@@ -1,0 +1,38 @@
+[package]
+name = "everevo-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "EverEvo agent core — ReAct loop, tool registry, sandbox, knowledge layer"
+
+[dependencies]
+everevo-core = { path = "../everevo-core" }
+everevo-downloader = { path = "../everevo-downloader" }
+everevo-bootstrap = { path = "../everevo-bootstrap" }
+everevo-sandbox = { path = "../everevo-sandbox" }
+everevo-telemetry = { path = "../everevo-telemetry" }
+everevo-domain = { path = "../everevo-domain" }
+
+# Knowledge graph (required — oxigraph, no protoc needed)
+everevo-kg = { path = "../everevo-kg" }
+# Vector store (required — needs protoc for lancedb)
+everevo-vector = { path = "../everevo-vector" }
+
+tokio = { workspace = true, features = ["process"] }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+futures.workspace = true
+async-trait = "0.1"
+tracing.workspace = true
+reqwest.workspace = true
+which = "6"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

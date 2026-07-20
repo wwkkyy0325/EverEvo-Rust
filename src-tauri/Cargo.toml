@@ -1,0 +1,30 @@
+[workspace]
+# Standalone — not part of parent workspace
+
+[package]
+name = "everevo"
+version = "0.1.0"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+axum = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Reuse existing EverEvo crates — zero bridge overhead
+everevo-core = { path = "../crates/everevo-core" }
+everevo-bootstrap = { path = "../crates/everevo-bootstrap" }
+everevo-db = { path = "../crates/everevo-db" }
+everevo-server = { path = "../crates/everevo-server" }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

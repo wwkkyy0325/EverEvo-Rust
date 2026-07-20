@@ -1,0 +1,71 @@
+# EverEvo-Rust — Virtual Workspace Root
+# No [package] section = virtual manifest = no root crate
+
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/user/everevo-rust"
+
+[workspace.dependencies]
+# ── Serialization ──
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# ── Async Runtime ──
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal"] }
+
+# ── Error Handling ──
+thiserror = "2"
+
+# ── Identifiers & Time ──
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# ── Database ──
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate", "chrono", "uuid"] }
+
+# ── Web Framework ──
+axum = { version = "0.8", features = ["macros"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
+tower = "0.5"
+
+
+# ── Observability ──
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# ── CLI ──
+clap = { version = "4", features = ["derive", "env"] }
+
+# ── Archive ──
+zip = "2"
+
+# ── Misc ──
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "hickory-dns", "gzip", "brotli", "http2"], default-features = false }
+futures = "0.3"
+tokio-stream = "0.1"
+pin-project-lite = "0.2"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+future_incompatible = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = 1 }
+pedantic = { level = "allow", priority = 3 }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.dev.package.sqlx-macros]
+opt-level = 3

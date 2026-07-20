@@ -1,0 +1,45 @@
+[package]
+name = "everevo-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "EverEvo Axum server binary — assembles all crates and serves the API"
+
+[[bin]]
+name = "everevo-server"
+path = "src/main.rs"
+
+[dependencies]
+everevo-core = { path = "../everevo-core" }
+everevo-agent = { path = "../everevo-agent" }
+everevo-db = { path = "../everevo-db" }
+everevo-bootstrap = { path = "../everevo-bootstrap" }
+everevo-downloader = { path = "../everevo-downloader" }
+everevo-sandbox = { path = "../everevo-sandbox" }
+everevo-domain = { path = "../everevo-domain" }
+everevo-telemetry = { path = "../everevo-telemetry" }
+everevo-vector = { path = "../everevo-vector" }
+everevo-kg = { path = "../everevo-kg" }
+
+axum.workspace = true
+tower-http.workspace = true
+tokio = { workspace = true, features = ["process"] }
+tokio-stream.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+async-trait = "0.1"
+tracing.workspace = true
+tracing-subscriber.workspace = true
+futures.workspace = true
+clap.workspace = true
+async-stream = "0.3"
+toml = "0.8"
+open = "5"
+zip.workspace = true
+reqwest.workspace = true
+
+[lints]
+workspace = true

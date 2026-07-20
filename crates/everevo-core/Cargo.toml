@@ -1,0 +1,21 @@
+[package]
+name = "everevo-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "EverEvo shared types, traits, error types, and configuration — zero heavy I/O deps"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait = "0.1"
+sha2 = "0.10"
+toml = "0.8"
+
+[lints]
+workspace = true

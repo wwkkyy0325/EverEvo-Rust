@@ -1,0 +1,33 @@
+# ── Rust ──
+target/
+**/*.rs.bk
+
+# ── Data (runtime, created on first launch) ──
+data/
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+
+# ── Node / Frontend ──
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# ── Tauri generated ──
+src-tauri/gen/
+
+# ── Environment ──
+.env
+.env.local
+*.env
+
+# ── Misc ──
+*.log
+tmp/

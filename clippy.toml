@@ -1,0 +1,15 @@
+# Sandbox Choke Point: only everevo-sandbox may spawn subprocesses.
+# All other crates must use SandboxProvider trait.
+#
+# To allow exceptions (WSL detection in sandbox), add:
+# #[allow(clippy::disallowed_methods)] on the specific function.
+
+disallowed-methods = [
+    # Block direct process spawning outside sandbox crate
+    { path = "std::process::Command::new", reason = "Use everevo_sandbox::SandboxProvider::execute() instead" },
+    { path = "tokio::process::Command::new", reason = "Use everevo_sandbox::SandboxProvider::execute() instead" },
+    { path = "std::process::Command::output", reason = "Use everevo_sandbox::SandboxProvider::execute() instead" },
+    { path = "tokio::process::Command::output", reason = "Use everevo_sandbox::SandboxProvider::execute() instead" },
+    { path = "std::process::Command::spawn", reason = "Use everevo_sandbox::SandboxProvider::execute() instead" },
+    { path = "tokio::process::Command::spawn", reason = "Use everevo_sandbox::SandboxProvider::execute() instead" },
+]
