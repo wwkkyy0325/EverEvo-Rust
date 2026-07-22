@@ -60,6 +60,9 @@ pub struct SubAgentContext {
     pub parent_workspace: Option<PathBuf>,
     /// Explicit context from the main agent.
     pub delegation_note: Option<String>,
+    /// Parent session's permission level for inheritance.
+    /// When FullyAuto, sub-agent shell commands should auto-approve.
+    pub permission_level: Option<String>,
 }
 
 impl Default for SubAgentContext {
@@ -72,6 +75,7 @@ impl Default for SubAgentContext {
             domain_knowledge: "(no domain knowledge matched)".into(),
             parent_workspace: None,
             delegation_note: None,
+            permission_level: None,
         }
     }
 }
@@ -123,6 +127,31 @@ impl SubAgentContext {
             prompt.push_str("## Delegation Context\n");
             prompt.push_str(note);
             prompt.push_str("\n\n");
+        }
+
+        // ── Permission Level ───────────────────────────────────
+        if let Some(ref level) = self.permission_level {
+            prompt.push_str("## Permission Level\n");
+            prompt.push_str(&format!(
+                "Parent session permission: {level}. "
+            ));
+            if level == "全自动" || level == "fully_auto" {
+                prompt.push_str(
+                    "Your shell commands are auto-approved (except admin/sudo). \
+                     Do NOT wait for or request confirmation — commands execute immediately.\n",
+                );
+            } else if level == "半自动" || level == "semi_auto" {
+                prompt.push_str(
+                    "Safe commands auto-run; dangerous ones require confirmation. \
+                     If a command requires confirmation, it WILL be confirmed by the user \
+                     transparently — just proceed.\n",
+                );
+            } else {
+                prompt.push_str(
+                    "Commands may require user confirmation before execution.\n",
+                );
+            }
+            prompt.push_str("\n");
         }
 
         // ── Rules ──────────────────────────────────────────────

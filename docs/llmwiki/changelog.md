@@ -4,6 +4,88 @@ All notable changes to EverEvo-Rust. Append-only, newest first.
 
 ---
 
+## 2026-07-21 — Frontend Redesign: Theme System + Component Architecture
+
+**What:** Comprehensive frontend overhaul — migrated to Tailwind CSS v4, built CSS variable design token system (OKLCH), integrated shadcn/ui component library, implemented 4-theme multi-theme system, and refactored component architecture.
+
+**Phase 1 — Design Token Foundation + Tailwind v4:**
+- Migrated Tailwind CSS v3.4 → v4.1 (CSS-first `@theme`, OKLCH, 5× faster builds)
+- Removed `tailwind.config.js`, `postcss.config.js` (no longer needed)
+- Defined 40+ CSS custom properties in OKLCH across `:root` (light) and `.dark` (dark)
+- Created `ThemeProvider` React Context + `localStorage` persistence + system preference detection
+- Added `ThemeToggle` with sun/moon icons in nav bar
+- Replaced ALL hardcoded colors across 8 components with semantic tokens
+
+**Phase 2 — shadcn/ui Component Library:**
+- Integrated shadcn/ui (new-york style) with Tailwind v4 compatibility
+- Created base components: `Button`, `Input`, `Card`, `Badge`, `Separator`
+- Added utilities: `cn()` (clsx + tailwind-merge), `class-variance-authority`
+- Path aliases configured: `@/*` → `./src/*`
+
+**Phase 3 — Multi-Theme System:**
+- 4 color themes: `default` (blue), `ocean` (teal), `sunset` (orange), `forest` (green)
+- Each theme × dark/light = 8 visual combinations, independent axes
+- `ThemeSelector` dropdown component with color preview dots
+- All shadcn/ui + app components auto-adapt to theme changes
+
+**Phase 4 — Component Architecture:**
+- Extracted reusable components: `ChatBubble`, `ToolCallCard`, `ThinkingPanel`
+- `ChatView` refactored to use shadcn `Button` + `Input`
+- New directory structure: `components/ui/` (shadcn), `components/chat/`, `components/layout/`
+- `ToolCallCard` now has expand/collapse with tool-specific color coding
+
+**Files affected (new):**
+- `frontend/src/index.css` — design token system + Tailwind v4 theme mapping
+- `frontend/src/hooks/useTheme.tsx` — ThemeProvider + two-axis theme system
+- `frontend/src/components/ThemeToggle.tsx` — dark/light toggle
+- `frontend/src/components/ThemeSelector.tsx` — color theme picker
+- `frontend/src/components/ui/button.tsx` — shadcn Button (cva variants)
+- `frontend/src/components/ui/input.tsx` — shadcn Input
+- `frontend/src/components/ui/card.tsx` — shadcn Card family
+- `frontend/src/components/ui/badge.tsx` — shadcn Badge
+- `frontend/src/components/ui/separator.tsx` — shadcn Separator
+- `frontend/src/components/chat/ChatBubble.tsx` — reusable message bubble
+- `frontend/src/components/chat/ToolCallCard.tsx` — expandable tool call display
+- `frontend/src/components/chat/ThinkingPanel.tsx` — thinking process panel
+- `frontend/src/lib/utils.ts` — cn() utility
+- `frontend/components.json` — shadcn/ui configuration
+
+**Files affected (modified):**
+- `frontend/package.json` — updated deps (Tailwind v4, clsx, cva, tailwind-merge, lucide-react)
+- `frontend/vite.config.ts` — @tailwindcss/vite plugin, path alias
+- `frontend/tsconfig.json` — path alias config
+- `frontend/src/main.tsx` — ThemeProvider wrapper
+- `frontend/src/App.tsx` — semantic tokens, ThemeToggle + ThemeSelector
+- `frontend/src/components/ChatView.tsx` — shadcn Button/Input, extracted sub-components
+- `frontend/src/components/SessionSidebar.tsx` — semantic tokens
+- `frontend/src/components/BootstrapView.tsx` — semantic tokens
+- `frontend/src/components/SettingsView.tsx` — semantic tokens
+- `frontend/src/components/AuditPanel.tsx` — semantic tokens
+- `frontend/src/components/ConfirmDialog.tsx` — semantic tokens
+- `frontend/src/components/MemoryPanel.tsx` — semantic tokens
+- `frontend/src/components/DomainPanel.tsx` — semantic tokens
+
+**Files removed:**
+- `frontend/tailwind.config.js` — replaced by CSS-first `@theme`
+- `frontend/postcss.config.js` — replaced by `@tailwindcss/vite` plugin
+
+**Key design decisions:**
+- CSS custom properties as single source of truth (not JS config)
+- OKLCH color space for perceptual uniformity and native opacity
+- shadcn/ui source-copy pattern (not npm black box) aligns with EverEvo "self-built" philosophy
+- Two-axis theme system (color × brightness) = 8 independent visual combinations
+- All shadcn components reference semantic tokens — theme-switching requires zero component changes
+
+**Research-backed choices (deep web research on Hermes, ClawX, local-ai, shadcn/ui ecosystem):**
+- Tailwind v4 + shadcn/ui is the 2025 consensus stack for AI chat applications
+- Three-tier token architecture (global → semantic → component) is the W3C DTCG standard
+- `data-theme` attribute pattern scales to N themes without custom variants
+- OKLCH recommended over HSL for perceptually uniform shade scales
+
+**Task doc:** [docs/llmwiki/tasks/frontend-redesign-theme-system.md](docs/llmwiki/tasks/frontend-redesign-theme-system.md)
+
+---
+
 ## 2026-07-19 — Security Hardening, Coupling Fix, File Splitting, Phase 2/3
 
 **What:** Fixed 2 security issues (ZIP Slip defense, CORS tightening), removed stale `everevo-agent` dependency from domain crate, split all 5 files >800 lines into focused sub-modules, added `Agent` trait to core, replaced `std::sync::Mutex` with `tokio::sync::Mutex` in MockLlmProvider, and added proper error variants (`Bootstrap`, `Download`) with `From` impls.

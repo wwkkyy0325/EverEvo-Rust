@@ -1,18 +1,170 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
 
-/* Custom scrollbar for chat area */
-::-webkit-scrollbar {
-  width: 6px;
+/* EverEvo — Pixel dark theme. One mode, one look.
+   Minecraft-inspired: grass green, stone gray, gold accents, Press Start 2P font.
+   Sharp corners, 1px borders, inset-bevel buttons. */
+
+:root {
+  --background: oklch(0.16 0.01 140);
+  --foreground: oklch(0.90 0.02 110);
+  --primary: oklch(0.58 0.17 140);
+  --primary-foreground: oklch(0.12 0 0);
+  --secondary: oklch(0.24 0.01 100);
+  --secondary-foreground: oklch(0.90 0.02 110);
+  --muted: oklch(0.22 0.01 100);
+  --muted-foreground: oklch(0.60 0.02 100);
+  --accent: oklch(0.72 0.18 85);
+  --accent-foreground: oklch(0.12 0.01 90);
+  --destructive: oklch(0.55 0.21 25);
+  --destructive-foreground: oklch(0.98 0 0);
+  --success: oklch(0.55 0.16 150);
+  --success-foreground: oklch(0.98 0 0);
+  --warning: oklch(0.72 0.18 80);
+  --warning-foreground: oklch(0.12 0.01 80);
+  --thinking: oklch(0.55 0.14 290);
+  --thinking-foreground: oklch(0.98 0 0);
+  --border: oklch(0.35 0.01 100);
+  --input: oklch(0.24 0.01 100);
+  --ring: oklch(0.58 0.17 140);
+  --radius: 0px;
+
+  --sidebar-background: oklch(0.14 0.005 140);
+  --sidebar-foreground: oklch(0.90 0.02 110);
+  --sidebar-accent: oklch(0.22 0.02 140);
+  --sidebar-border: oklch(0.28 0.01 100);
+
+  --chat-user-bubble: oklch(0.50 0.16 140);
+  --chat-user-bubble-foreground: oklch(0.98 0 0);
+  --chat-assistant-bubble: oklch(0.22 0.01 140);
+  --chat-assistant-bubble-foreground: oklch(0.90 0.02 110);
+
+  --tool-shell: oklch(0.70 0.15 85);
+  --tool-web: oklch(0.50 0.16 140);
+  --tool-file: oklch(0.50 0.16 155);
+  --tool-code: oklch(0.55 0.15 290);
+
+  --statusbar-background: oklch(0.12 0.004 140);
+  --statusbar-foreground: oklch(0.60 0.02 100);
+
+  --pixel-unit: 4px;
+  --font-heading: "Press Start 2P", monospace;
+  --font-body: "DotGothic16", "Courier New", monospace;
 }
-::-webkit-scrollbar-track {
-  background: transparent;
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-thinking: var(--thinking);
+  --color-thinking-foreground: var(--thinking-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --radius: var(--radius);
+  --font-heading: var(--font-heading);
+  --font-body: var(--font-body);
+  --color-sidebar: var(--sidebar-background);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-chat-user: var(--chat-user-bubble);
+  --color-chat-user-foreground: var(--chat-user-bubble-foreground);
+  --color-chat-assistant: var(--chat-assistant-bubble);
+  --color-chat-assistant-foreground: var(--chat-assistant-bubble-foreground);
+  --color-tool-shell: var(--tool-shell);
+  --color-tool-web: var(--tool-web);
+  --color-tool-file: var(--tool-file);
+  --color-tool-code: var(--tool-code);
+  --color-statusbar: var(--statusbar-background);
+  --color-statusbar-foreground: var(--statusbar-foreground);
 }
-::-webkit-scrollbar-thumb {
-  background: #374151;
-  border-radius: 3px;
+
+* { border-color: var(--border); }
+
+html { background-color: oklch(0.16 0.01 140); } /* dark base — no white flash during transitions */
+body { background: transparent; }
+body {
+  color: var(--foreground);
+  font-family: var(--font-body);
+  -webkit-font-smoothing: none;
+  -moz-osx-font-smoothing: none;
+  letter-spacing: 0.5px;
 }
-::-webkit-scrollbar-thumb:hover {
-  background: #4b5563;
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--font-heading);
+  text-transform: uppercase;
+  letter-spacing: 1px;
 }
+.font-mono, code, pre {
+  font-family: var(--font-heading);
+  font-size: 0.65rem;
+  line-height: 1.8;
+}
+img, canvas, svg {
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+}
+
+/* Buttons */
+button {
+  border-width: 1px;
+  box-shadow: inset 0 1px 0 0 rgba(255,255,255,0.2), inset 0 -2px 0 0 rgba(0,0,0,0.15);
+}
+button:active {
+  box-shadow: inset 0 1px 0 0 rgba(0,0,0,0.15), inset 0 -1px 0 0 rgba(255,255,255,0.1);
+  transform: translateY(1px);
+}
+button.border-transparent, button.shadow-none { box-shadow: none; border-width: 0; }
+button.border-transparent:active, button.shadow-none:active { box-shadow: none; transform: none; }
+
+input, textarea, select {
+  border-width: 1px;
+  font-family: var(--font-body);
+  -webkit-font-smoothing: none;
+}
+[class*="rounded-lg"], [class*="rounded-xl"], [class*="rounded-md"], [class*="rounded-sm"] {
+  border-width: 1px;
+}
+
+/* Splash → content transitions */
+@keyframes fade-out {
+  from { opacity: 1; }
+  to   { opacity: 0; }
+}
+@keyframes fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.animate-fade-out {
+  animation: fade-out 600ms ease-out forwards;
+  pointer-events: none;
+}
+.animate-fade-in {
+  animation: fade-in 500ms ease-out;
+}
+@keyframes scale-in {
+  from { opacity: 0; transform: scale(0.95) translateY(4px); }
+  to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+.animate-scale-in {
+  animation: scale-in 200ms ease-out;
+}
+
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: oklch(0.40 0.01 100); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: oklch(0.50 0.01 100); }

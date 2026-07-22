@@ -1,16 +1,16 @@
 //! Agent Orchestration — SupervisorAgent + SubAgent + TaskDecomposer.
 //!
+//! **DEPRECATED**: The main sub-agent flow now uses `TaskTool` + `spawn_single()`
+//! in delegate.rs. This module is retained for the `/api/agent/delegate` API
+//! endpoint and may be removed in a future cleanup.
+//!
 //! ## Architecture (OpenAI Agents SDK + CrewAI Manager-Worker)
 //!
 //! SupervisorAgent (主Agent, 长期存活)
 //!   ├── 分析任务 → 拆解为子任务
 //!   ├── 创建 SubAgent (临时) → 注入上下文 → 执行 → 销毁
 //!   └── 汇总结果 + Re-plan loop
-//!
-//! ## References
-//! - OpenAI Agents SDK: Agent-as-Tool + Handoff patterns
-//! - CrewAI: Manager-Worker with task-level tool scoping
-//! - LangGraph: Execute→Re-plan→Execute adaptive loop
+#![allow(dead_code)]
 
 use std::path::PathBuf;
 use std::sync::Arc;

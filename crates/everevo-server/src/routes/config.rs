@@ -52,7 +52,26 @@ async fn put_config(
     let path = state.config.data_dir.join("config.toml");
     let toml_str = toml::to_string_pretty(&body).unwrap_or_default();
     match tokio::fs::write(&path, toml_str).await {
-        Ok(_) => Json(serde_json::json!({ "data": { "saved": true } })),
+        Ok(_) => {
+            // Auto-reload LLM clients from the saved config
+            let providers = body.llm.unwrap_or_default();
+            let mut new_map: HashMap<String, Option<Arc<everevo_agent::llm::HttpClient>>> = HashMap::new();
+            for p in &providers {
+                if !p.api_key.is_empty() {
+                    let client = everevo_agent::llm::HttpClient::new(&p.api_format, &p.api_key, &p.base_url, &p.model);
+                    new_map.insert(p.id.clone(), Some(Arc::new(client)));
+                }
+            }
+            let mut guard = state.llm.write().await;
+            for (id, client) in &new_map { guard.insert(id.clone(), client.clone()); }
+            guard.retain(|id, _| new_map.contains_key(id));
+            drop(guard);
+
+            if !new_map.is_empty() {
+                state.llm_notify.notify_one();
+            }
+            Json(serde_json::json!({ "data": { "saved": true } }))
+        }
         Err(e) => Json(serde_json::json!({ "error": format!("Save failed: {e}") })),
     }
 }
@@ -86,6 +105,11 @@ async fn reload_llm(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
     // Remove providers that no longer exist
     guard.retain(|id, _| new_map.contains_key(id));
     drop(guard);
+
+    // Wake the init pipeline if it's waiting for LLM config
+    if !providers.is_empty() {
+        state.llm_notify.notify_one();
+    }
 
     Json(serde_json::json!({ "data": { "reloaded": true, "providers": providers.len() } }))
 }

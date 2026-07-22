@@ -171,14 +171,19 @@ async fn cmd_serve(config: everevo_core::AppConfig, host: &str, port: u16) {
         std::process::exit(1);
     });
 
-    // ── Provision in background; server starts immediately ──
+    // ── Init orchestrator: provision assets → check LLM → startup checks ──
     let pipeline = state.init_pipeline.clone();
+    let init_state = Arc::clone(&state);
+    let data_dir_c = config.data_dir.clone();
+
     if !pipeline.is_initialized() {
+        println!("[init] First boot — provisioning in background…");
         tracing::info!("First boot — provisioning in background…");
         let mut events = pipeline.events();
         let _handle = tokio::spawn(async move { pipeline.run().await });
-        let data_dir_c = config.data_dir.clone();
+
         tokio::spawn(async move {
+            // ── Phase 1: wait for asset provisioning ──
             while let Ok(event) = events.recv().await {
                 match event {
                     everevo_bootstrap::pipeline::InitEvent::AssetDone { key, .. } => {
@@ -188,7 +193,7 @@ async fn cmd_serve(config: everevo_core::AppConfig, host: &str, port: u16) {
                         tracing::warn!(%key, %error, "Asset failed");
                     }
                     everevo_bootstrap::pipeline::InitEvent::AllDone => {
-                        tracing::info!("All assets provisioned — init complete");
+                        tracing::info!("All assets provisioned");
                         break;
                     }
                     everevo_bootstrap::pipeline::InitEvent::FatalError(e) => {
@@ -198,17 +203,18 @@ async fn cmd_serve(config: everevo_core::AppConfig, host: &str, port: u16) {
                     _ => {}
                 }
             }
-            let report = everevo_server::startup_check::run_startup_check(&data_dir_c).await;
-            if report.fail > 0 {
-                tracing::error!(fail = report.fail, "Startup check found critical issues");
-            }
+            println!("[init] Assets done, entering LLM phase…");
+
+            // ── Phase 2: check LLM config (wait if needed) ──
+            run_init_llm_phase(&init_state, &data_dir_c).await;
         });
     } else {
+        println!("[init] Already provisioned — spawning LLM check task");
         tracing::info!("Init marker found — already provisioned");
-        let report = everevo_server::startup_check::run_startup_check(&config.data_dir).await;
-        if report.fail > 0 {
-            tracing::error!(fail = report.fail, "Startup check found critical issues");
-        }
+        // Assets ready; run LLM check + startup checks in background.
+        tokio::spawn(async move {
+            run_init_llm_phase(&init_state, &data_dir_c).await;
+        });
     }
 
     // ── Dreaming Scheduler ─────────────────────────────────────
@@ -458,6 +464,8 @@ async fn cmd_chat(config: &everevo_core::AppConfig, message: &str) {
         }
     }
 }
+
+use everevo_server::main_impl::run_init_llm_phase;
 
 /// Load the primary LLM provider from data/config.toml.
 async fn load_primary_llm(config: &everevo_core::AppConfig) -> Option<everevo_agent::llm::HttpClient> {

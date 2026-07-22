@@ -13,7 +13,7 @@ mod memory_tool;
 mod shell;
 
 pub use bootstrap::BootstrapTool;
-pub use delegate::TaskTool;
+pub use delegate::{SubAgentHandle, SubAgentStatus, TaskTool};
 pub use download::DownloadTool;
 pub use memory_tool::MemoryTool;
 pub use shell::ShellTool;

@@ -3,7 +3,7 @@
 //! The agent uses this to download files with multi-mirror, resume, and progress support.
 //! Calls `Downloader::submit()` directly — **no CLI overhead**.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -16,11 +16,24 @@ use everevo_core::EverEvoError;
 
 pub struct DownloadTool {
     downloader: Arc<Downloader>,
+    /// Sandbox working directory. Relative `dest_path`s are resolved against
+    /// this directory so downloads (and their `.resume.json` sidecar files)
+    /// stay inside the sandbox instead of leaking into the process CWD.
+    work_dir: Option<PathBuf>,
 }
 
 impl DownloadTool {
     pub fn new(downloader: Arc<Downloader>) -> Self {
-        Self { downloader }
+        Self {
+            downloader,
+            work_dir: None,
+        }
+    }
+
+    /// Set the sandbox working directory for relative path resolution.
+    pub fn with_work_dir(mut self, dir: PathBuf) -> Self {
+        self.work_dir = Some(dir);
+        self
     }
 }
 
@@ -95,7 +108,12 @@ impl Tool for DownloadTool {
             _ => Priority::Normal,
         };
 
-        let task = DownloadTask::new(url, PathBuf::from(dest_path))
+        // Resolve relative paths against the sandbox working directory so
+        // downloads don't leak into the process CWD (which is src-tauri/
+        // in Tauri dev mode, triggering unwanted rebuilds).
+        let dest = resolve_dest_path(dest_path, self.work_dir.as_deref());
+
+        let task = DownloadTask::new(url, dest)
             .with_region(region)
             .with_priority(priority);
 
@@ -134,6 +152,30 @@ impl Tool for DownloadTool {
                 content: format!("Download failed: {}", result.error_message().unwrap_or("unknown error")),
                 is_error: true,
             })
+        }
+    }
+}
+
+/// Resolve a user-supplied `dest_path` to an absolute path.
+///
+/// - Absolute paths are returned as-is.
+/// - Relative paths are joined against `work_dir` (sandbox working directory).
+/// - If no `work_dir` is set, the returned path will still be absolute
+///   (resolved against the process CWD as last resort).
+fn resolve_dest_path(raw: &str, work_dir: Option<&Path>) -> PathBuf {
+    let p = Path::new(raw);
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    match work_dir {
+        Some(dir) => dir.join(p),
+        None => {
+            // Fallback: resolve against process CWD so we still get an absolute
+            // path (avoiding ambiguity), even though this will be src-tauri/
+            // in dev mode.  This branch should only be hit in tests.
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(p)
         }
     }
 }

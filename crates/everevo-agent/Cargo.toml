@@ -26,6 +26,7 @@ uuid.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
 futures.workspace = true
+tokio-util.workspace = true
 async-trait = "0.1"
 tracing.workspace = true
 reqwest.workspace = true

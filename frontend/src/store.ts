@@ -18,6 +18,19 @@ export interface SessionItem {
   updated_at: string;
   message_count: number;
   last_message: string | null;
+  // Local-only fields (not persisted by backend)
+  pinned?: boolean;
+}
+
+// ── Persisted local state ──────────────────────────────────────────────
+
+const ARCHIVED_KEY = 'everevo_archived_ids';
+
+function loadArchivedIds(): string[] {
+  try { return JSON.parse(localStorage.getItem(ARCHIVED_KEY) || '[]'); } catch { return []; }
+}
+function saveArchivedIds(ids: string[]) {
+  localStorage.setItem(ARCHIVED_KEY, JSON.stringify(ids));
 }
 
 export interface ToolCallEvent {
@@ -62,6 +75,7 @@ interface ChatState {
   sessions: SessionItem[];
   sessionsLoading: boolean;
   activeSessionId: string | null;
+  archivedIds: string[];
 
   // Messages for the active session
   messages: MessageItem[];
@@ -92,6 +106,9 @@ interface ChatState {
   loadSessions: () => Promise<void>;
   createSession: () => Promise<string>;
   deleteSession: (id: string) => Promise<void>;
+  archiveSession: (id: string) => void;
+  pinSession: (id: string) => void;
+  renameSession: (id: string, title: string) => void;
   switchSession: (id: string) => Promise<void>;
   loadMoreMessages: () => Promise<void>;
   sendMessage: (text: string) => Promise<void>;
@@ -123,6 +140,7 @@ export const useStore = create<ChatState>((set, get) => ({
   sessions: [],
   sessionsLoading: true,
   activeSessionId: null,
+  archivedIds: loadArchivedIds(),
   messages: [],
   messagesLoading: false,
   historyCursor: null,
@@ -156,13 +174,35 @@ export const useStore = create<ChatState>((set, get) => ({
     try {
       const res = await fetch('/api/sessions?limit=50');
       const json = await res.json();
-      set({ sessions: json.data ?? [], sessionsLoading: false });
+      const raw: SessionItem[] = json.data ?? [];
+      const { archivedIds, sessions: existing } = get();
+      const archivedSet = new Set(archivedIds);
+      const sorted = raw
+        .filter((s) => !archivedSet.has(s.id))
+        .map((s) => {
+          const old = existing.find((e) => e.id === s.id);
+          return { ...s, pinned: old?.pinned ?? false };
+        })
+        .sort((a, b) => {
+          if (a.pinned && !b.pinned) return -1;
+          if (!a.pinned && b.pinned) return 1;
+          return new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime();
+        });
+      set({ sessions: sorted, sessionsLoading: false });
     } catch {
       set({ sessionsLoading: false });
     }
   },
 
   createSession: async () => {
+    // Reuse existing empty session if one is already present (prevent accidental duplicates)
+    const { sessions, archivedIds } = get();
+    const archivedSet = new Set(archivedIds);
+    const empty = sessions.find((s) => s.message_count === 0 && !archivedSet.has(s.id));
+    if (empty) {
+      await get().switchSession(empty.id);
+      return empty.id;
+    }
     const res = await fetch('/api/sessions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -182,6 +222,34 @@ export const useStore = create<ChatState>((set, get) => ({
       set({ activeSessionId: null, messages: [], historyCursor: null, hasMoreHistory: false });
     }
     await get().loadSessions();
+  },
+
+  archiveSession: (id: string) => {
+    const { archivedIds, activeSessionId } = get();
+    if (archivedIds.includes(id)) return;
+    const next = [...archivedIds, id];
+    saveArchivedIds(next);
+    set((s) => ({
+      archivedIds: next,
+      sessions: s.sessions.filter((ses) => ses.id !== id),
+      ...(activeSessionId === id ? { activeSessionId: null, messages: [], historyCursor: null, hasMoreHistory: false } : {}),
+    }));
+  },
+
+  pinSession: (id: string) => {
+    set((s) => ({
+      sessions: s.sessions.map((ses) =>
+        ses.id === id ? { ...ses, pinned: !ses.pinned } : ses
+      ),
+    }));
+  },
+
+  renameSession: (id: string, title: string) => {
+    set((s) => ({
+      sessions: s.sessions.map((ses) =>
+        ses.id === id ? { ...ses, title } : ses
+      ),
+    }));
   },
 
   // ── Messages ──────────────────────────────────────────────────────

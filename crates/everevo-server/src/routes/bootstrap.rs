@@ -3,7 +3,7 @@
 use axum::{
     extract::State,
     response::sse::{Event, KeepAlive, Sse},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use futures::Stream;
@@ -17,6 +17,29 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/bootstrap/status", get(status_handler))
         .route("/api/bootstrap/download", get(download_handler))
+        .route("/api/init/status", get(init_status_handler))
+        .route("/api/init/proceed", post(init_proceed_handler))
+}
+
+// ── Init Status ─────────────────────────────────────────────────────────
+
+/// Returns the current startup phase + LLM availability so the frontend
+/// can decide which splash screen to render.
+async fn init_status_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let phase = *state.init_phase.read().await;
+    let has_llm = state.llm.read().await.values().any(|c| c.is_some());
+
+    Json(serde_json::json!({
+        "phase": phase,
+        "has_llm": has_llm,
+    }))
+}
+
+/// Force-continue past the LLM-config wait (user clicked "Skip for now").
+/// Also used implicitly by config save → reload → notify.
+async fn init_proceed_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    state.llm_notify.notify_one();
+    Json(serde_json::json!({ "ok": true }))
 }
 
 // ── Status ──────────────────────────────────────────────────────────────

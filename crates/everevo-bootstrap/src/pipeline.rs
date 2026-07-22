@@ -348,7 +348,10 @@ impl InitPipeline {
         let mut to_download: Vec<&Asset> = Vec::new();
 
         for asset in &check.missing {
-            let tracker = trackers.get_mut(&asset.key).unwrap();
+            let Some(tracker) = trackers.get_mut(&asset.key) else {
+                tracing::warn!(key = %asset.key, "Asset in missing list but not in trackers — skipping");
+                continue;
+            };
 
             if asset.is_model() {
                 let target = self.runtime_mgr.models_dir().join(&asset.key);
@@ -460,7 +463,10 @@ impl InitPipeline {
         let mut url_index: HashMap<String, usize> = HashMap::new(); // asset_key → current index
 
         for asset in &to_download {
-            let tracker = trackers.get_mut(&asset.key).unwrap();
+            let Some(tracker) = trackers.get_mut(&asset.key) else {
+                tracing::warn!(key = %asset.key, "Asset in download list but not in trackers — skipping");
+                continue;
+            };
             let urls = asset.all_urls();
 
             self.emit(InitEvent::LayerStart {

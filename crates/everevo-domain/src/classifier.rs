@@ -51,8 +51,21 @@ impl DomainClassifier {
 
         // Rule 1: High similarity → existing domain
         if best_sim > self.high_threshold {
+            let Some(domain_id) = best_id else {
+                tracing::warn!(
+                    sim = best_sim,
+                    "High similarity but no domain ID — registry may be empty"
+                );
+                return ClassificationResult {
+                    domain_id: String::new(),
+                    confidence: 0.0,
+                    is_new_domain: true,
+                    needs_llm: true,
+                    reason: "High similarity but no matching domain (empty registry?)".into(),
+                };
+            };
             return ClassificationResult {
-                domain_id: best_id.unwrap(),
+                domain_id,
                 confidence: best_sim,
                 is_new_domain: false,
                 needs_llm: false,

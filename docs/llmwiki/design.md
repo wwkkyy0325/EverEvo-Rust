@@ -73,11 +73,30 @@ ADK-Rust is designed for server-side microservice architecture (39 crates, multi
 | Concern | Choice | Why |
 |---------|--------|-----|
 | Framework | **React 18+** + TypeScript | Best AI coding support, richest chat UI ecosystem, streaming SSE mature |
-| Build | **Vite** | Fast HMR, standard for React SPAs |
-| Styling | Tailwind CSS | Utility-first, rapid prototyping |
-| State | Zustand or Jotai | Lightweight, no boilerplate |
+| Build | **Vite 6** | Fast HMR, standard for React SPAs |
+| Styling | **Tailwind CSS v4** | CSS-first config (`@theme`), OKLCH color space, 5x faster builds |
+| Component Library | **shadcn/ui** (new-york) | Source-copy pattern (no npm black box), Radix primitives, full customization |
+| Design Tokens | **CSS Variables + OKLCH** | Three-tier: global → semantic → component. Theme-agnostic, runtime-swappable |
+| Theming | `data-theme` attribute + `.dark` class | 4 color themes × dark/light = 8 combinations. localStorage persistence |
+| Icons | **Lucide React** | Default shadcn/ui icon library, tree-shakeable |
+| State | **Zustand 5** | Lightweight, no boilerplate |
 | Chat Streaming | Fetch API + ReadableStream | SSE over HTTP, native browser support |
 | Markdown | react-markdown + rehype-highlight | Code block syntax highlighting |
+
+**Theme system architecture:**
+```
+CSS Variables (:root / .dark / [data-theme="ocean"])   ← Design tokens (OKLCH)
+  → Tailwind v4 @theme inline mapping                   ← Utility classes (bg-primary, text-foreground)
+  → shadcn/ui components                                ← Primitives consume tokens
+  → App components                                      ← Business components consume tokens
+```
+
+**Supported themes (all with dark/light variants):**
+- `default` — Blue-gray, professional tech (primary: OKLCH 264° blue)
+- `ocean` — Teal/cyan, calm & clean (primary: OKLCH 200° teal)
+- `sunset` — Warm orange/amber, energetic (primary: OKLCH 55° orange)
+- `forest` — Emerald green, natural (primary: OKLCH 155° green)
+- `pixel` — Minecraft-inspired 8-bit retro: grass green, stone gray, gold accents, Press Start 2P font, sharp corners, pixel shadows. Zero component code changes — purely CSS `[data-theme="pixel"]`
 
 ### Storage Summary
 

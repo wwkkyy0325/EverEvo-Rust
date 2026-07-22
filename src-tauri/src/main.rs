@@ -79,13 +79,16 @@ fn main() {
                     let data_dir = config.data_dir.clone();
                     let (app, state) = everevo_server::build_app(config, db).await.unwrap();
 
-                    // ── Provision in background; server starts immediately ──
+                    // ── Init orchestrator: provision → check LLM → startup checks ──
                     let pipeline = state.init_pipeline.clone();
+                    let init_state = std::sync::Arc::clone(&state);
+                    let data_dir_c = data_dir.clone();
+
                     if !pipeline.is_initialized() {
                         tracing::info!("First boot — provisioning in background…");
                         let mut events = pipeline.events();
                         let _handle = tokio::spawn(async move { pipeline.run().await });
-                        let data_dir_c = data_dir.clone();
+
                         tokio::spawn(async move {
                             while let Ok(event) = events.recv().await {
                                 match event {
@@ -96,7 +99,7 @@ fn main() {
                                         tracing::warn!(%key, %error, "Asset failed");
                                     }
                                     everevo_bootstrap::pipeline::InitEvent::AllDone => {
-                                        tracing::info!("All assets provisioned — init complete");
+                                        tracing::info!("All assets provisioned");
                                         break;
                                     }
                                     everevo_bootstrap::pipeline::InitEvent::FatalError(e) => {
@@ -106,17 +109,13 @@ fn main() {
                                     _ => {}
                                 }
                             }
-                            let report = everevo_server::startup_check::run_startup_check(&data_dir_c).await;
-                            if report.fail > 0 {
-                                tracing::error!(fail = report.fail, "Startup check found critical issues");
-                            }
+                            everevo_server::main_impl::run_init_llm_phase(&init_state, &data_dir_c).await;
                         });
                     } else {
                         tracing::info!("Init marker found — already provisioned");
-                        let report = everevo_server::startup_check::run_startup_check(&data_dir).await;
-                        if report.fail > 0 {
-                            tracing::error!(fail = report.fail, "Startup check found critical issues");
-                        }
+                        tokio::spawn(async move {
+                            everevo_server::main_impl::run_init_llm_phase(&init_state, &data_dir_c).await;
+                        });
                     }
 
                     // Start dreaming scheduler in background

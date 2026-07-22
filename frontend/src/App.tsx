@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import BootstrapView from './components/BootstrapView';
 import ChatView from './components/ChatView';
 import SettingsView from './components/SettingsView';
@@ -7,50 +7,114 @@ import AuditPanel from './components/AuditPanel';
 import ConfirmDialog from './components/ConfirmDialog';
 import MemoryPanel from './components/MemoryPanel';
 import DomainPanel from './components/DomainPanel';
+import AppStatusBar from './components/AppStatusBar';
+import { Dialog } from './components/ui/dialog';
 
 type View = 'bootstrap' | 'chat' | 'settings';
 
 function App() {
   const [view, setView] = useState<View>('bootstrap');
+  const [showLlmPrompt, setShowLlmPrompt] = useState(false);
+  const llmPromptShown = useRef(false);
+
+  // After bootstrap, check if LLM is configured — only once
+  useEffect(() => {
+    if (view === 'bootstrap' || llmPromptShown.current) return;
+    let cancelled = false;
+
+    async function check() {
+      try {
+        const r = await fetch('/api/config');
+        const data = await r.json();
+        if (cancelled) return;
+        if (!data.has_llm) {
+          llmPromptShown.current = true;
+          setTimeout(() => { if (!cancelled) setShowLlmPrompt(true); }, 800);
+        }
+      } catch { /* ignore */ }
+    }
+    check();
+    return () => { cancelled = true; };
+  }, [view]);
 
   if (view === 'bootstrap') {
     return <BootstrapView onEnter={() => setView('chat')} />;
   }
 
   return (
-    <div className="flex h-screen bg-gray-950 text-white">
-      {/* Session sidebar — always visible */}
-      <SessionSidebar />
+    <div className="flex flex-col h-screen overflow-hidden bg-background text-foreground animate-fade-in">
+      {/* Top: sidebar + main */}
+      <div className="flex flex-1 min-h-0 overflow-hidden">
+        <SessionSidebar />
 
-      {/* Main area */}
-      <div className="flex-1 flex flex-col min-w-0">
-        {/* Top nav bar */}
-        <nav className="shrink-0 bg-gray-950/80 backdrop-blur border-b border-gray-800 px-4 py-2 flex items-center justify-end gap-2">
-          <button
-            onClick={() => setView('chat')}
-            className={`text-xs px-3 py-1 rounded ${view === 'chat' ? 'bg-blue-800 text-blue-200' : 'text-gray-400 hover:text-white'}`}
-          >
-            聊天
-          </button>
-          <button
-            onClick={() => setView('settings')}
-            className={`text-xs px-3 py-1 rounded ${view === 'settings' ? 'bg-blue-800 text-blue-200' : 'text-gray-400 hover:text-white'}`}
-          >
-            设置
-          </button>
-        </nav>
+        <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
+          <nav className="shrink-0 bg-background px-4 py-2 flex items-center justify-end gap-2">
+            <button
+              onClick={() => setView('chat')}
+              className={`text-xs px-3 py-1 rounded transition-colors ${
+                view === 'chat'
+                  ? 'bg-primary text-primary-foreground'
+                  : 'text-muted-foreground hover:text-foreground'
+              }`}
+            >
+              聊天
+            </button>
+            <button
+              onClick={() => setView('settings')}
+              className={`text-xs px-3 py-1 rounded transition-colors ${
+                view === 'settings'
+                  ? 'bg-primary text-primary-foreground'
+                  : 'text-muted-foreground hover:text-foreground'
+              }`}
+            >
+              设置
+            </button>
+          </nav>
 
-        {/* Content */}
-        {view === 'chat' && <ChatView />}
-        {view === 'settings' && <SettingsView onBack={() => setView('chat')} />}
+          {view === 'chat' && <ChatView />}
+          {view === 'settings' && <SettingsView onBack={() => setView('chat')} />}
+        </div>
       </div>
+
+      {/* Bottom status bar */}
+      <AppStatusBar />
+
+      {/* Panels & dialogs */}
       <AuditPanel />
-      {/* Permission confirmation dialog — shown when sandbox SemiAuto requires user approval */}
       <ConfirmDialog />
-      {/* Memory panel — browse/search persistent facts */}
       <MemoryPanel />
-      {/* Domain panel — manage knowledge domains */}
       <DomainPanel />
+
+      {/* LLM config prompt — shown after bootstrap if no LLM configured */}
+      <Dialog
+        open={showLlmPrompt}
+        onClose={() => setShowLlmPrompt(false)}
+        title="⚙️ 配置大模型"
+        persistent
+      >
+        <div className="flex flex-col gap-4">
+          <p className="text-xs text-muted-foreground leading-relaxed">
+            检测到尚未配置大模型。EverEvo 需要至少一个 LLM 提供商才能进行对话和智能操作。
+          </p>
+          <p className="text-xs text-muted-foreground">
+            支持 OpenAI 兼容接口（DeepSeek、OpenAI 等）和 Anthropic 原生接口。
+          </p>
+          <div className="flex gap-2 pt-1">
+            <button
+              onClick={() => { setShowLlmPrompt(false); setView('settings'); }}
+              className="flex-1 py-2 rounded-lg text-xs font-medium bg-primary hover:bg-primary/90 text-primary-foreground transition-colors"
+            >
+              去配置
+            </button>
+            <button
+              onClick={() => setShowLlmPrompt(false)}
+              className="px-3 py-2 rounded-lg text-xs bg-secondary hover:bg-secondary/80 text-muted-foreground hover:text-foreground transition-colors"
+            >
+              稍后再说
+            </button>
+          </div>
+        </div>
+      </Dialog>
     </div>
   );
 }

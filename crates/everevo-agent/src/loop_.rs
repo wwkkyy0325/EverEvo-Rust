@@ -89,6 +89,23 @@ pub enum AgentEvent {
     Done {
         final_text: String,
     },
+    /// A sub-agent was dispatched.
+    SubAgentStarted {
+        id: String,
+        description: String,
+    },
+    /// A sub-agent completed with a result.
+    SubAgentResult {
+        id: String,
+        description: String,
+        result: String,
+    },
+    /// LLM says Done but sub-agents are still running.
+    /// The caller should keep the SSE connection open and wait
+    /// for SubAgentResult events, then auto-resume the agent loop.
+    WaitingForSubAgents {
+        pending: usize,
+    },
     /// An error occurred during execution.
     Error {
         message: String,
@@ -131,7 +148,7 @@ impl AgentLoop {
 
     /// Set the subagent result channel for non-blocking task tool results.
     pub fn with_subagent_channel(self, rx: tokio::sync::mpsc::UnboundedReceiver<String>) -> Self {
-        *self.subagent_rx.lock().unwrap() = Some(rx);
+        *self.subagent_rx.lock().unwrap_or_else(|e| e.into_inner()) = Some(rx);
         self
     }
 
@@ -185,7 +202,7 @@ impl AgentLoop {
         let max_context_chars = self.max_context_chars;
         let telemetry = self.telemetry.clone();
         let trace_id = self.trace_id;
-        let subagent_rx = self.subagent_rx.lock().unwrap().take();
+        let subagent_rx = self.subagent_rx.lock().unwrap_or_else(|e| e.into_inner()).take();
         let pending_subagents = self.pending_subagents.clone();
 
         tokio::spawn(async move {
@@ -313,24 +330,30 @@ async fn run_loop(
         if tool_calls.is_empty() {
             let pending = pending_subagents.load(std::sync::atomic::Ordering::SeqCst);
             if pending > 0 {
-                // Sub-agents still running — don't exit. Wait for their
-                // results and let the LLM respond to them.
-                tracing::info!(pending, "LLM says Done but sub-agents running — waiting");
+                // Sub-agents still running — emit WaitingForSubAgents event
+                // and return. Do NOT block — the chat route will auto-resume
+                // when sub-agent results arrive on the channel.
+                // Drain any already-available results before returning.
                 if let Some(ref mut rx) = subagent_rx {
-                    // Block up to 5 min for the next sub-agent result.
-                    match tokio::time::timeout(std::time::Duration::from_secs(300), rx.recv()).await {
-                        Ok(Some(result)) => {
-                            messages.push(LlmMessage::user(&format!("[SubAgent Result]\n{result}")));
-                            continue; // Re-enter the loop; LLM will respond to the result
-                        }
-                        Ok(None) => {
-                            tracing::warn!("SubAgent result channel closed");
-                        }
-                        Err(_) => {
-                            tracing::warn!(pending, "Timed out waiting for sub-agent results");
-                        }
+                    while let Ok(result) = rx.try_recv() {
+                        messages.push(LlmMessage::user(&format!(
+                            "[SubAgent Result]\n{result}"
+                        )));
                     }
                 }
+                tracing::info!(pending, "LLM says Done but sub-agents running — yielding");
+                // Emit the partial text so the frontend can display it
+                if !current_text.is_empty() {
+                    let _ = tx
+                        .send(AgentEvent::TextDelta(current_text.clone()))
+                        .await;
+                }
+                let _ = tx
+                    .send(AgentEvent::WaitingForSubAgents { pending })
+                    .await;
+                // Do NOT emit Done — the chat route will auto-resume when
+                // sub-agent results arrive. Dropping tx signals "agent loop paused".
+                return Ok(());
             }
             // No pending sub-agents → truly done.
             let final_text = current_text.clone();

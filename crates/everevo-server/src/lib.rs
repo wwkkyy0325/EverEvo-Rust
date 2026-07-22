@@ -1,6 +1,7 @@
 //! EverEvo Axum server — app builder, shared state, and route wiring.
 
 pub mod app_state;
+pub mod main_impl;
 pub mod routes;
 pub mod startup_check;
 

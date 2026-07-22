@@ -25,6 +25,9 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/memory/facts/{name}", delete(delete_fact))
         .route("/api/agent/delegate", post(agent_delegate))
         .route("/api/agent/pool", get(agent_pool_status))
+        .route("/api/agent/tasks", get(list_subagent_tasks))
+        .route("/api/agent/tasks/{id}/cancel", post(cancel_subagent))
+        .route("/api/chat/{id}/interrupt", post(interrupt_chat))
 }
 
 #[derive(Deserialize)]
@@ -154,6 +157,24 @@ async fn set_permission(
         Some(sb) => {
             sb.set_permission_level(level);
             tracing::info!(%session_id, level = %level.label(), "Permission level changed");
+
+            // ── Auto-resolve pending confirmations when switching to FullyAuto ──
+            // If a sub-agent (or the main agent) is blocked on a confirmation
+            // oneshot, switching to FullyAuto should unblock it immediately.
+            // Without this, mid-conversation permission changes can deadlock
+            // already-spawned sub-agents that were waiting for user approval.
+            if level == everevo_sandbox::PermissionLevel::FullyAuto {
+                let pending = state.confirmations.write().await.remove(&session_id);
+                if let Some(p) = pending {
+                    let _ = p.response_tx.send(true); // auto-approve
+                    tracing::info!(
+                        %session_id,
+                        command = %p.command,
+                        "Auto-approved pending confirmation on FullyAuto switch"
+                    );
+                }
+            }
+
             Json(serde_json::json!({
                 "data": {
                     "session_id": session_id.to_string(),
@@ -322,4 +343,87 @@ async fn agent_delegate(State(state): State<Arc<AppState>>, Json(body): Json<Age
 
 async fn agent_pool_status(State(_state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "data": { "max_concurrent": 3, "status": "operational" }}))
+}
+
+// ── Sub-agent Task API ─────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct SubagentQuery {
+    #[serde(default)]
+    session_id: Option<Uuid>,
+}
+
+/// GET /api/agent/tasks — list running and recently completed sub-agents.
+async fn list_subagent_tasks(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<SubagentQuery>,
+) -> Json<serde_json::Value> {
+    let statuses = state.subagent_statuses.read().await;
+
+    // If session_id specified, return only that session's entries
+    let items: Vec<serde_json::Value> = if let Some(sid) = q.session_id {
+        statuses
+            .get(&sid)
+            .and_then(|arc| {
+                let list = arc.lock().ok()?;
+                Some(list.iter().map(|s| serde_json::to_value(s).unwrap_or_default()).collect())
+            })
+            .unwrap_or_default()
+    } else {
+        statuses
+            .iter()
+            .flat_map(|(_sid, arc)| {
+                let list = arc.lock().ok();
+                list.map(|l| l.iter().map(|s| serde_json::to_value(s).unwrap_or_default()).collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .collect()
+    };
+
+    Json(serde_json::json!({
+        "data": { "tasks": items, "total": items.len() }
+    }))
+}
+
+/// POST /api/agent/tasks/{id}/cancel — cancel a running sub-agent.
+async fn cancel_subagent(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Json<serde_json::Value> {
+    let handles = state.subagent_handles.read().await;
+    for (_sid, arc) in handles.iter() {
+        if let Ok(list) = arc.lock() {
+            if let Some(entry) = list.iter().find(|e| e.id == id) {
+                entry.cancel.cancel();
+                tracing::info!(%id, "Sub-agent cancelled via API");
+                return Json(serde_json::json!({
+                    "data": { "cancelled": true, "id": id.to_string() }
+                }));
+            }
+        }
+    }
+    Json(serde_json::json!({
+        "error": format!("Sub-agent not found: {id}")
+    }))
+}
+
+/// POST /api/chat/{id}/interrupt — cancel the current agent turn.
+/// Background sub-agents continue running; their results will appear
+/// in the next conversation turn.
+async fn interrupt_chat(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<Uuid>,
+) -> Json<serde_json::Value> {
+    let actors = state.session_actors.read().await;
+    if let Some(token) = actors.get(&session_id) {
+        token.cancel();
+        tracing::info!(%session_id, "Agent run interrupted by user");
+        Json(serde_json::json!({
+            "data": { "interrupted": true, "session_id": session_id.to_string() }
+        }))
+    } else {
+        Json(serde_json::json!({
+            "error": "No active agent run for this session"
+        }))
+    }
 }

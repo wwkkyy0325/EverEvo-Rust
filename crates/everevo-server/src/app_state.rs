@@ -2,12 +2,14 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use serde::Serialize;
+use tokio::sync::{Notify, RwLock};
 
 use everevo_agent::llm::HttpClient;
 use everevo_agent::memory::diary::DiaryManager;
 use everevo_agent::memory::facts::FactManager;
 use everevo_agent::skill::SkillRegistry;
+use everevo_agent::tools::builtins::{SubAgentHandle, SubAgentStatus};
 use everevo_domain::DomainRegistry;
 use everevo_agent::memory::scheduler::{DreamingScheduler, SchedulerConfig};
 use everevo_agent::memory::DreamingEngine;
@@ -19,6 +21,23 @@ use everevo_db::Database;
 use everevo_downloader::Downloader;
 use everevo_sandbox::{SandboxConfig, SessionSandbox};
 use everevo_telemetry::{Telemetry, TelemetryConfig};
+
+// ── Init Phase ──────────────────────────────────────────────────────────
+
+/// Tracks where the server is in the startup initialization sequence.
+/// The frontend polls `/api/init/status` to decide which splash screen to show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InitPhase {
+    /// Downloading runtimes + embedding models.
+    Provisioning,
+    /// Assets ready, but no LLM provider configured — frontend shows config prompt.
+    WaitingForLlm,
+    /// LLM confirmed, running startup self-checks (ONNX, DB, permissions).
+    Checking,
+    /// All subsystems ready; frontend transitions to main app.
+    Ready,
+}
 
 /// A pending confirmation that blocks a shell tool until the user responds.
 pub struct PendingConfirmation {
@@ -45,6 +64,10 @@ pub struct AppState {
     pub downloader: Arc<Downloader>,
     /// Init pipeline — event-driven bootstrap orchestration.
     pub init_pipeline: Arc<InitPipeline>,
+    /// Current startup phase (polled by frontend via GET /api/init/status).
+    pub init_phase: RwLock<InitPhase>,
+    /// Woken when the user configures an LLM provider during WaitingForLlm.
+    pub llm_notify: Notify,
     /// Per-session sandboxes, keyed by session UUID.
     pub sandboxes: RwLock<HashMap<uuid::Uuid, SessionSandbox>>,
     /// Pending confirmations awaiting user response, keyed by session UUID.
@@ -66,6 +89,12 @@ pub struct AppState {
     pub telemetry: Arc<Telemetry>,
     /// Skill registry — scans data/skills/ for SKILL.md files.
     pub skill_registry: Arc<SkillRegistry>,
+    /// Per-session cancellation tokens for interrupting active agent runs.
+    pub session_actors: RwLock<HashMap<uuid::Uuid, tokio_util::sync::CancellationToken>>,
+    /// Sub-agent handles keyed by session UUID — supports listing and cancellation via API.
+    pub subagent_handles: RwLock<HashMap<uuid::Uuid, Arc<std::sync::Mutex<Vec<SubAgentHandle>>>>>,
+    /// Sub-agent status snapshots keyed by session UUID — for status API.
+    pub subagent_statuses: RwLock<HashMap<uuid::Uuid, Arc<std::sync::Mutex<Vec<SubAgentStatus>>>>>,
 }
 
 impl AppState {
@@ -154,7 +183,16 @@ impl AppState {
             SkillRegistry::load(&skills_dir)
                 .unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "Failed to load skill registry");
-                    SkillRegistry::load(&std::path::PathBuf::new()).unwrap()
+                    SkillRegistry::load(&std::path::PathBuf::new()).unwrap_or_else(|e| {
+                        tracing::error!(error = %e, "SkillRegistry fallback load failed — skills disabled");
+                        // Create a temp dir for the fallback — load() succeeds on empty dirs
+                        let tmp = std::env::temp_dir().join("everevo_skills_fallback");
+                        let _ = std::fs::create_dir_all(&tmp);
+                        SkillRegistry::load(&tmp).unwrap_or_else(|e2| {
+                            tracing::error!(error = %e2, "SkillRegistry unrecoverable");
+                            panic!("SkillRegistry: cannot recover from load failure: {e2}");
+                        })
+                    })
                 })
         );
 
@@ -162,6 +200,8 @@ impl AppState {
             config, db,
             llm: RwLock::new(llm),
             bootstrap, downloader, init_pipeline,
+            init_phase: RwLock::new(InitPhase::Provisioning),
+            llm_notify: Notify::new(),
             sandboxes: RwLock::new(HashMap::new()),
             confirmations: Arc::new(RwLock::new(HashMap::new())),
             fact_manager,
@@ -172,6 +212,9 @@ impl AppState {
             domain_registry,
             telemetry,
             skill_registry,
+            session_actors: RwLock::new(HashMap::new()),
+            subagent_handles: RwLock::new(HashMap::new()),
+            subagent_statuses: RwLock::new(HashMap::new()),
         }))
     }
 
