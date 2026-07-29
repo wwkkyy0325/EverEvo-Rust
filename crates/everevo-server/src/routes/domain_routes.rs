@@ -11,10 +11,10 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
+use everevo_agent::knowledge::domain::{DocumentParser, Domain, DomainManager};
 use everevo_core::llm::LlmProvider;
 use everevo_core::retrieval::Retriever;
 use everevo_core::EverEvoError;
-use everevo_domain::{Domain, DomainManager, DocumentParser};
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -49,7 +49,9 @@ struct SearchQuery {
     limit: usize,
 }
 
-fn default_limit() -> usize { 20 }
+fn default_limit() -> usize {
+    20
+}
 
 #[derive(Debug, Deserialize)]
 struct MergeRequest {
@@ -87,7 +89,9 @@ async fn list_domains(
         })
         .collect();
 
-    Ok(Json(serde_json::json!({ "domains": domains, "total": domains.len() })))
+    Ok(Json(
+        serde_json::json!({ "domains": domains, "total": domains.len() }),
+    ))
 }
 
 /// POST /api/domains — create a new domain.
@@ -115,18 +119,21 @@ async fn create_domain(
     };
 
     mgr.registry.create(id.clone(), req.name, description);
-    mgr.registry.domains.get(&id).map(|_d| {
+    if mgr.registry.domains.contains_key(&id) {
         // Create domain directory structure
         let doc_dir = domain_root.join(&id).join("documents");
         let _ = std::fs::create_dir_all(&doc_dir);
         let inbox_dir = domain_root.join(&id).join("inbox");
         let _ = std::fs::create_dir_all(&inbox_dir);
-    });
+    }
     mgr.save()?;
 
-    let domain = mgr.registry.domains.get(&id)
+    let domain = mgr
+        .registry
+        .domains
+        .get(&id)
         .cloned()
-        .ok_or_else(|| EverEvoError::NotFound(id))?;
+        .ok_or(EverEvoError::NotFound(id))?;
 
     Ok(Json(domain))
 }
@@ -182,7 +189,9 @@ async fn delete_domain(
     let mut mgr = DomainManager::load(&domain_root)?;
 
     if !mgr.registry.domains.contains_key(&domain_id) {
-        return Err(AppError::not_found(format!("Domain '{domain_id}' not found")));
+        return Err(AppError::not_found(format!(
+            "Domain '{domain_id}' not found"
+        )));
     }
 
     // Mark as merged into "archived" (soft delete)
@@ -208,14 +217,16 @@ async fn ingest_document(
     let mut mgr = DomainManager::load_with_onnx(&domain_root, &models_dir)?;
 
     if !mgr.registry.domains.contains_key(&domain_id) {
-        return Err(AppError::not_found(format!("Domain '{domain_id}' not found")));
+        return Err(AppError::not_found(format!(
+            "Domain '{domain_id}' not found"
+        )));
     }
 
     let doc_id = Uuid::new_v4();
     let filename = format!("{doc_id}.md");
     let text = DocumentParser::parse(&filename, body.as_bytes()).unwrap_or(body.clone());
-    let _hash = everevo_domain::content_hash(&text);
-    let chunker = everevo_domain::SemanticChunker::default();
+    let _hash = everevo_agent::knowledge::domain::content_hash(&text);
+    let chunker = everevo_agent::knowledge::domain::SemanticChunker::default();
     let chunks = chunker.chunk(&text);
 
     // Write document to domain's documents directory
@@ -225,8 +236,9 @@ async fn ingest_document(
         .map_err(|e| EverEvoError::Internal(format!("Write doc: {e}")))?;
 
     // Update centroid with real embedding (falls back to dummy if ONNX unavailable)
-    let doc_vec: Vec<f32> = if let Some(ref emb) = mgr.embedder() {
-        emb.encode(&text).unwrap_or_else(|_| vec![0.1_f32; mgr.registry.embedding_dim])
+    let doc_vec: Vec<f32> = if let Some(emb) = mgr.embedder() {
+        emb.encode(&text)
+            .unwrap_or_else(|_| vec![0.1_f32; mgr.registry.embedding_dim])
     } else {
         vec![0.1_f32; mgr.registry.embedding_dim]
     };
@@ -258,10 +270,10 @@ async fn process_inbox(
         for new_id in &result.new_domains {
             if let Some(domain) = mgr.registry.domains.get(new_id) {
                 let prompt = build_domain_description_prompt(&domain.name, domain.document_count);
-                if let Ok(resp) = client.chat(
-                    &[everevo_core::llm::LlmMessage::user(&prompt)],
-                    &[],
-                ).await {
+                if let Ok(resp) = client
+                    .chat(&[everevo_core::llm::LlmMessage::user(&prompt)], &[])
+                    .await
+                {
                     if let Some(desc) = resp.content {
                         if let Some(d) = mgr.registry.domains.get_mut(new_id) {
                             d.description = desc.lines().take(3).collect::<Vec<_>>().join(" ");
@@ -291,7 +303,10 @@ async fn merge_domain(
     mgr.registry.merge_domains(&target_id, &req.source_id)?;
     mgr.save()?;
 
-    let target = mgr.registry.domains.get(&target_id)
+    let target = mgr
+        .registry
+        .domains
+        .get(&target_id)
         .ok_or_else(|| EverEvoError::NotFound(target_id.clone()))?;
 
     Ok(Json(serde_json::json!({
@@ -310,7 +325,7 @@ async fn search_domains(
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let domain_root = state.config.data_dir.join("domain");
-    let retriever = everevo_domain::DomainRetriever::new(&domain_root);
+    let retriever = everevo_agent::knowledge::domain::DomainRetriever::new(&domain_root);
     let results = retriever.search(&query.q, query.limit);
 
     Ok(Json(serde_json::json!({
@@ -340,7 +355,8 @@ async fn rag_search(
     State(state): State<Arc<AppState>>,
     Query(query): Query<RagSearchQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let rag = everevo_agent::rag::RagPipeline::new(&state.config.data_dir)?;
+    let rag = state.rag_pipeline.as_ref()
+        .ok_or_else(|| EverEvoError::Internal("RAG pipeline not initialized".into()))?;
     let results = rag.search(&query.q, query.top_k)?;
     Ok(Json(serde_json::json!({
         "real_embeddings": rag.real_embeddings,
@@ -358,9 +374,10 @@ async fn rag_ingest(
     State(state): State<Arc<AppState>>,
     body: String,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    use everevo_agent::rag::{make_chunk, RagPipeline};
+    use everevo_agent::rag::make_chunk;
     use everevo_vector::ChunkType;
-    let rag = RagPipeline::new(&state.config.data_dir)?;
+    let rag = state.rag_pipeline.as_ref()
+        .ok_or_else(|| EverEvoError::Internal("RAG pipeline not initialized".into()))?;
     let chunk = make_chunk(body, ChunkType::Fact, vec![]);
     rag.ingest(vec![chunk])?;
     Ok(Json(serde_json::json!({ "ingested": 1 })))
@@ -387,7 +404,11 @@ async fn create_fact(
     let now = chrono::Utc::now();
     let fact = everevo_core::memory::MemoryFact {
         name: req.name.clone(),
-        description: if req.description.is_empty() { req.name.clone() } else { req.description },
+        description: if req.description.is_empty() {
+            req.name.clone()
+        } else {
+            req.description
+        },
         content: req.content,
         fact_type: ft,
         created_at: now,
@@ -395,7 +416,9 @@ async fn create_fact(
         projection: everevo_core::memory::ProjectionMetadata::new("1.0", "api", vec![], 1.0),
         links: vec![],
     };
-    state.fact_manager.save(&fact)
+    state
+        .fact_manager
+        .save(&fact)
         .map_err(|e| AppError::from(EverEvoError::Internal(e.to_string())))?;
     Ok(Json(serde_json::json!({ "created": req.name })))
 }
@@ -425,22 +448,33 @@ async fn update_fact(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let facts = everevo_agent::memory::FactStore::load_all(&state.fact_manager)
         .map_err(|e| AppError::from(EverEvoError::Internal(e.to_string())))?;
-    let existing = facts.into_iter().find(|f| f.name == name)
+    let existing = facts
+        .into_iter()
+        .find(|f| f.name == name)
         .ok_or_else(|| AppError::not_found(format!("Fact '{name}' not found")))?;
 
-    let ft = everevo_core::memory::FactType::from_str(&req.fact_type)
-        .unwrap_or(existing.fact_type);
+    let ft = everevo_core::memory::FactType::from_str(&req.fact_type).unwrap_or(existing.fact_type);
     let updated = everevo_core::memory::MemoryFact {
         name: existing.name,
-        description: if req.description.is_empty() { existing.description } else { req.description },
-        content: if req.content.is_empty() { existing.content } else { req.content },
+        description: if req.description.is_empty() {
+            existing.description
+        } else {
+            req.description
+        },
+        content: if req.content.is_empty() {
+            existing.content
+        } else {
+            req.content
+        },
         fact_type: ft,
         created_at: existing.created_at,
         updated_at: chrono::Utc::now(),
         projection: existing.projection,
         links: existing.links,
     };
-    state.fact_manager.save(&updated)
+    state
+        .fact_manager
+        .save(&updated)
         .map_err(|e| AppError::from(EverEvoError::Internal(e.to_string())))?;
     Ok(Json(serde_json::json!({ "updated": name })))
 }
@@ -464,10 +498,16 @@ struct AppError {
 
 impl AppError {
     fn not_found(msg: String) -> Self {
-        Self { status: StatusCode::NOT_FOUND, message: msg }
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: msg,
+        }
     }
     fn conflict(msg: String) -> Self {
-        Self { status: StatusCode::CONFLICT, message: msg }
+        Self {
+            status: StatusCode::CONFLICT,
+            message: msg,
+        }
     }
 }
 
@@ -478,12 +518,19 @@ impl From<EverEvoError> for AppError {
             EverEvoError::InvalidInput(_) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        Self { status, message: e.to_string() }
+        Self {
+            status,
+            message: e.to_string(),
+        }
     }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
-        (self.status, Json(serde_json::json!({ "error": self.message }))).into_response()
+        (
+            self.status,
+            Json(serde_json::json!({ "error": self.message })),
+        )
+            .into_response()
     }
 }

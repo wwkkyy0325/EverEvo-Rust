@@ -4,8 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use crate::task::TaskId;
-
 /// Progress snapshot for a single task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Progress {
@@ -56,7 +54,10 @@ pub enum TaskState {
 
 impl TaskState {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Completed { .. } | Self::Failed { .. } | Self::Cancelled)
+        matches!(
+            self,
+            Self::Completed { .. } | Self::Failed { .. } | Self::Cancelled
+        )
     }
 
     pub fn is_active(&self) -> bool {
@@ -65,9 +66,8 @@ impl TaskState {
 }
 
 /// In-memory metadata for an active task.
+/// The task ID is always available from the HashMap key — no need to store it here.
 pub(crate) struct TaskMeta {
-    #[allow(dead_code)]
-    pub task_id: TaskId,
     pub state: TaskState,
     pub started_at: Option<Instant>,
     /// Sampling state for speed calculation
@@ -77,9 +77,8 @@ pub(crate) struct TaskMeta {
 }
 
 impl TaskMeta {
-    pub fn new(task_id: TaskId) -> Self {
+    pub fn new() -> Self {
         Self {
-            task_id,
             state: TaskState::Pending,
             started_at: None,
             last_sample_bytes: 0,

@@ -14,13 +14,12 @@ pub fn load_all_facts(facts_dir: &Path) -> Result<Vec<MemoryFact>, EverEvoError>
     if !facts_dir.exists() {
         return Ok(facts);
     }
-    let entries = std::fs::read_dir(facts_dir).map_err(|e| {
-        EverEvoError::Internal(format!("Failed to read facts dir: {e}"))
-    })?;
+    let entries = std::fs::read_dir(facts_dir)
+        .map_err(|e| EverEvoError::Internal(format!("Failed to read facts dir: {e}")))?;
     for entry in entries {
         let entry = entry.map_err(|e| EverEvoError::Internal(format!("Dir entry: {e}")))?;
         let path = entry.path();
-        if path.extension().map_or(false, |ext| ext == "md") {
+        if path.extension().is_some_and(|ext| ext == "md") {
             if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     if let Some(fact) = parse_fact_file(name, &content) {
@@ -40,7 +39,10 @@ pub fn regenerate_index(facts_dir: &Path, index_path: &Path) -> Result<(), EverE
 
     let mut by_type: HashMap<FactType, Vec<&MemoryFact>> = HashMap::new();
     for fact in &facts {
-        by_type.entry(fact.fact_type.clone()).or_default().push(fact);
+        by_type
+            .entry(fact.fact_type.clone())
+            .or_default()
+            .push(fact);
     }
 
     let type_order = [
@@ -73,9 +75,8 @@ pub fn regenerate_index(facts_dir: &Path, index_path: &Path) -> Result<(), EverE
         }
     }
 
-    std::fs::write(index_path, &index).map_err(|e| {
-        EverEvoError::Internal(format!("Failed to write index: {e}"))
-    })?;
+    std::fs::write(index_path, &index)
+        .map_err(|e| EverEvoError::Internal(format!("Failed to write index: {e}")))?;
 
     tracing::info!(count = facts.len(), "MEMORY.md regenerated");
     Ok(())
@@ -104,8 +105,7 @@ pub fn parse_index(content: &str) -> Vec<MemoryIndexEntry> {
             current_type = FactType::Reference;
             continue;
         }
-        if trimmed.starts_with("- [") {
-            let rest = &trimmed[3..];
+        if let Some(rest) = trimmed.strip_prefix("- [") {
             if let Some(name_end) = rest.find(']') {
                 let name = rest[..name_end].to_string();
                 let after_link = &rest[name_end + 1..];

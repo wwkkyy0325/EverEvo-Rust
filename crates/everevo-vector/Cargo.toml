@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "EverEvo vector store — embedding, chunking, and semantic search"
+description = "EverEvo vector store — embedding, chunking, and HNSW semantic search"
 
 [dependencies]
 everevo-core = { path = "../everevo-core" }
@@ -18,8 +18,10 @@ tokio.workspace = true
 thiserror.workspace = true
 futures.workspace = true
 
-# LanceDB — disk-backed ANN vector store. Compiled into binary.
-lancedb = "0.31"
+# HNSW — pure Rust ANN index with cosine distance. Zero FFI, no tokio.
+# Replaces LanceDB (which had nested-runtime panics on Windows) and
+# InMemory flat search (which didn't scale past 100K vectors).
+hnsw_rs = "0.3"
 
 # Fastembed — local ONNX embedding (uses ort internally)
 # Falls back to DummyEmbedder when feature is off or model missing
@@ -31,8 +33,7 @@ fastembed = { version = "5", optional = true }
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["load-dynamic"] }
 
 [features]
-default = ["lancedb", "onnx"]
-lancedb = []
+default = ["onnx"]
 onnx = ["fastembed"]
 
 [lints]

@@ -1,5 +1,6 @@
 // Permission confirmation dialog — appears when the sandbox (SemiAuto mode)
 // requires user approval for a dangerous command or external path access.
+// Sticky buttons ensure confirmation is always reachable regardless of command length.
 
 import { useStore } from '../store';
 
@@ -9,26 +10,35 @@ export default function ConfirmDialog() {
 
   if (!confirmRequest) return null;
 
+  const maxCmdLen = 600;
+  const cmdDisplay = confirmRequest.command.length > maxCmdLen
+    ? confirmRequest.command.slice(0, maxCmdLen) + '…'
+    : confirmRequest.command;
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-      <div className="bg-background border border-warning/50 rounded-xl p-5 max-w-lg w-full mx-4 shadow-2xl">
-        <div className="flex items-start gap-3 mb-3">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+      <div className="bg-background border border-warning/50 rounded-xl shadow-2xl max-w-lg w-full max-h-[85vh] flex flex-col overflow-hidden">
+        {/* Header — fixed at top */}
+        <div className="flex items-start gap-3 px-5 pt-5 pb-2 shrink-0">
           <span className="text-2xl shrink-0">⚠️</span>
-          <div>
-            <h2 className="text-sm font-bold text-warning">确认操作</h2>
+          <div className="min-w-0">
+            <span className="text-sm font-bold text-warning">确认操作</span>
             <p className="text-xs text-muted-foreground mt-1">{confirmRequest.reason}</p>
           </div>
         </div>
 
-        <div className="bg-secondary rounded p-3 mb-3">
-          <code className="text-xs text-foreground break-all">{confirmRequest.command}</code>
+        {/* Command — scrollable if too long */}
+        <div className="bg-secondary rounded mx-5 p-3 mb-3 max-h-40 overflow-y-auto shrink-0">
+          <code className="text-xs text-foreground break-all whitespace-pre-wrap">{cmdDisplay}</code>
         </div>
 
-        <p className="text-xs text-muted-foreground mb-3">
+        {/* Hint — fixed */}
+        <p className="text-xs text-muted-foreground px-5 mb-3 shrink-0">
           此命令被半自动模式拦截。请选择是否允许执行。
         </p>
 
-        <div className="flex gap-2 justify-end">
+        {/* Buttons — sticky at bottom */}
+        <div className="flex gap-2 justify-end px-5 pb-5 pt-2 border-t border-border shrink-0">
           <button
             onClick={() => confirmCommand(false)}
             className="px-4 py-2 rounded text-sm bg-secondary hover:bg-secondary/80 transition-colors"

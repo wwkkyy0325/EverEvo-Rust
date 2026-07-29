@@ -114,16 +114,15 @@ impl ConfigCenter {
 
     /// Get config as a string.
     pub fn get_str(&self, key: &str) -> Option<String> {
-        self.get(key).and_then(|v| match v.0 {
-            serde_json::Value::String(s) => Some(s),
-            other => Some(other.to_string()),
+        self.get(key).map(|v| match v.0 {
+            serde_json::Value::String(s) => s,
+            other => other.to_string(),
         })
     }
 
     /// Get config as f32.
     pub fn get_f32(&self, key: &str) -> Option<f32> {
-        self.get(key)
-            .and_then(|v| v.0.as_f64().map(|n| n as f32))
+        self.get(key).and_then(|v| v.0.as_f64().map(|n| n as f32))
     }
 
     /// Get config as i64.
@@ -162,9 +161,9 @@ impl ConfigCenter {
         // Collect all keys we know about (defaults + file config).
         if let Ok(file_config) = self.file_config.read() {
             for k in file_config.keys() {
-                result.entry(k.clone()).or_insert_with(|| {
-                    ConfigValue(serde_json::Value::Null)
-                });
+                result
+                    .entry(k.clone())
+                    .or_insert_with(|| ConfigValue(serde_json::Value::Null));
             }
         }
 
@@ -370,11 +369,7 @@ fn load_file_config(path: &Path) -> HashMap<String, ConfigValue> {
 }
 
 /// Recursively flatten a TOML table into dotted keys.
-fn flatten_toml_table(
-    table: &toml::Table,
-    prefix: &str,
-    out: &mut HashMap<String, ConfigValue>,
-) {
+fn flatten_toml_table(table: &toml::Table, prefix: &str, out: &mut HashMap<String, ConfigValue>) {
     for (key, val) in table {
         let full_key = if prefix.is_empty() {
             key.clone()
@@ -394,16 +389,12 @@ fn flatten_toml_table(
 fn toml_to_json(val: &toml::Value) -> serde_json::Value {
     match val {
         toml::Value::String(s) => serde_json::Value::String(s.clone()),
-        toml::Value::Integer(i) => {
-            serde_json::Value::Number(serde_json::Number::from(*i))
-        }
+        toml::Value::Integer(i) => serde_json::Value::Number(serde_json::Number::from(*i)),
         toml::Value::Float(f) => serde_json::Number::from_f64(*f)
             .map(serde_json::Value::Number)
             .unwrap_or(serde_json::Value::Null),
         toml::Value::Boolean(b) => serde_json::Value::Bool(*b),
-        toml::Value::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(toml_to_json).collect())
-        }
+        toml::Value::Array(arr) => serde_json::Value::Array(arr.iter().map(toml_to_json).collect()),
         toml::Value::Table(t) => {
             let mut map = serde_json::Map::new();
             for (k, v) in t {
@@ -526,12 +517,12 @@ rrf_k = 99
         // File config set rrf_k = 99; default is 60. Value should not be default
         // (may also be overridden by env vars leaking from parallel tests).
         let rrf_k = dump.get("retrieval.rrf_k").unwrap().0.as_i64().unwrap();
-        assert_ne!(rrf_k, 60, "rrf_k should be overridden by file (or env), not default 60");
+        assert_ne!(
+            rrf_k, 60,
+            "rrf_k should be overridden by file (or env), not default 60"
+        );
 
         // Default max_turns = 100 (no file override, no env set).
-        assert_eq!(
-            dump.get("agent.max_turns").unwrap().0.as_i64(),
-            Some(100)
-        );
+        assert_eq!(dump.get("agent.max_turns").unwrap().0.as_i64(), Some(100));
     }
 }

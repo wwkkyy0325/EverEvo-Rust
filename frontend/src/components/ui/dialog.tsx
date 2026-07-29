@@ -57,7 +57,7 @@ export function Dialog({ open, onClose, title, children, persistent, className }
         {/* Header */}
         {title && (
           <div className="flex items-center justify-between px-5 py-3 border-b border-border">
-            <h2 className="text-sm font-semibold text-foreground">{title}</h2>
+            <span className="text-sm font-semibold text-foreground">{title}</span>
             {!persistent && (
               <button
                 onClick={onClose}

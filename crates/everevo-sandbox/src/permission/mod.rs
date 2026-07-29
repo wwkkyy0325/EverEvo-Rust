@@ -31,5 +31,4 @@ mod patterns;
 mod rules;
 
 pub use level::{NetworkPolicy, PermissionLevel};
-pub use paths::{extract_paths, glob_match, is_path_allowed};
 pub use rules::{check_permission, command_is_denied, PermissionDecision, PermissionRules};

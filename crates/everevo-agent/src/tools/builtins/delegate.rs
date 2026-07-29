@@ -11,7 +11,7 @@
 //! The `handles` and `statuses` fields enable monitoring and cancellation
 //! via `GET /api/agent/tasks` and `POST /api/agent/tasks/{id}/cancel`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,7 +24,6 @@ use everevo_core::EverEvoError;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::orchestration::TaskType;
 use crate::subagent_context::SubAgentContext;
 
 // ── Defaults (safety floor if config is not provided) ─────────────────────
@@ -74,9 +73,9 @@ pub struct TaskTool {
     pub handles: Arc<std::sync::Mutex<Vec<SubAgentHandle>>>,
     /// Completed sub-agent statuses (pruned periodically).
     pub statuses: Arc<std::sync::Mutex<Vec<SubAgentStatus>>>,
-    /// Accumulated sub-agent result texts. Appended on completion,
-    /// drained by the auto-continue loop in chat.rs.
-    pub results_backlog: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Accumulated sub-agent results: (id, description, result_text).
+    /// Appended on completion, drained by the auto-continue loop in chat.rs.
+    pub results_backlog: Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
     /// Max turns per sub-agent (safety ceiling, configurable).
     subagent_max_turns: usize,
     /// Timeout per sub-agent in seconds (safety ceiling, configurable).
@@ -140,7 +139,10 @@ impl TaskTool {
             if s.status == "running" {
                 if let Ok(started) = chrono::DateTime::parse_from_rfc3339(&s.started_at) {
                     let started_utc = started.with_timezone(&chrono::Utc);
-                    s.elapsed_ms = now.signed_duration_since(started_utc).num_milliseconds().max(0) as u64;
+                    s.elapsed_ms = now
+                        .signed_duration_since(started_utc)
+                        .num_milliseconds()
+                        .max(0) as u64;
                 }
             }
         }
@@ -184,12 +186,13 @@ impl TaskTool {
         }
     }
 
-    fn dispatch_one(&self, desc: &str, stype: &str, max_turns: usize) {
+    fn dispatch_one(&self, desc: &str, stype: &str, max_turns: usize, isolation: Option<String>) {
         self.pending.fetch_add(1, Ordering::SeqCst);
 
         let cancel = CancellationToken::new();
         let subagent_id = Uuid::new_v4();
         let started_at = Utc::now();
+        let use_worktree = isolation.as_deref() == Some("worktree");
 
         // Register handle for cancellation
         let handle = SubAgentHandle {
@@ -198,19 +201,29 @@ impl TaskTool {
             started_at,
             cancel: cancel.clone(),
         };
-        self.handles.lock().unwrap_or_else(|e| e.into_inner()).push(handle);
+        self.handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(handle);
 
         // Register running status (visible immediately via API)
-        self.statuses.lock().unwrap_or_else(|e| e.into_inner()).push(SubAgentStatus {
-            id: subagent_id,
-            description: desc.to_string(),
-            started_at: started_at.to_rfc3339(),
-            status: "running".into(),
-            elapsed_ms: 0,
-        });
+        self.statuses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(SubAgentStatus {
+                id: subagent_id,
+                description: desc.to_string(),
+                started_at: started_at.to_rfc3339(),
+                status: "running".into(),
+                elapsed_ms: 0,
+            });
 
         // Compute effective limits (LLM-specified or config default)
-        let effective_max_turns = if max_turns == 0 { self.subagent_max_turns } else { max_turns };
+        let effective_max_turns = if max_turns == 0 {
+            self.subagent_max_turns
+        } else {
+            max_turns
+        };
         let effective_timeout_secs = self.subagent_timeout_secs;
 
         // Write telemetry START record (before execution, not just after)
@@ -238,7 +251,11 @@ impl TaskTool {
         let tools = Arc::clone(&self.base_tools);
         let llm = self.llm.clone();
         let ctx = self.subagent_ctx.read().unwrap().clone();
-        let tx = self.result_tx.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let tx = self
+            .result_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let pending = Arc::clone(&self.pending);
         let statuses = Arc::clone(&self.statuses);
         let backlog = Arc::clone(&self.results_backlog);
@@ -253,6 +270,38 @@ impl TaskTool {
                 return;
             };
 
+            // ── Git worktree isolation ─────────────────────────────
+            let _worktree_guard = if use_worktree {
+                let wt_name = format!("subagent-{}", subagent_id);
+                let wt_path = sandbox_root.join(&wt_name);
+                // Create worktree from HEAD
+                #[allow(clippy::disallowed_methods)]
+                let output = tokio::process::Command::new("git")
+                    .args([
+                        "worktree",
+                        "add",
+                        "--detach",
+                        wt_path.to_string_lossy().as_ref(),
+                        "HEAD",
+                    ])
+                    .output()
+                    .await;
+                match output {
+                    Ok(o) if o.status.success() => {
+                        tracing::info!(%subagent_id, path = %wt_path.display(), "Git worktree created");
+                        Some(wt_path)
+                    }
+                    _ => {
+                        tracing::warn!(%subagent_id, "Git worktree creation failed — using default sandbox");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let effective_root = _worktree_guard.as_ref().unwrap_or(&sandbox_root);
+
             // ── Execution with timeout + cancellation ──────────────
             let outcome: (&str, Option<String>) = tokio::select! {
                 _ = cancel.cancelled() => {
@@ -261,7 +310,7 @@ impl TaskTool {
                 r = tokio::time::timeout(
                     Duration::from_secs(effective_timeout_secs),
                     spawn_single(
-                        &sandbox_root, &tools, llm_client,
+                        effective_root, &tools, llm_client,
                         &desc, &stype, &ctx,
                         effective_max_turns, cancel.clone(),
                     ),
@@ -291,8 +340,32 @@ impl TaskTool {
                     s.status = outcome.0.to_string();
                     if let Ok(started) = chrono::DateTime::parse_from_rfc3339(&s.started_at) {
                         let started_utc = started.with_timezone(&chrono::Utc);
-                        s.elapsed_ms =
-                            Utc::now().signed_duration_since(started_utc).num_milliseconds().max(0) as u64;
+                        s.elapsed_ms = Utc::now()
+                            .signed_duration_since(started_utc)
+                            .num_milliseconds()
+                            .max(0) as u64;
+                    }
+                }
+            }
+
+            // ── Clean up git worktree ───────────────────────────────
+            if let Some(ref wt_path) = _worktree_guard {
+                #[allow(clippy::disallowed_methods)]
+                let output = tokio::process::Command::new("git")
+                    .args([
+                        "worktree",
+                        "remove",
+                        "--force",
+                        wt_path.to_string_lossy().as_ref(),
+                    ])
+                    .output()
+                    .await;
+                match output {
+                    Ok(o) if o.status.success() => {
+                        tracing::info!(%subagent_id, path = %wt_path.display(), "Git worktree removed");
+                    }
+                    _ => {
+                        tracing::warn!(%subagent_id, path = %wt_path.display(), "Git worktree cleanup failed");
                     }
                 }
             }
@@ -305,7 +378,10 @@ impl TaskTool {
 
             if let Some(result_text) = outcome.1.clone() {
                 let _ = tx.map(|t| t.send(result_text.clone()));
-                backlog.lock().unwrap_or_else(|e| e.into_inner()).push(result_text);
+                backlog
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((subagent_id.to_string(), desc.to_string(), result_text));
             } else if outcome.0 == "cancelled" {
                 let _ = tx.map(|t| {
                     t.send(format!(
@@ -314,7 +390,10 @@ impl TaskTool {
                 });
             }
         });
-        task_handles.lock().unwrap_or_else(|e| e.into_inner()).push(handle);
+        task_handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(handle);
     }
 }
 
@@ -332,7 +411,8 @@ impl Tool for TaskTool {
                 "description": {"type": "string"},
                 "subtasks": {"type": "array", "items": {"type": "object", "properties": {"description": {"type": "string"}, "subagent_type": {"type": "string"}}, "required": ["description"]}},
                 "subagent_type": {"type": "string"},
-                "max_turns": {"type": "integer", "description": "Max turns (0=unlimited)"}
+                "max_turns": {"type": "integer", "description": "Max turns (0=unlimited)"},
+                "isolation": {"type": "string", "enum": ["worktree", "none"], "description": "Isolation mode: worktree (git worktree) or none (default)"}
             }
         })
     }
@@ -340,18 +420,18 @@ impl Tool for TaskTool {
         RiskLevel::Medium
     }
 
-    async fn execute(&self, params: serde_json::Value) -> Result<ToolOutput, EverEvoError> {
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        _cancel: Option<&CancellationToken>,
+    ) -> Result<ToolOutput, EverEvoError> {
         if let Some(subtasks) = params["subtasks"].as_array() {
             for st in subtasks {
                 let d = st["description"].as_str().unwrap_or("unnamed");
-                let t = st["subagent_type"]
-                    .as_str()
-                    .unwrap_or("code-explorer");
-                let mt = st["max_turns"]
-                    .as_u64()
-                    .map(|v| v as usize)
-                    .unwrap_or(0);
-                self.dispatch_one(d, t, mt);
+                let t = st["subagent_type"].as_str().unwrap_or("code-explorer");
+                let mt = st["max_turns"].as_u64().map(|v| v as usize).unwrap_or(0);
+                let iso = st["isolation"].as_str().map(|s| s.to_string());
+                self.dispatch_one(d, t, mt, iso);
             }
             return Ok(ToolOutput {
                 content: format!("{} subagents dispatched", subtasks.len()),
@@ -366,10 +446,9 @@ impl Tool for TaskTool {
             .as_u64()
             .map(|v| v as usize)
             .unwrap_or(0);
-        let stype = params["subagent_type"]
-            .as_str()
-            .unwrap_or("code-explorer");
-        self.dispatch_one(desc, stype, max_turns);
+        let stype = params["subagent_type"].as_str().unwrap_or("code-explorer");
+        let isolation = params["isolation"].as_str().map(|s| s.to_string());
+        self.dispatch_one(desc, stype, max_turns, isolation);
         Ok(ToolOutput {
             content: format!("SubAgent dispatched: {desc}"),
             is_error: false,
@@ -377,10 +456,44 @@ impl Tool for TaskTool {
     }
 }
 
+/// Type-specific guidance injected into the sub-agent system prompt.
+fn stype_guidance(stype: &str) -> String {
+    match stype {
+        "reviewer" => "\n\n## Role: Code Reviewer\n\
+            You are a critical code reviewer. Focus on:\n\
+            - Correctness bugs and edge cases\n\
+            - Security vulnerabilities\n\
+            - Performance issues\n\
+            - Adherence to project conventions\n\
+            - Test coverage gaps\n\
+            Be thorough and adversarial — find every issue.\n"
+            .into(),
+        "research" | "code-explorer" => "\n\n## Role: Researcher\n\
+            You are a thorough researcher. Focus on:\n\
+            - Exploring all relevant files and patterns\n\
+            - Finding connections across modules\n\
+            - Documenting your findings with file paths and line numbers\n\
+            - Providing a structured, comprehensive report\n\
+            Leave no stone unturned.\n"
+            .into(),
+        "file" => "\n\n## Role: File Operations\n\
+            You are a precise file operator. Focus on:\n\
+            - Making the requested file changes exactly as specified\n\
+            - Verifying each change with tests or checks\n\
+            - Leaving no unintended side effects\n\
+            - Reporting what was changed and why.\n"
+            .into(),
+        _ => "\n\n## Role: General Assistant\n\
+            Complete the assigned task thoroughly and return a structured result.\n"
+            .into(),
+    }
+}
+
 // ── spawn_single ──────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn spawn_single(
-    sandbox_root: &PathBuf,
+    sandbox_root: &Path,
     base_tools: &everevo_core::tool::ToolRegistry,
     llm: Arc<crate::llm::HttpClient>,
     desc: &str,
@@ -389,12 +502,9 @@ async fn spawn_single(
     max_turns: usize,
     cancel: CancellationToken,
 ) -> String {
-    let _task_type = match stype {
-        "reviewer" => TaskType::ReviewTask,
-        "research" => TaskType::ResearchTask,
-        "file" => TaskType::FileOperation,
-        _ => TaskType::CodeTask,
-    };
+    // Increment recursion depth for this sub-agent's children
+    let mut child_ctx = sub_ctx.clone();
+    child_ctx.depth = sub_ctx.depth.saturating_add(1);
 
     let mut sub_tools = everevo_core::tool::ToolRegistry::new();
     if let Some(shell) = base_tools.get("shell") {
@@ -404,57 +514,26 @@ async fn spawn_single(
         sub_tools.register(Arc::clone(memory));
     }
 
-    // Build the full system prompt from the assembled context.
-    let system_prompt = sub_ctx.build_system_prompt(desc);
+    // Build the full system prompt with type-specific guidance.
+    let mut system_prompt = child_ctx.build_system_prompt(desc);
+    system_prompt.push_str(&stype_guidance(stype));
+
     let messages = vec![
         everevo_core::llm::LlmMessage::system(&system_prompt),
-        everevo_core::llm::LlmMessage::user(&format!(
+        everevo_core::llm::LlmMessage::user(format!(
             "Execute this task and return the result:\n\n{desc}\n\n\
              If you need to run shell commands, use the shell tool.\n\
              Report ALL findings including empty results.",
         )),
     ];
 
-    // Run with max_turns limit — prevents infinite loops ("失联" fix).
-    let agent_loop = crate::AgentLoop::new().with_max_turns(max_turns);
-    let mut rx = agent_loop
-        .run(llm, Arc::new(sub_tools), messages, None)
-        .await;
-
-    let mut final_text = String::new();
-    let mut tool_call_count = 0usize;
+    // Run with max_turns limit — uses shared AgentLoop::run_subagent().
     let start = std::time::Instant::now();
     let sa_id = Uuid::new_v4();
-
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                final_text = "Sub-agent cancelled by user.".into();
-                break;
-            }
-            event = rx.recv() => {
-                match event {
-                    Some(crate::AgentEvent::ToolCallStart { .. }) => {
-                        tool_call_count += 1;
-                    }
-                    Some(crate::AgentEvent::Done { final_text: text }) => {
-                        final_text = text;
-                        break;
-                    }
-                    Some(crate::AgentEvent::Error { message }) => {
-                        final_text = message;
-                        break;
-                    }
-                    None => {
-                        // Channel closed
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
+    let agent_loop = crate::AgentLoop::new().with_max_turns(max_turns);
+    let final_text = agent_loop
+        .run_subagent(llm, Arc::new(sub_tools), messages, cancel)
+        .await;
     let duration_ms = start.elapsed().as_millis() as u64;
 
     // Persist telemetry (completion record)
@@ -470,8 +549,7 @@ async fn spawn_single(
             "id": sa_id.to_string(),
             "task": desc,
             "success": !final_text.is_empty(),
-            "turns": 0,
-            "tool_calls": tool_call_count,
+            "_note": "turn/tool_call counts not tracked by run_subagent",
             "duration_ms": duration_ms,
             "content": &final_text[..500.min(final_text.len())],
         }))
@@ -483,8 +561,7 @@ async fn spawn_single(
         "agent_id": sa_id.to_string(),
         "task": desc,
         "status": if is_error { "FAILED" } else { "SUCCESS" },
-        "turns": 0,
-        "tool_calls": tool_call_count,
+        "_note": "turn/tool_call counts not tracked by run_subagent",
         "duration_ms": duration_ms,
         "timestamp": Utc::now().to_rfc3339(),
         "schema_version": "1.0",
@@ -535,7 +612,7 @@ mod tests {
                 None,
             );
             let r = t
-                .execute(serde_json::json!({"description": "test"}))
+                .execute(serde_json::json!({"description": "test"}), None)
                 .await
                 .unwrap();
             assert!(!r.is_error);
@@ -551,8 +628,16 @@ mod tests {
             None,
         );
         // Start with no handles
-        assert!(t.handles.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
-        assert!(t.statuses.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+        assert!(t
+            .handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty());
+        assert!(t
+            .statuses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty());
     }
 
     #[test]
@@ -591,10 +676,17 @@ mod tests {
             status: "completed".into(),
             elapsed_ms: 1000,
         };
-        t.statuses.lock().unwrap_or_else(|e| e.into_inner()).push(old);
+        t.statuses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(old);
         t.prune_statuses();
         // Old completed should be pruned
-        assert!(t.statuses.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+        assert!(t
+            .statuses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty());
     }
 
     #[test]
@@ -611,9 +703,15 @@ mod tests {
             status: "running".into(),
             elapsed_ms: 5000,
         };
-        t.statuses.lock().unwrap_or_else(|e| e.into_inner()).push(running);
+        t.statuses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(running);
         t.prune_statuses();
         // Running should NOT be pruned
-        assert_eq!(t.statuses.lock().unwrap_or_else(|e| e.into_inner()).len(), 1);
+        assert_eq!(
+            t.statuses.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            1
+        );
     }
 }

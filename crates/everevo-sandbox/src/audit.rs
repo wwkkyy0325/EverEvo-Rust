@@ -1,14 +1,32 @@
-//! Audit trail — append-only JSONL writer, one record per line.
-//!
-//! Each session gets its own `audit.jsonl` in its sandbox directory.
-//! Records are flushed after every write so crashes don't lose data.
+//! Audit trail — structured record + append-only JSONL writer.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::provider::AuditRecord;
+/// Structured audit record — one per sandbox execution.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AuditRecord {
+    pub timestamp: String,
+    pub shell: String,
+    pub command: String,
+    pub working_dir: String,
+    pub timeout_secs: u64,
+    pub exit_code: i32,
+    pub duration_ms: u64,
+    pub killed_by_timeout: bool,
+    pub stdout_len: usize,
+    pub stderr_len: usize,
+    pub permission_level: String,
+    pub was_confirmed: bool,
+    pub requires_admin: bool,
+    pub network_allowed: bool,
+    pub memory_limit_mb: Option<u64>,
+    pub job_object_applied: bool,
+    pub external_paths: Vec<String>,
+    pub decision: String,
+}
 
 /// Thread-safe append-only JSONL audit writer.
 pub struct AuditWriter {
@@ -18,7 +36,7 @@ pub struct AuditWriter {
 
 impl AuditWriter {
     /// Create (or append to) an audit file at `dir/audit.jsonl`.
-    pub fn open(dir: &PathBuf) -> Result<Self, String> {
+    pub fn open(dir: &Path) -> Result<Self, String> {
         let path = dir.join("audit.jsonl");
         let file = OpenOptions::new()
             .create(true)

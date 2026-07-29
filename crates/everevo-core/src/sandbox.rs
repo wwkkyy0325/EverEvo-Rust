@@ -54,14 +54,35 @@ impl ExecutionConfig {
         }
     }
 
-    pub fn with_args(mut self, args: Vec<String>) -> Self { self.args = args; self }
-    pub fn with_timeout(mut self, secs: u64) -> Self { self.timeout_secs = secs; self }
-    pub fn with_working_dir(mut self, dir: PathBuf) -> Self { self.working_dir = Some(dir); self }
-    pub fn with_env(mut self, key: &str, val: &str) -> Self { self.env_vars.insert(key.into(), val.into()); self }
-    pub fn with_network(mut self, allowed: bool) -> Self { self.network_allowed = allowed; self }
-    pub fn with_memory_limit(mut self, mb: u64) -> Self { self.memory_limit_mb = Some(mb); self }
+    pub fn with_args(mut self, args: Vec<String>) -> Self {
+        self.args = args;
+        self
+    }
+    pub fn with_timeout(mut self, secs: u64) -> Self {
+        self.timeout_secs = secs;
+        self
+    }
+    pub fn with_working_dir(mut self, dir: PathBuf) -> Self {
+        self.working_dir = Some(dir);
+        self
+    }
+    pub fn with_env(mut self, key: &str, val: &str) -> Self {
+        self.env_vars.insert(key.into(), val.into());
+        self
+    }
+    pub fn with_network(mut self, allowed: bool) -> Self {
+        self.network_allowed = allowed;
+        self
+    }
+    pub fn with_memory_limit(mut self, mb: u64) -> Self {
+        self.memory_limit_mb = Some(mb);
+        self
+    }
     /// Mark this command as user-confirmed — bypasses the SemiAuto confirmation gate.
-    pub fn with_confirmed(mut self, confirmed: bool) -> Self { self.confirmed = confirmed; self }
+    pub fn with_confirmed(mut self, confirmed: bool) -> Self {
+        self.confirmed = confirmed;
+        self
+    }
 }
 
 /// Abstract sandbox — every isolation tier implements this.

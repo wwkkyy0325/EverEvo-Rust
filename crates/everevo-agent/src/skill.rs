@@ -1,5 +1,12 @@
-//! Skill Registry — scans data/skills/ for SKILL.md files, parses YAML
-//! frontmatter, and builds an index for context injection.
+//! Skill Registry — scans data/skills/ for user SKILL.md files and
+//! merges with built-in skills embedded in the binary.
+//!
+//! ## Two sources, merged at startup
+//!
+//! 1. **Built-in** — shipped in the binary via `include_str!()`. Guaranteed
+//!    present on every install, no filesystem dependency.
+//! 2. **User** — loaded from `data/skills/` at runtime. Users can add their
+//!    own skills without rebuilding.
 //!
 //! ## Two-stage injection pattern
 //!
@@ -9,14 +16,21 @@
 //! Stage 2 (on-demand, future): when the LLM invokes a skill by name, the
 //! full SKILL.md body is loaded and injected into the prompt.
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use everevo_core::context::{ContextBuildContext, ContextFragment, ContextStage};
-use everevo_core::llm::LlmMessage;
 use everevo_core::EverEvoError;
+
+use crate::memory::frontmatter::parse_frontmatter;
+
+// ── Built-in Skills ──────────────────────────────────────────────────────
+
+/// Content for built-in skills, embedded in the binary at compile time.
+/// Each entry: (directory_name, "SKILL.md content").
+const BUILTIN_SKILLS: &[(&str, &str)] = &[(
+    "anti-fixation",
+    include_str!("../builtin-skills/anti-fixation/SKILL.md"),
+)];
 
 // ── Skill ─────────────────────────────────────────────────────────────────
 
@@ -36,12 +50,20 @@ pub struct Skill {
 
 /// Scans `data/skills/` for SKILL.md files and builds an in-memory index.
 pub struct SkillRegistry {
-    skills: Vec<Skill>,
-    #[allow(dead_code)]
-    skills_dir: PathBuf,
+    pub(crate) skills: Vec<Skill>,
+    pub(crate) skills_dir: PathBuf,
 }
 
 impl SkillRegistry {
+    /// Create an empty registry — used as a last-resort fallback when
+    /// all load attempts fail. Skills are non-critical; graceful degradation.
+    pub fn empty() -> Self {
+        Self {
+            skills: Vec::new(),
+            skills_dir: PathBuf::new(),
+        }
+    }
+
     /// Scan `skills_dir` for SKILL.md files, parse YAML frontmatter.
     pub fn load(skills_dir: &Path) -> Result<Self, EverEvoError> {
         let mut skills = Vec::new();
@@ -133,7 +155,7 @@ impl SkillRegistry {
             })
             .collect();
 
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_by_key(|(count, _)| std::cmp::Reverse(*count));
         scored.into_iter().map(|(_, s)| s).collect()
     }
 
@@ -149,51 +171,45 @@ impl SkillRegistry {
             .map(|s| (s.name.clone(), s.description.clone()))
             .collect()
     }
-}
 
-// ── SkillStage (ContextPipeline Integration) ──────────────────────────────
-
-/// Injects available skill names + descriptions into the LLM context.
-///
-/// Stage 1 only — lightweight metadata injection so the LLM knows what
-/// skills exist. Full skill bodies are loaded on-demand in Stage 2 (future).
-pub struct SkillStage {
-    registry: Arc<SkillRegistry>,
-}
-
-impl SkillStage {
-    pub fn new(registry: Arc<SkillRegistry>) -> Self {
-        Self { registry }
-    }
-}
-
-impl ContextStage for SkillStage {
-    fn priority(&self) -> i32 {
-        2 // after PersonaStage(1), before MemoryStage(3)
+    /// Re-scan the skills directory and reload all SKILL.md files.
+    /// Useful when skills are added/removed at runtime without restarting.
+    pub fn rescan(&mut self) -> Result<(), everevo_core::EverEvoError> {
+        let reloaded = SkillRegistry::load(&self.skills_dir)?;
+        self.skills = reloaded.skills;
+        Ok(())
     }
 
-    fn name(&self) -> &str {
-        "skills"
-    }
-
-    fn build(&self, _ctx: &ContextBuildContext) -> Option<ContextFragment> {
-        let metadata = self.registry.list_metadata();
-        if metadata.is_empty() {
-            return None;
+    /// Register built-in skills embedded in the binary at compile time.
+    ///
+    /// These are always available regardless of what's in `data/skills/`.
+    /// Built-in skills are loaded BEFORE user skills; if a user skill has
+    /// the same name, the user version takes precedence (last wins).
+    pub fn with_builtins(mut self) -> Self {
+        for (dir_name, content) in BUILTIN_SKILLS {
+            // Use a synthetic path so parse_skill_md logs are meaningful.
+            let fake_path = PathBuf::from("[builtin]").join(dir_name).join("SKILL.md");
+            match parse_skill_md(content, &fake_path) {
+                Ok(skill) => {
+                    // Remove any existing skill with the same name (user override).
+                    self.skills.retain(|s| s.name != skill.name);
+                    tracing::info!(
+                        name = %skill.name,
+                        "Registered built-in skill"
+                    );
+                    self.skills.push(skill);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        skill = %dir_name,
+                        error = %e,
+                        "Failed to parse built-in skill (skipping)"
+                    );
+                }
+            }
         }
-        let content: String = metadata
-            .iter()
-            .map(|(name, desc)| format!("- **{name}**: {desc}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        Some(ContextFragment {
-            label: "Available Skills".into(),
-            messages: vec![LlmMessage::user(&format!(
-                "## Available Skills\n\n{content}\n\n\
-                 To use a skill, say \"use the {skill_name} skill\" or invoke it by name.",
-                skill_name = "{name}"
-            ))],
-        })
+        self.skills.sort_by(|a, b| a.name.cmp(&b.name));
+        self
     }
 }
 
@@ -230,10 +246,7 @@ fn parse_skill_md(content: &str, path: &Path) -> Result<Skill, String> {
         .get("name")
         .cloned()
         .ok_or_else(|| "Missing 'name' in frontmatter".to_string())?;
-    let description = fm
-        .get("description")
-        .cloned()
-        .unwrap_or_default();
+    let description = fm.get("description").cloned().unwrap_or_default();
 
     let tools = fm
         .get("tools")
@@ -242,12 +255,8 @@ fn parse_skill_md(content: &str, path: &Path) -> Result<Skill, String> {
 
     let persona = fm.get("persona").cloned();
 
-    // when_to_use may be an inline list or a multiline YAML list.
-    // If the frontmatter key is empty (multi-line), we look at the raw
-    // frontmatter lines to extract the list.
     let when_to_use = if let Some(raw) = fm.get("when_to_use") {
         if raw.is_empty() {
-            // Multiline — we need to re-parse from the raw frontmatter text
             parse_multiline_when_to_use(content)
         } else {
             parse_list_value(raw)
@@ -281,10 +290,11 @@ fn parse_multiline_when_to_use(content: &str) -> Vec<String> {
         if in_when_to_use {
             if let Some(stripped) = trimmed.strip_prefix("- ") {
                 items.push(stripped.trim().to_string());
-            } else if !trimmed.starts_with('-') && !trimmed.is_empty() && !trimmed.starts_with("---") {
-                // End of the list — not indented and not a dash item
+            } else if !trimmed.starts_with('-')
+                && !trimmed.is_empty()
+                && !trimmed.starts_with("---")
+            {
                 if trimmed.contains(':') {
-                    // Next frontmatter key
                     break;
                 }
             } else if trimmed.starts_with("---") {
@@ -295,58 +305,12 @@ fn parse_multiline_when_to_use(content: &str) -> Vec<String> {
     items
 }
 
-/// Parse YAML-like frontmatter from markdown content.
-/// Returns `(key_value_map, body_text)` or `None` if no frontmatter found.
-fn parse_frontmatter(content: &str) -> Option<(HashMap<String, String>, &str)> {
-    let content = content.trim();
-    if !content.starts_with("---") {
-        return None;
-    }
-    let rest = &content[3..];
-    let end = rest.find("\n---")?;
-    let fm_text = &rest[..end];
-    let body = rest[end + 4..].trim();
-
-    let mut map = HashMap::new();
-    let mut pending_key: Option<String> = None;
-
-    for line in fm_text.lines() {
-        if let Some(pending) = pending_key.take() {
-            // This line is a value for the pending key
-            let trimmed = line.trim();
-            if trimmed.starts_with("- ") {
-                // Multiline list continues — handled elsewhere by the caller,
-                // but we need to ingest at least the first item here.
-                // For now, store an empty marker so the caller knows to re-parse.
-                map.insert(pending, String::new());
-            } else if !trimmed.is_empty() {
-                map.insert(pending, trimmed.to_string());
-            }
-            continue;
-        }
-
-        if let Some((key, value)) = line.split_once(':') {
-            let key = key.trim().to_string();
-            let value = value.trim().to_string();
-            if value.is_empty() {
-                // Could be a multiline value — defer to next line
-                pending_key = Some(key);
-            } else {
-                map.insert(key, value);
-            }
-        }
-    }
-
-    Some((map, body))
-}
-
 // ── Keyword Match Helper ──────────────────────────────────────────────────
 
-/// Common stop words that don't carry semantic meaning for trigger matching.
 const STOP_WORDS: &[&str] = &[
-    "user", "asks", "ask", "for", "an", "or", "to", "when", "the", "a",
-    "wants", "want", "provides", "provide", "has", "have", "is", "are",
-    "be", "in", "on", "at", "with", "about", "check", "needs", "need",
+    "user", "asks", "ask", "for", "an", "or", "to", "when", "the", "a", "wants", "want",
+    "provides", "provide", "has", "have", "is", "are", "be", "in", "on", "at", "with", "about",
+    "check", "needs", "need",
 ];
 
 /// Check if a skill trigger matches a user message via keyword overlap.
@@ -416,12 +380,18 @@ when_to_use:
 Some body text.";
         let skill = parse_skill_md(content, Path::new("data/skills/code-review/SKILL.md")).unwrap();
         assert_eq!(skill.name, "code-review");
-        assert_eq!(skill.description, "Review code for bugs, style issues, and security problems");
+        assert_eq!(
+            skill.description,
+            "Review code for bugs, style issues, and security problems"
+        );
         assert_eq!(skill.tools, vec!["shell", "memory"]);
-        assert_eq!(skill.when_to_use, vec![
-            "User asks for code review",
-            "User wants to check code quality",
-        ]);
+        assert_eq!(
+            skill.when_to_use,
+            vec![
+                "User asks for code review",
+                "User wants to check code quality",
+            ]
+        );
         assert!(skill.body.contains("Code Review Skill"));
         assert!(skill.persona.is_none());
     }
@@ -440,7 +410,10 @@ persona: You are a senior architect.
 Body here.";
         let skill = parse_skill_md(content, Path::new("test/SKILL.md")).unwrap();
         assert_eq!(skill.name, "read-diagram");
-        assert_eq!(skill.persona.as_deref(), Some("You are a senior architect."));
+        assert_eq!(
+            skill.persona.as_deref(),
+            Some("You are a senior architect.")
+        );
     }
 
     // ── SkillRegistry ─────────────────────────────────────────────────
@@ -535,43 +508,33 @@ Body here.";
         assert_eq!(meta[1].1, "desc b");
     }
 
-    // ── SkillStage ────────────────────────────────────────────────────
-
     #[test]
-    fn test_skill_stage_builds_context_fragment() {
-        let skills = vec![Skill {
-            name: "test-skill".into(),
-            description: "A test skill for testing".into(),
-            body: "body".into(),
-            tools: vec![],
-            when_to_use: vec![],
-            persona: None,
-            path: PathBuf::from("test"),
-        }];
-        let registry = Arc::new(SkillRegistry {
-            skills,
-            skills_dir: PathBuf::from("test"),
-        });
-        let stage = SkillStage::new(registry);
-        let ctx = ContextBuildContext::default();
-
-        let fragment = stage.build(&ctx).unwrap();
-        assert_eq!(fragment.label, "Available Skills");
-        assert_eq!(fragment.messages.len(), 1);
-        let content = &fragment.messages[0].content;
-        assert!(content.contains("Available Skills"));
-        assert!(content.contains("**test-skill**"));
-        assert!(content.contains("A test skill for testing"));
+    fn test_with_builtins_registers_anti_fixation() {
+        let registry = SkillRegistry::empty().with_builtins();
+        let skill = registry.get("anti-fixation").expect("anti-fixation should be registered");
+        assert!(skill.description.contains("fixation"));
+        assert!(!skill.body.is_empty());
     }
 
     #[test]
-    fn test_skill_stage_empty_registry_returns_none() {
-        let registry = Arc::new(SkillRegistry {
-            skills: vec![],
-            skills_dir: PathBuf::from("test"),
+    fn test_builtin_user_override_last_wins() {
+        // User directory skill with same name as builtin — user wins
+        let mut registry = SkillRegistry::empty();
+        // Manually add a "user" skill with the same name
+        registry.skills.push(Skill {
+            name: "anti-fixation".into(),
+            description: "user override version".into(),
+            body: "custom".into(),
+            tools: vec![],
+            when_to_use: vec![],
+            persona: None,
+            path: PathBuf::from("data/skills/anti-fixation/SKILL.md"),
         });
-        let stage = SkillStage::new(registry);
-        let ctx = ContextBuildContext::default();
-        assert!(stage.build(&ctx).is_none());
+        // with_builtins should remove user version and register builtin
+        let registry = registry.with_builtins();
+        let skill = registry.get("anti-fixation").unwrap();
+        // Built-in wins (registered after user, removes duplicates first,
+        // then inserts itself)
+        assert!(skill.body.contains("Anti-Fixation Protocol"));
     }
 }

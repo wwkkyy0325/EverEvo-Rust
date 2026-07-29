@@ -2,7 +2,22 @@ import { useEffect, useState, useRef } from 'react';
 import { useStore } from '../store';
 import appIcon from '@/assets/icons/app/everevo.svg';
 
-export default function SessionSidebar() {
+type SettingsTab = 'llm' | 'routing';
+
+const SETTINGS_ITEMS: { key: SettingsTab; icon: string; label: string }[] = [
+  { key: 'llm', icon: '⚙️', label: '大语言模型' },
+  { key: 'routing', icon: '🧭', label: '模型路由' },
+];
+
+export default function SessionSidebar({
+  view,
+  settingsTab,
+  onSettingsTabChange,
+}: {
+  view: 'chat' | 'settings' | 'bootstrap' | 'devpanel';
+  settingsTab: SettingsTab;
+  onSettingsTabChange: (tab: SettingsTab) => void;
+}) {
   const {
     sessions, sessionsLoading, activeSessionId,
     loadSessions, createSession, deleteSession, switchSession,
@@ -19,39 +34,62 @@ export default function SessionSidebar() {
         <span className="text-xs font-bold text-sidebar-foreground font-mono tracking-widest uppercase">EverEvo</span>
       </div>
 
-      {/* New session */}
-      <div className="p-2 border-b border-sidebar-border">
-        <button onClick={createSession}
-          className="w-full text-left bg-primary hover:bg-primary/90 text-primary-foreground text-xs font-medium py-2 px-3 transition-colors
-                     shadow-[inset_0_1px_0_0_rgba(255,255,255,0.15),inset_0_-1px_0_0_rgba(0,0,0,0.1)]
-                     active:shadow-[inset_0_1px_0_0_rgba(0,0,0,0.1),inset_0_-1px_0_0_rgba(255,255,255,0.08)] active:translate-y-px">
-          + 新建对话
-        </button>
-      </div>
-
-      {/* Session list */}
-      <nav className="flex-1 overflow-y-auto">
-        {sessionsLoading && sessions.length === 0 && (
-          <div className="p-4 text-center">
-            <div className="animate-spin w-5 h-5 border-2 border-primary border-t-transparent mx-auto" />
+      {view === 'chat' ? (
+        <>
+          {/* New session */}
+          <div className="p-2 border-b border-sidebar-border">
+            <button onClick={createSession}
+              className="w-full text-left bg-primary hover:bg-primary/90 text-primary-foreground text-xs font-medium py-2 px-3 transition-colors
+                         shadow-[inset_0_1px_0_0_rgba(255,255,255,0.15),inset_0_-1px_0_0_rgba(0,0,0,0.1)]
+                         active:shadow-[inset_0_1px_0_0_rgba(0,0,0,0.1),inset_0_-1px_0_0_rgba(255,255,255,0.08)] active:translate-y-px">
+              + 新建对话
+            </button>
           </div>
-        )}
-        {!sessionsLoading && sessions.length === 0 && (
-          <p className="text-xs text-muted-foreground text-center p-4">暂无对话</p>
-        )}
-        {sessions.map((s) => (
-          <SessionRow
-            key={s.id}
-            session={s}
-            active={activeSessionId === s.id}
-            onSelect={() => switchSession(s.id)}
-            onDelete={() => deleteSession(s.id)}
-            onArchive={() => archiveSession(s.id)}
-            onPin={() => pinSession(s.id)}
-            onRename={(t) => renameSession(s.id, t)}
-          />
-        ))}
-      </nav>
+
+          {/* Session list */}
+          <nav className="flex-1 overflow-y-auto">
+            {sessionsLoading && sessions.length === 0 && (
+              <div className="p-4 text-center">
+                <div className="animate-spin w-5 h-5 border-2 border-primary border-t-transparent mx-auto" />
+              </div>
+            )}
+            {!sessionsLoading && sessions.length === 0 && (
+              <p className="text-xs text-muted-foreground text-center p-4">暂无对话</p>
+            )}
+            {sessions.map((s) => (
+              <SessionRow
+                key={s.id}
+                session={s}
+                active={activeSessionId === s.id}
+                onSelect={() => switchSession(s.id)}
+                onDelete={() => deleteSession(s.id)}
+                onArchive={() => archiveSession(s.id)}
+                onPin={() => pinSession(s.id)}
+                onRename={(t) => renameSession(s.id, t)}
+              />
+            ))}
+          </nav>
+        </>
+      ) : (
+        /* Settings sub-nav */
+        <nav className="flex-1 overflow-y-auto">
+          {SETTINGS_ITEMS.map((item) => (
+            <div
+              key={item.key}
+              onClick={() => onSettingsTabChange(item.key)}
+              className={`flex items-center gap-2 px-3 py-2.5 cursor-pointer border-b border-sidebar-border/50 transition-all duration-300 border-l-[3px] ${
+                settingsTab === item.key
+                  ? 'bg-white/10'
+                  : 'hover:bg-sidebar-accent/50'
+              }`}
+              style={{ borderLeftColor: settingsTab === item.key ? 'var(--warning)' : 'transparent' }}
+            >
+              <span className="text-sm shrink-0">{item.icon}</span>
+              <span className="text-xs text-sidebar-foreground">{item.label}</span>
+            </div>
+          ))}
+        </nav>
+      )}
     </aside>
   );
 }
@@ -105,12 +143,12 @@ function SessionRow({
   return (
     <div
       onClick={onSelect}
-      className={`group px-3 py-2 cursor-pointer border-b border-sidebar-border/50 transition-all border-l-[3px] ${
+      className={`group px-3 py-2 cursor-pointer border-b border-sidebar-border/50 transition-all duration-300 border-l-[3px] ${
         active
           ? 'bg-white/10'
-          : 'hover:bg-sidebar-accent/50 border-l-transparent'
+          : 'hover:bg-sidebar-accent/50'
       }`}
-      style={active ? { borderLeftColor: 'var(--warning)', borderLeftWidth: '3px' } : { borderLeftWidth: '3px' }}
+      style={{ borderLeftColor: active ? 'var(--warning)' : 'transparent' }}
     >
       {/* Top row: title + ⋮ */}
       <div className="flex items-center justify-between gap-1">

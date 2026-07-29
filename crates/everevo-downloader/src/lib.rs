@@ -50,9 +50,9 @@ pub mod config;
 pub mod error;
 pub mod mirror;
 pub mod observer;
-pub mod resume;
+pub(crate) mod resume;
 pub mod state;
-pub mod strategy;
+pub(crate) mod strategy;
 pub mod task;
 mod worker;
 
@@ -115,7 +115,7 @@ impl Downloader {
         let task = Arc::new(task);
 
         // Register in state map
-        let meta = Arc::new(tokio::sync::Mutex::new(TaskMeta::new(task_id.clone())));
+        let meta = Arc::new(tokio::sync::Mutex::new(TaskMeta::new()));
         {
             let mut map = self.state_map.write().await;
             map.insert(task_id.clone(), meta.clone());
@@ -182,8 +182,8 @@ impl Downloader {
                     Err(DownloadError::Cancelled { task_id: task_id.clone() })
                 }
                 r = worker::execute_task(
-                    &task_clone, &client, &config, &*mirrors_guard,
-                    &*events, &*observers, &meta_clone,
+                    &task_clone, &client, &config, &mirrors_guard,
+                    &events, &observers, &meta_clone,
                 ) => r
             };
 
@@ -265,11 +265,11 @@ impl Downloader {
     /// Cancel a running or pending task.
     pub async fn cancel(&self, task_id: &str) -> Result<(), DownloadError> {
         let tokens = self.cancel_tokens.read().await;
-        let token = tokens.get(task_id).ok_or_else(|| {
-            DownloadError::TaskNotFound {
+        let token = tokens
+            .get(task_id)
+            .ok_or_else(|| DownloadError::TaskNotFound {
                 task_id: task_id.to_string(),
-            }
-        })?;
+            })?;
         token.cancel();
 
         self.events.send(DownloadEvent::Cancelled {
@@ -288,29 +288,6 @@ impl Downloader {
             task_id: task_id.to_string(),
         });
         Ok(())
-    }
-
-    /// Resubmit a previously paused/failed task using its resume state.
-    pub async fn resume_task(&self, task_id: &str) -> Result<TaskHandle, DownloadError> {
-        // Read the existing task meta and resume file
-        let map = self.state_map.read().await;
-        let meta = map
-            .get(task_id)
-            .ok_or_else(|| DownloadError::TaskNotFound {
-                task_id: task_id.to_string(),
-            })?;
-        let _state = meta.lock().await.state.clone();
-        drop(map);
-
-        // We need the original task — but we only have meta now.
-        // For proper resume, the caller should re-submit with the same task.
-        // This is a lightweight resubmit that just reuses the task_id.
-        Err(DownloadError::Other(
-            "resume_task requires re-submitting the original DownloadTask. \
-             Use downloader.submit(original_task) — the engine will \
-             automatically detect and use any existing .resume.json file."
-                .into(),
-        ))
     }
 
     // ── Mirror Management ──────────────────────────────────────────────
@@ -347,9 +324,9 @@ impl std::future::Future for TaskHandle {
     ) -> std::task::Poll<Self::Output> {
         match std::pin::pin!(&mut self.rx).poll(cx) {
             std::task::Poll::Ready(Ok(r)) => std::task::Poll::Ready(Ok(r)),
-            std::task::Poll::Ready(Err(_)) => std::task::Poll::Ready(Err(
-                DownloadError::Other("Task sender dropped".into()),
-            )),
+            std::task::Poll::Ready(Err(_)) => {
+                std::task::Poll::Ready(Err(DownloadError::Other("Task sender dropped".into())))
+            }
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }

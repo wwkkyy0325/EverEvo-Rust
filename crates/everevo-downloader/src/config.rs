@@ -57,10 +57,7 @@ impl Default for DownloaderConfig {
             timeout_secs: 30,
             chunk_threshold: 10 * 1024 * 1024, // 10 MiB
             temp_dir: None,
-            user_agent: format!(
-                "EverEvo-Downloader/{} (Rust)",
-                env!("CARGO_PKG_VERSION")
-            ),
+            user_agent: format!("EverEvo-Downloader/{} (Rust)", env!("CARGO_PKG_VERSION")),
             pool_idle_timeout_secs: 90,
             mirror_enabled: true,
             default_region: Region::Auto,

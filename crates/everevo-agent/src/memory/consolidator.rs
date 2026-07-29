@@ -165,7 +165,10 @@ impl MemoryConsolidator {
 
         match best_match {
             Some((ex, score)) if score > 0.95 => ConsolidationAction::Noop {
-                reason: format!("Nearly identical to existing fact '{}' (sim={:.3})", ex.name, score),
+                reason: format!(
+                    "Nearly identical to existing fact '{}' (sim={:.3})",
+                    ex.name, score
+                ),
             },
             Some((ex, score)) => ConsolidationAction::Update {
                 existing_name: ex.name.clone(),
@@ -176,21 +179,14 @@ impl MemoryConsolidator {
     }
 
     /// Apply threshold gating — does this candidate pass the DEEP phase gates?
-    pub fn passes_gates(
-        candidate: &ScoredCandidate,
-        recall_count: u32,
-        unique_days: u32,
-    ) -> bool {
+    pub fn passes_gates(candidate: &ScoredCandidate, recall_count: u32, unique_days: u32) -> bool {
         candidate.score >= MIN_SCORE
             && recall_count >= MIN_RECALL_COUNT
             && unique_days >= MIN_UNIQUE_QUERIES
     }
 
     /// Find facts that may need deprecation (low relevance, old, never retrieved).
-    pub fn find_stale_candidates(
-        facts: &[MemoryFact],
-        max_count: usize,
-    ) -> Vec<&MemoryFact> {
+    pub fn find_stale_candidates(facts: &[MemoryFact], max_count: usize) -> Vec<&MemoryFact> {
         let now = chrono::Utc::now();
         let threshold = chrono::Duration::days(90);
 
@@ -247,8 +243,14 @@ mod tests {
     #[test]
     fn test_identical_fact_is_update() {
         let c = MemoryConsolidator::default();
-        let cand = make_fact("pref", "User prefers async await over promise chains in all projects");
-        let existing = vec![make_fact("pref", "User prefers async await over promise chains in all projects")];
+        let cand = make_fact(
+            "pref",
+            "User prefers async await over promise chains in all projects",
+        );
+        let existing = vec![make_fact(
+            "pref",
+            "User prefers async await over promise chains in all projects",
+        )];
         let action = c.consolidate(&cand, &existing);
         assert!(matches!(action, ConsolidationAction::Update { .. }));
     }
@@ -258,17 +260,26 @@ mod tests {
         let mut c = MemoryConsolidator::default();
         c.similarity_threshold = 0.4; // lower threshold for test
         let cand = make_fact("pref-v2", "User prefers async await for JavaScript code");
-        let existing = vec![make_fact("pref", "User prefers async await for all code including JavaScript")];
+        let existing = vec![make_fact(
+            "pref",
+            "User prefers async await for all code including JavaScript",
+        )];
         let action = c.consolidate(&cand, &existing);
-        assert!(matches!(action, ConsolidationAction::Update { .. }),
-            "Expected Update, got {:?}", action);
+        assert!(
+            matches!(action, ConsolidationAction::Update { .. }),
+            "Expected Update, got {:?}",
+            action
+        );
     }
 
     #[test]
     fn test_unrelated_fact_is_add() {
         let c = MemoryConsolidator::default();
         let cand = make_fact("python-version", "Project uses Python 3.11");
-        let existing = vec![make_fact("pref", "User prefers async/await over promise chains")];
+        let existing = vec![make_fact(
+            "pref",
+            "User prefers async/await over promise chains",
+        )];
         let action = c.consolidate(&cand, &existing);
         assert_eq!(action, ConsolidationAction::Add);
     }

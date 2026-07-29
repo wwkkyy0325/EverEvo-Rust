@@ -31,14 +31,9 @@ pub struct ResumeState {
 
 impl ResumeState {
     /// Create a new resume state.
-    pub fn new(
-        task_id: &str,
-        url: &str,
-        total_size: u64,
-        chunk_size: u64,
-    ) -> Self {
+    pub fn new(task_id: &str, url: &str, total_size: u64, chunk_size: u64) -> Self {
         let total_chunks = if chunk_size > 0 && total_size > 0 {
-            ((total_size + chunk_size - 1) / chunk_size) as usize
+            total_size.div_ceil(chunk_size) as usize
         } else {
             1
         };
@@ -64,6 +59,7 @@ impl ResumeState {
     }
 
     /// Get the byte range for a specific chunk.
+    #[allow(dead_code)]
     pub fn chunk_range(&self, index: usize) -> (u64, u64) {
         let start = index as u64 * self.chunk_size;
         let end = if index == self.total_chunks - 1 {
@@ -75,11 +71,13 @@ impl ResumeState {
     }
 
     /// Check if all chunks are done.
+    #[allow(dead_code)]
     pub fn is_complete(&self) -> bool {
         self.completed_chunks.len() >= self.total_chunks
     }
 
     /// Bytes remaining to download.
+    #[allow(dead_code)]
     pub fn remaining_bytes(&self) -> u64 {
         let done = self.completed_chunks.len() as u64 * self.chunk_size;
         self.total_size.saturating_sub(done)

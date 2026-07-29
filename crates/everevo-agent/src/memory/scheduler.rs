@@ -18,8 +18,8 @@
 //!
 //! Phase execution is delegated to [`DreamingEngine`](super::engine::DreamingEngine).
 
+use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicI64, Ordering};
 use std::time::Duration;
 
 use everevo_core::EverEvoError;
@@ -200,7 +200,8 @@ impl DreamingScheduler {
     /// Mark whether the last LIGHT phase found data to process.
     /// Used for adaptive interval: active (3h) vs idle (12h).
     pub fn set_light_had_data(&self, had_data: bool) {
-        self.last_light_had_data.store(if had_data { 1 } else { 0 }, Ordering::Relaxed);
+        self.last_light_had_data
+            .store(if had_data { 1 } else { 0 }, Ordering::Relaxed);
     }
 
     /// Acquire the LIGHT mutex. Returns true if acquired (proceed), false if already running.
@@ -258,7 +259,9 @@ impl DreamingScheduler {
                             this.mark_completed(phase);
                             // After DEEP: generate wiki pages from promoted facts
                             if matches!(phase, ScheduledPhase::Deep | ScheduledPhase::RemAndDeep) {
-                                if let Err(e) = wiki_generator.generate_from_facts(&fact_manager).await {
+                                if let Err(e) =
+                                    wiki_generator.generate_from_facts(&fact_manager).await
+                                {
                                     tracing::warn!(error = %e, "Wiki generation failed");
                                 }
                             }
@@ -371,10 +374,7 @@ mod tests {
     fn test_mark_completed_updates_timestamps() {
         let sched = DreamingScheduler::new(SchedulerConfig::default());
         // Set before to a known-old value
-        sched
-            .timestamps
-            .last_light
-            .store(1000, Ordering::Relaxed);
+        sched.timestamps.last_light.store(1000, Ordering::Relaxed);
         let before = sched.timestamps.last_light.load(Ordering::Relaxed);
         sched.mark_completed(&ScheduledPhase::Light {
             reason: "test".into(),

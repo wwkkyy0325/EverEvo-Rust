@@ -93,8 +93,14 @@ pub enum StreamEvent {
     Thinking(String),
     /// A token of the final response text.
     Text(String),
-    ToolCallStart { id: String, name: String },
-    ToolCallArg { id: String, arg_delta: String },
+    ToolCallStart {
+        id: String,
+        name: String,
+    },
+    ToolCallArg {
+        id: String,
+        arg_delta: String,
+    },
     Done,
 }
 
@@ -102,16 +108,40 @@ pub enum StreamEvent {
 
 impl LlmMessage {
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: LlmRole::System, content: content.into(), thinking: None, tool_calls: None, tool_call_id: None }
+        Self {
+            role: LlmRole::System,
+            content: content.into(),
+            thinking: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
     }
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: LlmRole::User, content: content.into(), thinking: None, tool_calls: None, tool_call_id: None }
+        Self {
+            role: LlmRole::User,
+            content: content.into(),
+            thinking: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: LlmRole::Assistant, content: content.into(), thinking: None, tool_calls: None, tool_call_id: None }
+        Self {
+            role: LlmRole::Assistant,
+            content: content.into(),
+            thinking: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
     }
     pub fn tool(content: impl Into<String>, call_id: impl Into<String>) -> Self {
-        Self { role: LlmRole::Tool, content: content.into(), thinking: None, tool_calls: None, tool_call_id: Some(call_id.into()) }
+        Self {
+            role: LlmRole::Tool,
+            content: content.into(),
+            thinking: None,
+            tool_calls: None,
+            tool_call_id: Some(call_id.into()),
+        }
     }
 }
 
@@ -134,7 +164,10 @@ mod tests {
     fn test_llm_message_constructors() {
         assert!(matches!(LlmMessage::system("sys").role, LlmRole::System));
         assert!(matches!(LlmMessage::user("hi").role, LlmRole::User));
-        assert_eq!(LlmMessage::tool("out", "call_1").tool_call_id.unwrap(), "call_1");
+        assert_eq!(
+            LlmMessage::tool("out", "call_1").tool_call_id.unwrap(),
+            "call_1"
+        );
     }
 
     #[test]

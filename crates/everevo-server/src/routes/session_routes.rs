@@ -32,6 +32,8 @@ pub fn router() -> Router<Arc<AppState>> {
         )
         // Message history (separate endpoint for cursor pagination)
         .route("/api/sessions/{id}/messages", get(get_messages))
+        // Session status (mode + state for daemon sessions)
+        .route("/api/sessions/{id}/status", get(get_session_status))
 }
 
 // ── DTOs ────────────────────────────────────────────────────────────────
@@ -98,6 +100,12 @@ struct SessionItem {
     message_count: i64,
     /// First ~120 chars of the most recent message, if any.
     last_message: Option<String>,
+    /// Session mode: "interactive" or "background"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
+    /// Session state: "idle", "running", "completed", "failed"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<String>,
 }
 
 async fn list_sessions(
@@ -117,13 +125,18 @@ async fn list_sessions(
 
     let items: Vec<SessionItem> = rows
         .into_iter()
-        .map(|r| SessionItem {
-            id: r.id,
-            title: r.title,
-            created_at: r.created_at.to_rfc3339(),
-            updated_at: r.updated_at.to_rfc3339(),
-            message_count: r.message_count,
-            last_message: r.last_content.map(|c| truncate_preview(&c, 120)),
+        .map(|r| {
+            let (mode, state) = parse_metadata(&r.metadata);
+            SessionItem {
+                id: r.id,
+                title: r.title,
+                created_at: r.created_at.to_rfc3339(),
+                updated_at: r.updated_at.to_rfc3339(),
+                message_count: r.message_count,
+                last_message: r.last_content.map(|c| truncate_preview(&c, 120)),
+                mode,
+                state,
+            }
         })
         .collect();
 
@@ -190,6 +203,8 @@ struct MessageItem {
     content: String,
     tool_calls: Option<serde_json::Value>,
     tool_call_id: Option<String>,
+    thinking: String,
+    blocks_json: Option<serde_json::Value>,
     created_at: String,
 }
 
@@ -230,6 +245,8 @@ async fn get_messages(
             content: m.content,
             tool_calls: m.tool_calls.and_then(|s| serde_json::from_str(&s).ok()),
             tool_call_id: m.tool_call_id,
+            thinking: m.thinking,
+            blocks_json: m.blocks_json.and_then(|s| serde_json::from_str(&s).ok()),
             created_at: m.created_at.to_rfc3339(),
         })
         .collect();
@@ -257,7 +274,12 @@ async fn create_session(
             // Hermes `on_session_end` pattern: prevent memory loss at session boundaries.
             state.dreaming_engine.flush_on_session_end().await;
             // Initialize per-session sandbox + audit trail
-            let _ = state.create_sandbox(row.id, resolve_permission(&state.config.default_permission_level)).await;
+            let _ = state
+                .create_sandbox(
+                    row.id,
+                    resolve_permission(&state.config.default_permission_level),
+                )
+                .await;
             Json(serde_json::json!({
                 "data": {
                     "id": row.id,
@@ -296,7 +318,38 @@ async fn delete_session(
     }
 }
 
+// ── Session Status ────────────────────────────────────────────────────────
+
+async fn get_session_status(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Json<serde_json::Value> {
+    let session = match state.db.get_session(id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return Json(serde_json::json!({ "error": "Session not found" })),
+        Err(e) => return Json(serde_json::json!({ "error": e.to_string() })),
+    };
+
+    let meta: everevo_core::types::SessionMeta =
+        serde_json::from_str(&session.metadata).unwrap_or_default();
+    let has_bg = state.bg_sessions.read().await.contains_key(&id);
+
+    Json(serde_json::json!({
+        "id": session.id,
+        "mode": meta.mode.as_str(),
+        "state": if has_bg { "running" } else { meta.state.as_str() },
+        "title": session.title,
+        "updated_at": session.updated_at.to_rfc3339(),
+    }))
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────
+
+fn parse_metadata(raw: &str) -> (Option<String>, Option<String>) {
+    let meta: everevo_core::types::SessionMeta =
+        serde_json::from_str(raw).unwrap_or_default();
+    (Some(meta.mode.as_str().to_string()), Some(meta.state.as_str().to_string()))
+}
 
 fn truncate_preview(text: &str, max_chars: usize) -> String {
     let single_line = text.lines().next().unwrap_or(text);

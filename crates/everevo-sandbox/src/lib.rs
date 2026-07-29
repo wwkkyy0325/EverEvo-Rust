@@ -3,6 +3,10 @@
 //! ## Architecture (designed as independent service boundary)
 //!
 //! ```text
+
+// Internal implementation uses tokio::process::Command — the disallowed_methods
+// lint guards external callers, not the sandbox's own process spawning.
+#![allow(clippy::disallowed_methods)]
 //!                    ┌─────────────────────────┐
 //!                    │   SandboxProvider trait │  ← everevo-core
 //!                    └───────────┬─────────────┘
@@ -32,26 +36,29 @@
 //! - wasmtime: fuel metering + capability-based security
 //! - Docker: cgroups v2 + seccomp + user namespaces
 
+pub mod audit;
 mod config;
 mod error;
+#[cfg(windows)]
+mod job_object;
 mod limits;
 pub mod permission;
 mod provider;
 mod resolved;
-pub mod audit;
 pub mod session;
-#[cfg(windows)] mod job_object;
-#[cfg(not(windows))] mod unix_limits;
+#[cfg(not(windows))]
+mod unix_limits;
 
+pub use audit::AuditRecord;
 pub use config::SandboxConfig;
 pub use error::SandboxError;
 pub use limits::ResourceLimits;
 pub use permission::{
-    PermissionLevel, PermissionRules, PermissionDecision, NetworkPolicy,
-    command_is_denied, check_permission, extract_paths, is_path_allowed, glob_match,
+    check_permission, command_is_denied, NetworkPolicy, PermissionDecision, PermissionLevel,
+    PermissionRules,
 };
-pub use provider::{TieredSandbox, AuditRecord};
-pub use resolved::{ShellResolver, Shell, ShellKind};
+pub use provider::TieredSandbox;
+pub use resolved::{Shell, ShellKind, ShellResolver};
 pub use session::SessionSandbox;
 
 pub use everevo_core::sandbox::SandboxProvider;

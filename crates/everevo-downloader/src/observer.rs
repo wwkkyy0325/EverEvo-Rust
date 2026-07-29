@@ -15,10 +15,7 @@ use crate::task::TaskId;
 #[derive(Debug, Clone)]
 pub enum DownloadEvent {
     /// A new task was submitted.
-    TaskQueued {
-        task_id: TaskId,
-        url: String,
-    },
+    TaskQueued { task_id: TaskId, url: String },
     /// Mirror resolution started.
     ResolvingMirror {
         task_id: TaskId,
@@ -31,10 +28,7 @@ pub enum DownloadEvent {
         mirror_name: String,
     },
     /// Download progress update (emitted at most ~2 Hz).
-    Progress {
-        task_id: TaskId,
-        progress: Progress,
-    },
+    Progress { task_id: TaskId, progress: Progress },
     /// A chunk completed (for chunked downloads).
     ChunkDone {
         task_id: TaskId,
@@ -42,13 +36,9 @@ pub enum DownloadEvent {
         total_chunks: usize,
     },
     /// Download paused.
-    Paused {
-        task_id: TaskId,
-    },
+    Paused { task_id: TaskId },
     /// Download resumed.
-    Resumed {
-        task_id: TaskId,
-    },
+    Resumed { task_id: TaskId },
     /// Download completed successfully.
     Completed {
         task_id: TaskId,
@@ -64,9 +54,7 @@ pub enum DownloadEvent {
         retries_used: u32,
     },
     /// Download cancelled.
-    Cancelled {
-        task_id: TaskId,
-    },
+    Cancelled { task_id: TaskId },
     /// Mirror switch occurred mid-download (e.g., chunk failed on one mirror).
     MirrorSwitched {
         task_id: TaskId,
@@ -117,12 +105,6 @@ impl EventBroadcaster {
     /// Create a new subscriber receiver.
     pub fn subscribe(&self) -> broadcast::Receiver<DownloadEvent> {
         self.tx.subscribe()
-    }
-
-    /// Number of active subscribers.
-    #[allow(dead_code)]
-    pub fn subscriber_count(&self) -> usize {
-        self.tx.receiver_count()
     }
 }
 

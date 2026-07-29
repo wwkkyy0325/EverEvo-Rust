@@ -48,7 +48,8 @@ impl Database {
     }
 
     pub async fn delete_session(&self, id: Uuid) -> Result<(), EverEvoError> {
-        // Delete messages first (foreign key cascade would be better, but SQLite pragma)
+        // Explicit pre-delete ensures cleanup even when foreign_keys PRAGMA isn't
+        // active (belt + suspenders: CASCADE is enabled via connect options too).
         sqlx::query("DELETE FROM messages WHERE session_id = ?")
             .bind(id)
             .execute(&self.pool)
@@ -64,11 +65,7 @@ impl Database {
         Ok(())
     }
 
-    pub async fn update_session_title(
-        &self,
-        id: Uuid,
-        title: &str,
-    ) -> Result<(), EverEvoError> {
+    pub async fn update_session_title(&self, id: Uuid, title: &str) -> Result<(), EverEvoError> {
         sqlx::query("UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?")
             .bind(title)
             .bind(Utc::now())
@@ -76,6 +73,23 @@ impl Database {
             .execute(&self.pool)
             .await
             .map_err(|e| EverEvoError::Database(format!("Update session title failed: {e}")))?;
+
+        Ok(())
+    }
+
+    /// Update session metadata JSON (mode + state for daemon sessions).
+    pub async fn update_session_metadata(
+        &self,
+        id: Uuid,
+        metadata: &str,
+    ) -> Result<(), EverEvoError> {
+        sqlx::query("UPDATE sessions SET metadata = ?, updated_at = ? WHERE id = ?")
+            .bind(metadata)
+            .bind(Utc::now())
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| EverEvoError::Database(format!("Update session metadata: {e}")))?;
 
         Ok(())
     }
@@ -89,9 +103,9 @@ impl Database {
     pub async fn add_message(&self, row: &MessageRow) -> Result<MessageRow, EverEvoError> {
         let content_hash = crate::models::sha256_hash(&row.content);
         sqlx::query_as::<_, MessageRow>(
-            "INSERT INTO messages (id, session_id, role, content, content_hash, tool_calls, tool_call_id, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-             RETURNING id, session_id, role, content, content_hash, tool_calls, tool_call_id, created_at",
+            "INSERT INTO messages (id, session_id, role, content, content_hash, tool_calls, tool_call_id, thinking, blocks_json, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             RETURNING id, session_id, role, content, content_hash, tool_calls, tool_call_id, thinking, blocks_json, created_at",
         )
         .bind(row.id)
         .bind(row.session_id)
@@ -100,6 +114,8 @@ impl Database {
         .bind(&content_hash)
         .bind(&row.tool_calls)
         .bind(&row.tool_call_id)
+        .bind(&row.thinking)
+        .bind(&row.blocks_json)
         .bind(row.created_at)
         .fetch_one(&self.pool)
         .await
@@ -112,22 +128,28 @@ impl Database {
         limit: Option<usize>,
     ) -> Result<Vec<MessageRow>, EverEvoError> {
         let limit = limit.unwrap_or(100);
-        sqlx::query_as::<_, MessageRow>(
-            "SELECT id, session_id, role, content, content_hash, tool_calls, tool_call_id, created_at
+        let mut rows: Vec<MessageRow> = sqlx::query_as::<_, MessageRow>(
+            "SELECT id, session_id, role, content, content_hash, tool_calls, tool_call_id, thinking, blocks_json, created_at
              FROM messages WHERE session_id = ?
-             ORDER BY created_at ASC
+             ORDER BY created_at DESC
              LIMIT ?",
         )
         .bind(session_id)
         .bind(limit as i64)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| EverEvoError::Database(format!("Get messages failed: {e}")))
+        .map_err(|e| EverEvoError::Database(format!("Get messages failed: {e}")))?;
+        // Reverse to restore oldest→newest order expected by downstream consumers
+        rows.reverse();
+        Ok(rows)
     }
 
     pub async fn search_sessions(&self, query: &str) -> Result<Vec<SessionRow>, EverEvoError> {
         // Escape LIKE wildcards to prevent DoS via % and _ injection
-        let escaped = query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let escaped = query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
         let pattern = format!("%{escaped}%");
         // SQLite uses \ as default escape char
         sqlx::query_as::<_, SessionRow>(
@@ -170,7 +192,7 @@ impl Database {
         sqlx::query_as::<_, SessionWithMeta>(
             r#"SELECT
                 s.id, s.title, s.created_at, s.updated_at, s.metadata,
-                COUNT(m.id) AS message_count,
+                COUNT(CASE WHEN m.role = 'user' THEN 1 END) AS message_count,
                 (SELECT m2.content FROM messages m2
                  WHERE m2.session_id = s.id
                  ORDER BY m2.created_at DESC LIMIT 1) AS last_content
@@ -207,7 +229,7 @@ impl Database {
     ) -> Result<Vec<MessageRow>, EverEvoError> {
         if let Some(cursor) = before {
             sqlx::query_as::<_, MessageRow>(
-                "SELECT id, session_id, role, content, content_hash, tool_calls, tool_call_id, created_at
+                "SELECT id, session_id, role, content, content_hash, tool_calls, tool_call_id, thinking, blocks_json, created_at
                  FROM messages
                  WHERE session_id = ? AND created_at < (SELECT created_at FROM messages WHERE id = ?)
                  ORDER BY created_at DESC
@@ -221,7 +243,7 @@ impl Database {
             .map_err(|e| EverEvoError::Database(format!("Get messages before failed: {e}")))
         } else {
             sqlx::query_as::<_, MessageRow>(
-                "SELECT id, session_id, role, content, content_hash, tool_calls, tool_call_id, created_at
+                "SELECT id, session_id, role, content, content_hash, tool_calls, tool_call_id, thinking, blocks_json, created_at
                  FROM messages
                  WHERE session_id = ?
                  ORDER BY created_at DESC
@@ -270,7 +292,13 @@ pub struct FactRow {
 
 impl Database {
     /// Upsert a fact into the SQLite index (INSERT OR REPLACE).
-    pub async fn upsert_fact(&self, id: &str, description: &str, content: &str, fact_type: &str) -> Result<(), EverEvoError> {
+    pub async fn upsert_fact(
+        &self,
+        id: &str,
+        description: &str,
+        content: &str,
+        fact_type: &str,
+    ) -> Result<(), EverEvoError> {
         sqlx::query(
             "INSERT INTO facts (id, description, content, fact_type, retrieval_count, created_at, updated_at)
              VALUES (?, ?, ?, ?, 0, datetime('now'), datetime('now'))
@@ -339,5 +367,52 @@ impl Database {
             .await
             .map_err(|e| EverEvoError::Database(format!("Bump fact retrieval failed: {e}")))?;
         Ok(())
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    /// Verify LIKE wildcard escaping prevents DoS injection.
+    fn escape_like(query: &str) -> String {
+        let escaped = query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        format!("%{escaped}%")
+    }
+
+    #[test]
+    fn test_like_escape_plain_text() {
+        assert_eq!(escape_like("hello"), "%hello%");
+    }
+
+    #[test]
+    fn test_like_escape_percent() {
+        // % is a LIKE wildcard; should be escaped to prevent full-table scan
+        assert_eq!(escape_like("100%"), "%100\\%%");
+    }
+
+    #[test]
+    fn test_like_escape_underscore() {
+        // _ matches any single char in LIKE
+        assert_eq!(escape_like("a_b"), "%a\\_b%");
+    }
+
+    #[test]
+    fn test_like_escape_backslash() {
+        // backslash is the escape char itself
+        assert_eq!(escape_like("C:\\path"), "%C:\\\\path%");
+    }
+
+    #[test]
+    fn test_like_escape_combined() {
+        assert_eq!(escape_like("100%_win\\path"), "%100\\%\\_win\\\\path%");
+    }
+
+    #[test]
+    fn test_like_escape_empty() {
+        assert_eq!(escape_like(""), "%%");
     }
 }

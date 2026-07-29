@@ -16,6 +16,72 @@ pub struct Session {
     pub metadata: serde_json::Value,
 }
 
+// ── Session Mode & State ────────────────────────────────────────────────
+
+/// Session execution mode — interactive (SSE) or background (daemon).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMode {
+    /// User is connected via SSE, sees live streaming.
+    #[default]
+    Interactive,
+    /// Session runs in background; user can disconnect and reconnect later.
+    Background,
+}
+
+impl SessionMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SessionMode::Interactive => "interactive",
+            SessionMode::Background => "background",
+        }
+    }
+}
+
+/// Current state of a session's agent loop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionState {
+    /// No agent run in progress.
+    #[default]
+    Idle,
+    /// Agent is processing — LLM call or tool execution.
+    Running,
+    /// Tool needs user confirmation; agent is blocked.
+    WaitingUser,
+    /// Agent loop completed successfully.
+    Completed,
+    /// Agent loop terminated with an error.
+    Failed,
+}
+
+impl SessionState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SessionState::Idle => "idle",
+            SessionState::Running => "running",
+            SessionState::WaitingUser => "waiting_user",
+            SessionState::Completed => "completed",
+            SessionState::Failed => "failed",
+        }
+    }
+}
+
+/// Session metadata stored in the JSON metadata column.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMeta {
+    #[serde(default)]
+    pub mode: SessionMode,
+    #[serde(default)]
+    pub state: SessionState,
+}
+
+impl Default for SessionMeta {
+    fn default() -> Self {
+        Self { mode: SessionMode::Interactive, state: SessionState::Idle }
+    }
+}
+
 // ── Message ────────────────────────────────────────────────────────────
 
 /// Role of a message in a conversation.
@@ -65,6 +131,10 @@ pub struct ChatRequest {
     #[serde(default)]
     pub session_id: Option<Uuid>,
     pub message: String,
+    /// If true, replay messages from DB instead of calling LLM.
+    /// Used for reconnecting to background/daemon sessions.
+    #[serde(default)]
+    pub reconnect: bool,
 }
 
 /// SSE event types sent to the frontend during agent processing.
@@ -73,9 +143,7 @@ pub struct ChatRequest {
 /// Previously named StreamEvent — renamed to avoid collision with everevo_core::llm::StreamEvent.
 pub enum SseEvent {
     /// LLM is thinking (text token).
-    Thinking {
-        token: String,
-    },
+    Thinking { token: String },
     /// A tool is about to be called.
     ToolCallStart {
         tool_call_id: String,
@@ -90,14 +158,9 @@ pub enum SseEvent {
         is_error: bool,
     },
     /// The agent's final response is complete.
-    Done {
-        session_id: Uuid,
-        message_id: Uuid,
-    },
+    Done { session_id: Uuid, message_id: Uuid },
     /// An error occurred.
-    Error {
-        message: String,
-    },
+    Error { message: String },
 }
 
 // ── LLM Provider ───────────────────────────────────────────────────────

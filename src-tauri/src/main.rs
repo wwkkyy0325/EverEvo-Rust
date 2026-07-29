@@ -102,7 +102,7 @@ fn main() {
                                         tracing::info!("All assets provisioned");
                                         break;
                                     }
-                                    everevo_bootstrap::pipeline::InitEvent::FatalError(e) => {
+                                    everevo_bootstrap::pipeline::InitEvent::FatalError { error: e } => {
                                         tracing::error!(%e, "Init pipeline fatal error");
                                         break;
                                     }

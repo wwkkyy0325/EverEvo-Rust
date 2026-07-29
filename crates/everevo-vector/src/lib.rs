@@ -1,41 +1,36 @@
-//! EverEvo vector store — embedding, chunking, and semantic search.
+//! EverEvo vector store — embedding, chunking, and HNSW semantic search.
 //!
 //! ## Architecture
 //!
 //! ```text
 //! EmbeddingModel (trait)
 //!   ├── DummyEmbedder     ← fallback: returns zero vectors
-//!   └── FastembedModel    ← Phase 2b: fastembed-rs (ONNX, CPU)
+//!   └── FastembedModel    ← fastembed-rs (ONNX, CPU)
 //!
 //! VectorStore (trait)
-//!   ├── InMemoryStore     ← MVP: flat cosine search, <100K chunks
-//!   ├── LanceDBStore      ← Disk-backed: ANN index (feature = "lancedb")
-//!   └── PersistentStore   ← Wraps LanceDBStore (or InMemory + JSON fallback)
+//!   └── HnswStore         ← Pure Rust HNSW ANN index with cosine distance.
+//!                            Single backend — no fallbacks, no platform issues.
 //! ```
 //!
-//! ## Upgrade path
+//! ## Why HNSW (not LanceDB, not Flat)
 //!
-//! The trait-based design means we start with the simple in-memory store
-//! and swap to LanceDB later without changing any call sites.
+//! - **LanceDB**: tokio nested-runtime panics on Windows. Requires separate
+//!   process for reliable embedding. Overkill for desktop agents.
+//! - **Flat search**: O(N×D) scaling. Fine up to ~50K vectors, then linear
+//!   latency becomes noticeable compared to LLM inference time.
+//! - **HNSW**: O(log N) search, >99% recall, zero FFI, no async runtime,
+//!   disk persistence via bincode. Good from 100 vectors to 10M+.
 
 mod embedding;
 mod engine;
-mod memory_store;
+mod hnsw_store;
 mod onnx_embedder;
-mod persistent;
 mod store_trait;
 mod types;
 
-#[cfg(feature = "lancedb")]
-mod lancedb_store;
-
 pub use embedding::{DummyEmbedder, EmbeddingModel};
 pub use engine::{cosine_similarity, VectorEngine};
+pub use hnsw_store::HnswStore;
 pub use onnx_embedder::{check_onnx_model, configure_ort_dylib, OnnxCheckResult, OnnxEmbedder};
-pub use memory_store::InMemoryStore;
-pub use persistent::PersistentStore;
 pub use store_trait::VectorStore;
 pub use types::{ChunkType, MemoryChunk, RawChunk, ScoredChunk};
-
-#[cfg(feature = "lancedb")]
-pub use lancedb_store::LanceDBStore;

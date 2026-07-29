@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 
 use crate::types::RiskLevel;
 use crate::EverEvoError;
@@ -32,9 +33,15 @@ pub trait Tool: Send + Sync {
     fn risk_level(&self) -> RiskLevel;
 
     /// Execute the tool. Receives the sandbox for isolated operations.
+    /// Execute the tool with the given parameters.
+    ///
+    /// `cancel` allows cooperative cancellation — tools should check
+    /// `cancel.is_cancelled()` before long-running work and return
+    /// early with an appropriate error if cancelled.
     async fn execute(
         &self,
         params: serde_json::Value,
+        cancel: Option<&CancellationToken>,
     ) -> Result<ToolOutput, EverEvoError>;
 }
 
@@ -45,6 +52,33 @@ pub struct ToolOutput {
     pub is_error: bool,
 }
 
+// ── Tool Hooks (PreToolUse / PostToolUse) ───────────────────────────────
+
+/// Hook for intercepting tool execution. Claude Code pattern.
+///
+/// Register hooks via `ToolRegistry::add_hook()`. Hooks run in registration order.
+#[async_trait]
+pub trait ToolHook: Send + Sync {
+    /// Called before a tool executes. Return `Err` to block the tool call.
+    /// The error message is passed back to the LLM as the tool result.
+    async fn pre_execute(
+        &self,
+        _tool_name: &str,
+        _params: &serde_json::Value,
+    ) -> Result<(), EverEvoError> {
+        Ok(())
+    }
+
+    /// Called after a tool executes (fires even on error).
+    async fn post_execute(
+        &self,
+        _tool_name: &str,
+        _params: &serde_json::Value,
+        _result: &Result<ToolOutput, EverEvoError>,
+    ) {
+    }
+}
+
 // ── Registry ────────────────────────────────────────────────────────────
 
 /// Registry of available tools, keyed by name.
@@ -53,18 +87,31 @@ pub struct ToolOutput {
 #[derive(Default)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
+    pub hooks: Vec<Arc<dyn ToolHook>>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            hooks: Vec::new(),
         }
     }
 
     /// Register a tool. Replaces any existing tool with the same name.
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
         self.tools.insert(tool.name().to_string(), tool);
+    }
+
+    /// Remove tools that don't match the predicate.
+    /// Used to filter write tools in plan mode.
+    pub fn retain(&mut self, predicate: impl Fn(&Arc<dyn Tool>) -> bool) {
+        self.tools.retain(|_, tool| predicate(tool));
+    }
+
+    /// Add a hook that fires before/after every tool execution.
+    pub fn add_hook(&mut self, hook: Arc<dyn ToolHook>) {
+        self.hooks.push(hook);
     }
 
     /// Get a tool by name.
@@ -113,12 +160,27 @@ mod tests {
     struct TestTool;
     #[async_trait]
     impl Tool for TestTool {
-        fn name(&self) -> &str { "test" }
-        fn description(&self) -> &str { "A test tool" }
-        fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
-        fn risk_level(&self) -> RiskLevel { RiskLevel::Low }
-        async fn execute(&self, _params: serde_json::Value) -> Result<ToolOutput, EverEvoError> {
-            Ok(ToolOutput { content: "ok".into(), is_error: false })
+        fn name(&self) -> &str {
+            "test"
+        }
+        fn description(&self) -> &str {
+            "A test tool"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn risk_level(&self) -> RiskLevel {
+            RiskLevel::Low
+        }
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<ToolOutput, EverEvoError> {
+            Ok(ToolOutput {
+                content: "ok".into(),
+                is_error: false,
+            })
         }
     }
 

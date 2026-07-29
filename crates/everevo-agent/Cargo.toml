@@ -8,16 +8,25 @@ description = "EverEvo agent core — ReAct loop, tool registry, sandbox, knowle
 
 [dependencies]
 everevo-core = { path = "../everevo-core" }
+everevo-db = { path = "../everevo-db" }
 everevo-downloader = { path = "../everevo-downloader" }
 everevo-bootstrap = { path = "../everevo-bootstrap" }
 everevo-sandbox = { path = "../everevo-sandbox" }
-everevo-telemetry = { path = "../everevo-telemetry" }
-everevo-domain = { path = "../everevo-domain" }
+# Telemetry now in everevo_core::telemetry
+# Domain knowledge — now inline, was everevo-domain crate
+sha2 = "0.10"
 
-# Knowledge graph (required — oxigraph, no protoc needed)
-everevo-kg = { path = "../everevo-kg" }
 # Vector store (required — needs protoc for lancedb)
 everevo-vector = { path = "../everevo-vector" }
+
+# Workflow engine
+everevo-workflow = { path = "../everevo-workflow" }
+
+# Code search
+everevo-code-search = { path = "../everevo-code-search" }
+
+# Knowledge graph (Oxigraph — now inline, was everevo-kg crate)
+oxigraph = { version = "0.4", default-features = false }
 
 tokio = { workspace = true, features = ["process"] }
 serde.workspace = true

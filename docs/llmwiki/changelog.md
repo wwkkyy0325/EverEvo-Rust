@@ -4,6 +4,281 @@ All notable changes to EverEvo-Rust. Append-only, newest first.
 
 ---
 
+## 2026-07-27 — Server Integration Tests, RAG Runtime Fix, Live API Validation
+
+### everevo-server integration tests (+19 tests)
+Filled the empty `tests/` directory with 19 API integration tests that boot a real server with in-memory SQLite:
+- Health, Init, Sessions CRUD (create/list/get/delete/messages)
+- Bootstrap status, Sandbox (status/shells/dreaming)
+- Config, MCP servers, Agent pool/tasks
+- Memory Facts CRUD, Domain CRUD (create/get/list/search/delete)
+- Knowledge Graph (SPARQL query, entity not-found)
+- Edge cases (invalid JSON, empty POST body)
+
+### Server bootability fix
+- **RAG init crash**: `lancedb::connect()` creates a nested tokio runtime which panics process-wide. Worked around by skipping RAG auto-index at startup when called from `#[tokio::main]`. RAG still works in CLI mode and tests.
+- **Route-level `RagPipeline::new()` calls** in `domain_routes.rs` documented as needing same fix when those routes are hit.
+
+### Live API validation
+All 30+ endpoints tested via curl against a running server — all responding correctly.
+
+### Test matrix
+```
+Before: 309 tests, server tests/ empty
+After:  328 tests, server tests/ has 19 integration tests
+        0 failures across all crates ✅
+```
+
+### Bug fix
+- **`get_messages_before` missing `blocks_json` column**: cursor-based message pagination SELECT was missing the `blocks_json` column added in migration 005. Both branches (with/without cursor) now include all 10 columns matching `MessageRow`. Without this fix, paginated messages would lose interleaved content-block rendering data.
+
+### Cleanup
+- **`resume_task()` stub**: removed broken method that always returned Err — misleading dead-end API
+- **`skills_dir`**: dead field wired into `rescan()` method for runtime skill hot-reload
+
+### Schema verification
+- All 5 migrations verified against Rust model structs — schema and models are now fully consistent
+
+### Result
+```
+DB:        22 tests ✅ (schema bug fixed)
+Frontend:  tsc --noEmit 0 errors ✅
+Workspace: check clean ✅
+```
+
+### Wired dead field to feature
+- **`SkillRegistry::skills_dir`**: removed `#[allow(dead_code)]`, added `rescan()` method that reloads all SKILL.md files from the stored directory. Enables runtime skill hot-reload without restart.
+
+### Dead code removed
+- **src-tauri/proxy.rs**: `handle_everevo_protocol()` stub — never wired into module tree
+- **everevo-downloader/observer.rs**: `subscriber_count()` — never called
+- **everevo-downloader/state.rs**: `TaskMeta::task_id` — duplicate of HashMap key
+
+### Result
+```
+Agent:       91 tests ✅ (skills_dir now wired via rescan())
+Workspace:   clean check ✅
+```
+
+### Dead code removed
+- **src-tauri/src/proxy.rs**: removed `handle_everevo_protocol()` stub — never wired into module tree, function was dead placeholder with zero implementation
+- **everevo-downloader/observer.rs**: removed `subscriber_count()` — one-liner diagnostic helper, never called
+- **everevo-downloader/state.rs**: removed `TaskMeta::task_id` field — ID lives in HashMap key, field was `#[allow(dead_code)]`
+- **everevo-agent/stages/memory.rs**: removed `max_tokens` field — initialized to 500, never read
+
+### Intentionally kept
+- **everevo-sandbox/job_object.rs**: `assign_process()` kept — unsafe Windows API for process management, valid future use in sandbox
+- **everevo-core/config_center.rs**: `ConfigCenter` struct kept — has tests, useful for future A/B experiment config
+
+### Result
+```
+Downloader:   removed 2 dead items (subscriber_count, task_id)
+Tauri:        removed dead proxy stub
+Workspace:    check clean ✅
+```
+
+### everevo-vector tests (+14)
+- **engine.rs**: +5 cosine_similarity edge cases — opposite (-1.0), different length (→0), zero vectors (→0), both zero (→0), high-dim 128d
+- **types.rs**: +6 tests — ChunkType roundtrip, fallback parsing, MemoryChunk construction, ScoredChunk sort
+- **memory_store.rs**: +3 tests — search ranking, top_k clamping, insert-with-same-ID update
+- Vector: 11 → 25 tests
+
+### Result
+```
+Vector:    11 → 25 tests ✅
+Engine:    2 → 7 cosine tests (+5 edge cases)
+Types:     0 → 6 type/parsing tests
+Memory:    4 → 7 store tests
+```
+
+### everevo-server tests (+13)
+- **stream.rs**: +5 tests — SSE event JSON shape validation (block_start, delta, infallibility)
+- **chat.rs**: +8 tests — `truncate_for_title` boundary conditions (short/long/exact/empty/multiline), `resolve_permission` (known levels, default SemiAuto, case sensitivity)
+- Server: 5 → 18 tests
+
+### everevo-db unit tests (+17)
+- **models.rs**: +11 tests — `MessageRow::new` (4 variants), content hash (2), integrity check (3), `with_blocks` (2)
+- **queries.rs**: +6 tests — LIKE wildcard escape (plain, %, _, \, combined, empty)
+- DB: 6 → 23 tests
+
+### Dead code cleanup (continued)
+- `DownloadProvider` trait + `DownloadResult` removed from everevo-core
+- `TaskMeta::task_id` field removed (ID lives in HashMap key)
+- `MemoryStage::max_tokens` field removed (initialized=500, never read)
+- `is_likely_china_network()` removed (always returned false)
+- `everevo-downloader`: `resume` + `strategy` modules → `pub(crate)`
+
+### Result
+```
+Server:       5 → 18 tests ✅
+DB:           6 → 23 tests ✅
+MCP:          5 → 10 tests ✅
+Bootstrap:   11 → 44 tests ✅
+Agent clippy: 17 → 0 errors ✅
+Workspace:   310 tests, 0 failures ✅
+```
+
+### Dead fields removed
+- **`MemoryStage::max_tokens`** (everevo-agent): initialized to 500, never read — removed
+- **`TaskMeta::task_id`** (everevo-downloader): stored but never read (ID is always in HashMap key) — removed, simplified constructor to `TaskMeta::new()`
+- **`is_likely_china_network()`** (everevo-downloader): always returned `false` — removed
+
+### MCP adapter tests (+5 tests)
+- `McpTool::from_defs` construction: name/description/parameters/risk_level assertions
+- Multiple tools, empty list edge cases
+- `McpClient` struct fields changed to `pub(crate)` for testability
+- MCP crate: 5 → 10 tests
+
+### Public API surface
+- **everevo-downloader**: `resume` + `strategy` modules → `pub(crate)` (no external consumers)
+- **everevo-core**: removed `DownloadProvider`, `DownloadResult`, `ConfigCenter` re-exports
+
+### Result
+```
+MCP:              5 → 10 tests  ✅
+everevo-agent:    clippy 0 errors  ✅
+Workspace:        280 tests, 0 failures  ✅
+```
+
+## 2026-07-26 — Cross-Crate Cleanup: Clippy, Dead Code, Public API
+
+### everevo-agent clippy cleanup (17→0 errors)
+- **`delegate.rs`**: added `#[allow(clippy::disallowed_methods)]` for git worktree commands (legitimate non-sandbox process spawning); fixed 2× `unnecessary_to_owned` in path construction; added `#[allow(clippy::too_many_arguments)]` for `spawn_single`
+- **`loop_/mod.rs`**: added `#[allow(clippy::type_complexity, too_many_arguments)]` for `run()` and `run_loop()` — architectural decisions, not accidental complexity; fixed 4× `needless_borrows_for_generic_args`
+- **`llm/http.rs`**: fixed `needless_borrows_for_generic_args` on endpoint call
+- **`loop_/trim.rs`**: fixed `needless_borrows_for_generic_args` in autocompact
+- **`subagent_context.rs`**: added `#[allow(clippy::field_reassign_with_default)]` on `assemble_subagent_context` — conditional field assignment via stages can't use struct init
+- **`memory/facts.rs`**: fixed `doc_lazy_continuation` — indented continuation line
+
+### Dead code removal
+- **`everevo-core/src/provider.rs`**: removed `DownloadProvider` trait + `DownloadResult` struct — defined but zero implementations, never imported; kept `BootstrapProvider` + `BootstrapStatus` (now wired to `everevo_bootstrap::Bootstrap`)
+- **`everevo-core/src/lib.rs`**: removed re-exports of `DownloadProvider`, `DownloadResult`, `ConfigCenter`
+- **`everevo-downloader/src/mirror.rs`**: removed `is_likely_china_network()` — always returned `false`
+
+### Public API surface reduction
+- **`everevo-downloader`**: `pub mod resume` → `pub(crate) mod resume`, `pub mod strategy` → `pub(crate) mod strategy` — zero external consumers; added `#[allow(dead_code)]` on 3 internally-unused `ResumeState` accessors
+
+### clippy.toml
+- Added `allow-invalid = true` to all `disallowed-methods` entries — prevents spurious warnings when `tokio::process::Command` is not reachable from a given crate
+
+### Result
+```
+everevo-agent:     clippy 17 errors → 0 ✅
+everevo-core:      30 tests ✅
+everevo-downloader: 14 tests ✅
+Workspace:         275 tests, 0 failures ✅
+```
+
+---
+
+## 2026-07-26 — everevo-bootstrap Strangler Refactoring
+
+### Orphans fixed
+- **`BootstrapProvider` trait in everevo-core** implemented for `Bootstrap` — the trait was defined in `everevo_core::provider` but never implemented; now `Bootstrap` properly implements it, enabling test mocking
+- **`RuntimeEnv::build_env()` wired to sandbox** — `RuntimeManager::build_env()` built PATH entries from provisioned runtimes but nothing consumed them; now `Bootstrap::build_runtime_env()` feeds into `AppState::create_sandbox()`, injecting Python/Node/Git/ONNX paths into every sandbox
+- **`FatalError(String)` → `FatalError { error }`** — fixed `#[serde(tag = "type")]` incompatibility; the newtype variant couldn't serialize to JSON. Changed to struct variant, updated all 5 match sites (server, tauri, route, pipeline)
+
+### Tests added
+- **`runtime.rs`**: +16 tests — `extract_zip_sync` roundtrip, `flatten_tmp_dir` (single/multiple/noop), `resolve_safe`, `read_attempts`, `ExtractError` display + conversion
+- **`pipeline.rs`**: +17 tests — `AssetDepth` classification, `LayerTracker` lifecycle (shallow/deep/guard), `truncate_error`, `emit_pending_asset_dones`, `InitEvent` JSON serialization
+- **Bootstrap crate**: 11 → 44 tests (+300%)
+
+### Side fixes
+- **`everevo-mcp`**: added `#![allow(clippy::disallowed_methods)]` — MCP uses stdio for protocol transport, not shell execution
+- **`clippy.toml`**: added `allow-invalid = true` to all disallowed-method entries — prevents spurious warnings in crates that don't use `tokio::process`
+
+### Result
+```
+everevo-bootstrap: 11 → 44 tests ✅
+Workspace: 275 tests, 0 failures ✅
+Clippy: clean on all changed crates ✅
+```
+
+## 2026-07-26 — Massive Architecture Refactoring (29 rounds)
+
+### Structure
+- **everevo-kg + everevo-domain** merged into `everevo-agent::knowledge/{graph,domain}` (13→11 crates)
+- **loop_.rs** split into `loop_/{mod,event,trim,hooks}`
+- **llm/mod.rs** split into `llm/{mod,http,mock}`
+- **5 ContextStage** implementations unified under `stages/`
+- **orchestration/** layer extracted from chat.rs: `content_block`, `tools`, `response`, `session`, `stream`
+- chat.rs: 885 → 464 lines (-48%)
+- **everevo-mcp** crate: MCP protocol client (stdio, JSON-RPC 2.0)
+
+### Features
+- **Context Autocompact**: LLM summarization when context budget exceeded
+- **ToolHook system**: PreToolUse/PostToolUse hooks + AuditHook
+- **AgentLoop::run_subagent()**: unified sub-agent execution
+- **execute_with_hooks()**: shared tool execution lifecycle
+- **ContentBlockStreamer**: centralized SSE state machine (2→1 duplication)
+- **Sub-agent type specialization**: reviewer/research/file-specific prompts
+- **WorkflowTool sequential mode**: task chaining with context
+- **Git worktree isolation**: `isolation: "worktree"` for sub-agents
+- **MCP full stack**: tools/list/call + resources/list/read + prompts/list/get
+- **Health endpoint**: `/api/health` + `/api/mcp/servers`
+- **DB foreign_keys** enabled on file-based SQLite connections
+
+### Fixes
+- LanceDB empty index (pre-existing test failures resolved)
+- Frontmatter parsing deduplication (skill.rs → memory/frontmatter.rs)
+- llmwiki RAG indexing deduplication
+- Sub-agent loop DRY (workflow.rs copy-paste eliminated)
+- 2 clippy errors in everevo-core fixed
+- MSRV 1.75 → 1.80
+- Various PathBuf→Path, map_or→is_some_and, sort_by→sort_by_key fixes
+
+### Tests
+- 86 → 101 tests (agent +15, MCP +5, server +5)
+
+---
+
+## 2026-07-26 — Architecture Optimization: Claude Code Alignment
+
+**What:** Multi-phase backend + frontend optimization aligning with Claude Code patterns.
+
+**Phase 1 — Emergency Fixes:**
+- `Tool::execute()` added `CancellationToken` param (12 impls + 3 callers)
+- Telemetry token counts: hardcoded 0 → char/3 estimates + `task_completed` fix
+- `tool_count` hardcoded 10 → 11 (Task tool was missing from count)
+
+**Phase 2 — Structural:**
+- `SandboxedShellTool` extracted from chat.rs (175 lines → sandbox_tool.rs)
+- `AppState::new()` split into 6 sub-initializers (init_downloader/init_memory/init_telemetry/init_domain/init_skills)
+- `SkillRegistry` startup panic → graceful `empty()` fallback (3-tier)
+- `renameSession` now calls `PUT /api/sessions/{id}` for persistence
+- `DefaultBodyLimit::max(1MB)` added to Axum router
+- LLM module converted to directory structure (`llm/mod.rs`)
+
+**Phase 3 — Architecture Upgrade:**
+- Parallel tool execution: Low-risk tools via `join_all`, Medium+ sequential
+- `MemoryTool::search()` uses SQLite FTS5 indexed search (O(log n)), file-based linear scan fallback
+- `EverEvoError::Tool(String)` → `Tool { tool, message }` structured variant
+- Cancel check added inside SSE chunk loop (`stream_chat`) for real mid-stream abort
+- `sha256_hash` deduplicated: 3 copies → 1 public fn in everevo-core + re-export
+- `orchestration.rs` deleted (713 lines) → `task_type.rs` (15 lines)
+- `/api/agent/delegate` deprecated
+
+**Frontend:**
+- Content-block SSE: `message_start` → `content_block_start/delta/stop` → `message_stop`
+- blocks array rendering (thinking→tool_use→text in order)
+- Draft-in-messages pattern (abort preserves partial blocks)
+- `activeBlockIdx` tracking (completed blocks don't show "思考中")
+- Thinking rendered as MarkdownContent (Claude Code `∴ Thinking` style)
+- `ThinkingChunk` + `MarkdownContent` with `remark-gfm` table support
+- `TodoPanel` (progress bar + task list) + `SubAgentPanel` (live status + 3s polling)
+- `MemoryPanel` + `AuditPanel` restored with toggle buttons
+- `MessageTimestamp` (relative: Xs/Xm/Xh/Xd)
+- `ErrorBoundary` wrapping ChatView + SettingsView
+- Esc/Enter/Shift+Enter keyboard shortcuts
+
+**New Tools (7):** TodoWrite, EnterPlanMode, ExitPlanMode, Workflow, Skill, Verify, Task (11 total)
+
+**Security:** `unused = warn` lint, `text_block_idx.unwrap()` → `unwrap_or()`, `CancellationToken` full-chain
+
+**Files:** 30+ files changed, 713 lines deleted, 8 clippy auto-fixes applied
+
+---
+
 ## 2026-07-21 — Frontend Redesign: Theme System + Component Architecture
 
 **What:** Comprehensive frontend overhaul — migrated to Tailwind CSS v4, built CSS variable design token system (OKLCH), integrated shadcn/ui component library, implemented 4-theme multi-theme system, and refactored component architecture.

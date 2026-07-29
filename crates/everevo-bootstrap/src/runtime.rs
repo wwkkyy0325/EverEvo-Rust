@@ -25,7 +25,17 @@ pub struct RuntimeEnv {
 
 impl RuntimeEnv {
     pub fn empty() -> Self {
-        Self { paths: Vec::new(), env_vars: HashMap::new(), installed: Vec::new() }
+        Self {
+            paths: Vec::new(),
+            env_vars: HashMap::new(),
+            installed: Vec::new(),
+        }
+    }
+}
+
+impl Default for RuntimeEnv {
+    fn default() -> Self {
+        Self::empty()
     }
 }
 
@@ -45,12 +55,18 @@ impl RuntimeManager {
         }
     }
 
-    pub fn runtime_dir(&self) -> &PathBuf { &self.runtime_dir }
-    pub fn models_dir(&self) -> &PathBuf { &self.models_dir }
+    pub fn runtime_dir(&self) -> &PathBuf {
+        &self.runtime_dir
+    }
+    pub fn models_dir(&self) -> &PathBuf {
+        &self.models_dir
+    }
 
     /// Check if a cached ZIP exists for this asset (no re-download needed).
     pub fn find_cached_zip(&self, asset: &Asset) -> Option<PathBuf> {
-        let cache = self.runtime_dir.parent()?
+        let cache = self
+            .runtime_dir
+            .parent()?
             .join("downloads")
             .join(format!("{}.zip", asset.key));
         if cache.exists() && cache.metadata().ok()?.len() > 1024 {
@@ -73,7 +89,9 @@ impl RuntimeManager {
         // ── Already extracted? ────────────────────────────────────
         if sentinel.exists() {
             if let Ok(ver) = tokio::fs::read_to_string(&sentinel).await {
-                if ver.trim() == asset.version { return Ok(target); }
+                if ver.trim() == asset.version {
+                    return Ok(target);
+                }
             }
         }
 
@@ -82,7 +100,9 @@ impl RuntimeManager {
         if attempts >= 3 {
             return Err(ExtractError::PermanentFailure(format!(
                 "{} failed {} times. Delete {} to retry.",
-                asset.key, attempts, attempts_file.display()
+                asset.key,
+                attempts,
+                attempts_file.display()
             )));
         }
         let _ = tokio::fs::write(&attempts_file, (attempts + 1).to_string()).await;
@@ -91,15 +111,21 @@ impl RuntimeManager {
 
         // ── Extract to tmp ────────────────────────────────────────
         let tmp_dir = target.with_file_name(format!(".tmp_{}", asset.key));
-        if tmp_dir.exists() { let _ = tokio::fs::remove_dir_all(&tmp_dir).await; }
-        tokio::fs::create_dir_all(&tmp_dir).await.map_err(|e| ExtractError::Io(e, tmp_dir.clone()))?;
+        if tmp_dir.exists() {
+            let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+        }
+        tokio::fs::create_dir_all(&tmp_dir)
+            .await
+            .map_err(|e| ExtractError::Io(e, tmp_dir.clone()))?;
 
         let zip_path_c = zip_path.to_path_buf();
         let tmp_c = tmp_dir.clone();
         let result = tokio::task::spawn_blocking(move || {
             let r = extract_zip_sync(&zip_path_c, &tmp_c);
             // Flatten versioned subdirectory (onnxruntime-win-x64-1.21.0/ → .)
-            if r.is_ok() { flatten_tmp_dir(&tmp_c); }
+            if r.is_ok() {
+                flatten_tmp_dir(&tmp_c);
+            }
             r
         })
         .await
@@ -112,18 +138,24 @@ impl RuntimeManager {
 
         // Write sentinel into tmp BEFORE rename
         let tmp_sentinel = tmp_dir.join(".extracted");
-        tokio::fs::write(&tmp_sentinel, &asset.version).await
+        tokio::fs::write(&tmp_sentinel, &asset.version)
+            .await
             .map_err(|e| ExtractError::Io(e, tmp_sentinel))?;
 
         // ── Atomic rename with backup ─────────────────────────────
         let backup = target.with_file_name(format!(".backup_{}", asset.key));
         if target.exists() {
-            if backup.exists() { let _ = tokio::fs::remove_dir_all(&backup).await; }
-            tokio::fs::rename(&target, &backup).await
+            if backup.exists() {
+                let _ = tokio::fs::remove_dir_all(&backup).await;
+            }
+            tokio::fs::rename(&target, &backup)
+                .await
                 .map_err(|e| ExtractError::Io(e, target.clone()))?;
         }
         if let Err(e) = tokio::fs::rename(&tmp_dir, &target).await {
-            if backup.exists() { let _ = tokio::fs::rename(&backup, &target).await; }
+            if backup.exists() {
+                let _ = tokio::fs::rename(&backup, &target).await;
+            }
             return Err(ExtractError::Io(e, target));
         }
 
@@ -132,13 +164,19 @@ impl RuntimeManager {
             Ok(ver) if ver.trim() == asset.version => {}
             _ => {
                 let _ = tokio::fs::remove_dir_all(&target).await;
-                if backup.exists() { let _ = tokio::fs::rename(&backup, &target).await; }
-                return Err(ExtractError::Internal("Sentinel verify failed after rename".into()));
+                if backup.exists() {
+                    let _ = tokio::fs::rename(&backup, &target).await;
+                }
+                return Err(ExtractError::Internal(
+                    "Sentinel verify failed after rename".into(),
+                ));
             }
         }
 
         // Success — cleanup
-        if backup.exists() { let _ = tokio::fs::remove_dir_all(&backup).await; }
+        if backup.exists() {
+            let _ = tokio::fs::remove_dir_all(&backup).await;
+        }
         let _ = tokio::fs::remove_file(&attempts_file).await;
         tracing::info!(key = %asset.key, path = %target.display(), "Extracted OK");
         Ok(target)
@@ -162,12 +200,20 @@ impl RuntimeManager {
         // Fallback: check if any expected subdirectories actually have files
         // (handles manually placed assets or pre-flattened directories)
         let has_files = subdirs.iter().any(|sub| {
-            let path: PathBuf = if sub.is_empty() { dir.clone() } else { sub.iter().fold(dir.clone(), |p, s| p.join(s)) };
-            path.exists() && std::fs::read_dir(&path).map_or(false, |mut rd| rd.next().is_some())
+            let path: PathBuf = if sub.is_empty() {
+                dir.clone()
+            } else {
+                sub.iter().fold(dir.clone(), |p, s| p.join(s))
+            };
+            path.exists() && std::fs::read_dir(&path).is_ok_and(|mut rd| rd.next().is_some())
         });
         if extracted || has_files {
             for sub in subdirs {
-                env.paths.push(if sub.is_empty() { dir.clone() } else { sub.iter().fold(dir.clone(), |p, s| p.join(s)) });
+                env.paths.push(if sub.is_empty() {
+                    dir.clone()
+                } else {
+                    sub.iter().fold(dir.clone(), |p, s| p.join(s))
+                });
             }
             env.installed.push(key.into());
         }
@@ -181,9 +227,16 @@ impl RuntimeManager {
         } else {
             self.runtime_dir.join(".manifest.json")
         };
-        let mut manifest = Manifest::load(&manifest_path).await.unwrap_or_else(|_| Manifest { entries: HashMap::new() });
+        let mut manifest = Manifest::load(&manifest_path)
+            .await
+            .unwrap_or_else(|_| Manifest {
+                entries: HashMap::new(),
+            });
         manifest.upsert(&asset.key, &asset.version, None);
-        manifest.save(&manifest_path).await.map_err(|e| ExtractError::Io(e, manifest_path))?;
+        manifest
+            .save(&manifest_path)
+            .await
+            .map_err(|e| ExtractError::Io(e, manifest_path))?;
         Ok(())
     }
 
@@ -203,7 +256,9 @@ fn flatten_tmp_dir(dir: &Path) {
     let mut dirs: Vec<std::ffi::OsString> = Vec::new();
     let mut files = 0usize;
 
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in rd.flatten() {
         if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
             dirs.push(entry.file_name());
@@ -218,7 +273,9 @@ fn flatten_tmp_dir(dir: &Path) {
     }
 
     let wrapper = dir.join(&dirs[0]);
-    let Ok(rd) = std::fs::read_dir(&wrapper) else { return };
+    let Ok(rd) = std::fs::read_dir(&wrapper) else {
+        return;
+    };
 
     let mut count = 0u32;
     for entry in rd.flatten() {
@@ -233,22 +290,27 @@ fn flatten_tmp_dir(dir: &Path) {
 }
 
 async fn read_attempts(path: &Path) -> u32 {
-    if !path.exists() { return 0; }
-    tokio::fs::read_to_string(path).await
-        .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
+    if !path.exists() {
+        return 0;
+    }
+    tokio::fs::read_to_string(path)
+        .await
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 fn extract_zip_sync(zip_path: &Path, dest: &Path) -> Result<(), ExtractError> {
-    let file = std::fs::File::open(zip_path)
-        .map_err(|e| ExtractError::Io(e, zip_path.to_path_buf()))?;
-    let mut archive = zip::ZipArchive::new(file)
-        .map_err(|e| ExtractError::Zip(e.to_string()))?;
+    let file =
+        std::fs::File::open(zip_path).map_err(|e| ExtractError::Io(e, zip_path.to_path_buf()))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| ExtractError::Zip(e.to_string()))?;
 
     // Canonical dest once (the tmp dir; guaranteed to exist).
     let canonical_dest = dest.canonicalize().unwrap_or_else(|_| dest.to_path_buf());
 
     for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)
+        let mut entry = archive
+            .by_index(i)
             .map_err(|e| ExtractError::Zip(e.to_string()))?;
         let out_path = dest.join(entry.name());
 
@@ -262,8 +324,7 @@ fn extract_zip_sync(zip_path: &Path, dest: &Path) -> Result<(), ExtractError> {
                 .map_err(|e| ExtractError::Io(e, out_path.clone()))?;
         } else if let Some(parent) = out_path.parent() {
             let parent = parent.to_path_buf();
-            std::fs::create_dir_all(&parent)
-                .map_err(|e| ExtractError::Io(e, parent))?;
+            std::fs::create_dir_all(&parent).map_err(|e| ExtractError::Io(e, parent))?;
         }
 
         // Zip Slip defense — resolve via existing parent dir so
@@ -295,7 +356,9 @@ fn resolve_safe(path: &Path, is_dir: bool) -> PathBuf {
     }
     match path.parent() {
         Some(parent) if parent.exists() => {
-            let canon_parent = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+            let canon_parent = parent
+                .canonicalize()
+                .unwrap_or_else(|_| parent.to_path_buf());
             canon_parent.join(path.file_name().unwrap_or_default())
         }
         _ => path.to_path_buf(),
@@ -319,5 +382,210 @@ pub enum ExtractError {
 impl From<ExtractError> for everevo_core::EverEvoError {
     fn from(e: ExtractError) -> Self {
         everevo_core::EverEvoError::Bootstrap(format!("Extraction: {e}"))
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    // ── RuntimeManager::new ────────────────────────────────────────
+
+    #[test]
+    fn test_runtime_manager_dirs() {
+        let mgr = RuntimeManager::new(Path::new("/tmp/everevo-data"));
+        assert!(mgr.runtime_dir().ends_with("runtime"));
+        assert!(mgr.models_dir().ends_with("models"));
+    }
+
+    // ── RuntimeEnv ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_runtime_env_empty() {
+        let env = RuntimeEnv::empty();
+        assert!(env.paths.is_empty());
+        assert!(env.env_vars.is_empty());
+        assert!(env.installed.is_empty());
+    }
+
+    // ── flatten_tmp_dir ─────────────────────────────────────────────
+
+    #[test]
+    fn test_flatten_single_subdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wrapper = tmp.path().join("onnxruntime-win-x64-1.21.0");
+        std::fs::create_dir_all(&wrapper).unwrap();
+        std::fs::write(wrapper.join("onnxruntime.dll"), b"fake dll").unwrap();
+        std::fs::write(wrapper.join("README.md"), b"readme").unwrap();
+
+        flatten_tmp_dir(tmp.path());
+
+        // After flatten: wrapper gone, files moved up
+        assert!(!wrapper.exists(), "wrapper dir should be removed");
+        assert!(tmp.path().join("onnxruntime.dll").exists());
+        assert!(tmp.path().join("README.md").exists());
+    }
+
+    #[test]
+    fn test_flatten_multiple_dirs_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir_a = tmp.path().join("dir_a");
+        let dir_b = tmp.path().join("dir_b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+
+        flatten_tmp_dir(tmp.path());
+
+        // Both dirs should still exist (no flattening when >1 subdir)
+        assert!(dir_a.exists());
+        assert!(dir_b.exists());
+    }
+
+    #[test]
+    fn test_flatten_with_loose_files_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wrapper = tmp.path().join("single_wrapper");
+        std::fs::create_dir_all(&wrapper).unwrap();
+        std::fs::write(tmp.path().join("loose.txt"), b"loose").unwrap();
+
+        flatten_tmp_dir(tmp.path());
+
+        // Wrapper still exists (flatten skipped because of loose file)
+        assert!(wrapper.exists());
+        assert!(tmp.path().join("loose.txt").exists());
+    }
+
+    #[test]
+    fn test_flatten_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        flatten_tmp_dir(tmp.path());
+        // Should not panic on empty dir
+    }
+
+    // ── resolve_safe ────────────────────────────────────────────────
+
+    #[test]
+    fn test_resolve_safe_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("subdir");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let resolved = resolve_safe(&sub, true);
+        // Directory exists → should canonicalize
+        assert!(resolved.ends_with("subdir"));
+    }
+
+    #[test]
+    fn test_resolve_safe_file_parent_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("nonexistent.txt");
+
+        let resolved = resolve_safe(&file, false);
+        // File doesn't exist but parent does → parent canonical + filename
+        assert!(resolved.to_string_lossy().contains("nonexistent.txt"));
+    }
+
+    #[test]
+    fn test_resolve_safe_no_parent() {
+        // path with no parent (should be rare, but handle gracefully)
+        let p = Path::new("just_a_name");
+        let resolved = resolve_safe(p, false);
+        assert_eq!(resolved, p);
+    }
+
+    // ── read_attempts ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_read_attempts_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".attempts_python");
+        assert_eq!(read_attempts(&path).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_read_attempts_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".attempts_node");
+        tokio::fs::write(&path, b"2").await.unwrap();
+        assert_eq!(read_attempts(&path).await, 2);
+    }
+
+    #[tokio::test]
+    async fn test_read_attempts_broken_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".attempts_broken");
+        tokio::fs::write(&path, b"not-a-number").await.unwrap();
+        assert_eq!(read_attempts(&path).await, 0);
+    }
+
+    // ── extract_zip_sync ─────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_zip_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = tmp.path().join("test.zip");
+        let dest = tmp.path().join("out");
+
+        // Create a ZIP with known content
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut zip_writer = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        zip_writer.start_file("hello.txt", opts).unwrap();
+        zip_writer.write_all(b"Hello, EverEvo!").unwrap();
+        zip_writer.start_file("subdir/data.bin", opts).unwrap();
+        zip_writer.write_all(b"\x00\x01\x02\x03").unwrap();
+        zip_writer.finish().unwrap();
+
+        std::fs::create_dir_all(&dest).unwrap();
+        extract_zip_sync(&zip_path, &dest).unwrap();
+
+        assert!(dest.join("hello.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(dest.join("hello.txt")).unwrap(),
+            "Hello, EverEvo!"
+        );
+        assert!(dest.join("subdir").join("data.bin").exists());
+        assert_eq!(
+            std::fs::read(dest.join("subdir").join("data.bin")).unwrap(),
+            vec![0x00, 0x01, 0x02, 0x03]
+        );
+    }
+
+    #[test]
+    fn test_extract_zip_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = extract_zip_sync(&tmp.path().join("nonexistent.zip"), tmp.path());
+        assert!(result.is_err());
+        match result {
+            Err(ExtractError::Io(_, _)) => {} // expected
+            other => panic!("expected Io error, got {other:?}"),
+        }
+    }
+
+    // ── ExtractError Display ────────────────────────────────────────
+
+    #[test]
+    fn test_extract_error_display() {
+        let e = ExtractError::Zip("bad archive".into());
+        assert!(e.to_string().contains("bad archive"));
+
+        let e = ExtractError::Internal("boom".into());
+        assert!(e.to_string().contains("boom"));
+
+        let e = ExtractError::PermanentFailure("retry limit".into());
+        assert!(e.to_string().contains("retry limit"));
+    }
+
+    // ── EverEvoError conversion ─────────────────────────────────────
+
+    #[test]
+    fn test_extract_error_into_everevo_error() {
+        let e = ExtractError::PermanentFailure("test".into());
+        let ee: everevo_core::EverEvoError = e.into();
+        assert!(ee.to_string().contains("test"));
     }
 }

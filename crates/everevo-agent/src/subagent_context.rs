@@ -37,8 +37,8 @@ use std::path::PathBuf;
 
 use everevo_core::context::{ContextBuildContext, ContextStage};
 
-use crate::memory::MemoryStage;
-use crate::DomainKnowledgeStage;
+use crate::stages::DomainKnowledgeStage;
+use crate::stages::MemoryStage;
 
 // ── Sub-agent context builder ──────────────────────────────────────────
 
@@ -63,7 +63,22 @@ pub struct SubAgentContext {
     /// Parent session's permission level for inheritance.
     /// When FullyAuto, sub-agent shell commands should auto-approve.
     pub permission_level: Option<String>,
+    /// Recursion depth (0 = main agent, 1 = sub-agent, 2 = sub-sub-agent, etc.).
+    /// Used to prevent infinite recursive delegation. Max depth = 3.
+    pub depth: u32,
+    /// Summary of the parent agent's TodoWrite task list, so sub-agents
+    /// can distinguish done from pending work. Injected from the main
+    /// agent's TaskStateStage.
+    pub todo_summary: Option<String>,
+    /// Top memory facts relevant to the parent task (T1 + relevant T2).
+    /// Injected so sub-agents know what the main agent already knows.
+    pub memory_context: Option<String>,
+    /// Knowledge graph metadata (entity count etc.) for context awareness.
+    pub kg_context: Option<String>,
 }
+
+/// Maximum recursion depth for sub-agent delegation.
+pub const MAX_RECURSION_DEPTH: u32 = 3;
 
 impl Default for SubAgentContext {
     fn default() -> Self {
@@ -76,6 +91,10 @@ impl Default for SubAgentContext {
             parent_workspace: None,
             delegation_note: None,
             permission_level: None,
+            depth: 0,
+            todo_summary: None,
+            memory_context: None,
+            kg_context: None,
         }
     }
 }
@@ -132,9 +151,7 @@ impl SubAgentContext {
         // ── Permission Level ───────────────────────────────────
         if let Some(ref level) = self.permission_level {
             prompt.push_str("## Permission Level\n");
-            prompt.push_str(&format!(
-                "Parent session permission: {level}. "
-            ));
+            prompt.push_str(&format!("Parent session permission: {level}. "));
             if level == "全自动" || level == "fully_auto" {
                 prompt.push_str(
                     "Your shell commands are auto-approved (except admin/sudo). \
@@ -147,12 +164,63 @@ impl SubAgentContext {
                      transparently — just proceed.\n",
                 );
             } else {
+                prompt.push_str("Commands may require user confirmation before execution.\n");
+            }
+            prompt.push('\n');
+        }
+
+        // ── Delegation Depth ────────────────────────────────────
+        if self.depth > 0 {
+            prompt.push_str(&format!(
+                "## Delegation Depth\n\
+                 You are at depth {} (0 = main agent). ",
+                self.depth,
+            ));
+            if self.depth < MAX_RECURSION_DEPTH {
                 prompt.push_str(
-                    "Commands may require user confirmation before execution.\n",
+                    "You may use the `task` tool to delegate sub-tasks. \
+                     Sub-agents will be at depth {}.\n\n",
+                );
+                prompt = prompt.replace("{}", &(self.depth + 1).to_string());
+            } else {
+                prompt.push_str(
+                    "You are at maximum delegation depth. \
+                     Do NOT attempt to spawn further sub-agents.\n\n",
                 );
             }
-            prompt.push_str("\n");
         }
+
+        // ── Task State (inherited from parent agent) ───────────
+        if let Some(ref ts) = self.todo_summary {
+            if ts != "(empty)" {
+                prompt.push_str("## Parent Agent Task State\n\n");
+                prompt.push_str(ts);
+                prompt.push_str("\n\n");
+                prompt.push_str("Align your work with the parent's pending tasks. \
+                     If the user says \"继续\" (continue), they mean resume the oldest \
+                     PENDING task — not redo completed work.\n\n");
+            }
+        }
+
+        // ── Parent Memory Context (≤500 chars budget) ──────────
+        if let Some(ref mc) = self.memory_context {
+            let truncated: String = mc.chars().take(400).collect();
+            prompt.push_str("## Parent Agent Memory\n\n");
+            prompt.push_str(&truncated);
+            prompt.push_str("\n\n");
+        }
+        if let Some(ref kg) = self.kg_context {
+            prompt.push_str(&format!("Knowledge graph: {kg}\n\n"));
+        }
+
+        // ── Understanding User Intent ──────────────────────────
+        prompt.push_str("## Understanding User Intent\n\n");
+        prompt.push_str("- If the user reports they already did something: VERIFY, do NOT redo.\n");
+        prompt.push_str("- If the user says \"继续\" / \"continue\": resume the oldest \
+             PENDING task, not the most recently discussed topic.\n");
+        prompt.push_str("- Distinguish: \"I did X\" (verify) vs \"Do X\" (execute) vs \
+             \"继续\" (resume pending).\n");
+        prompt.push_str("- Never repeat work the user states they completed.\n\n");
 
         // ── Rules ──────────────────────────────────────────────
         prompt.push_str("## Rules\n");
@@ -174,6 +242,7 @@ impl SubAgentContext {
 /// Build a `SubAgentContext` by running every stage and capturing output.
 /// Stages that return `None` get an explicit "(no ... found)" message
 /// instead of being silently skipped.
+#[allow(clippy::field_reassign_with_default, clippy::too_many_arguments)]
 pub async fn assemble_subagent_context(
     user_message: &str,
     memory_stage: Option<&MemoryStage>,
@@ -182,6 +251,7 @@ pub async fn assemble_subagent_context(
     delegation_note: Option<String>,
     shell_name: &str,
     tool_names: &[String],
+    todo_summary: Option<String>,
 ) -> SubAgentContext {
     let ctx = ContextBuildContext {
         user_message: user_message.to_string(),
@@ -194,11 +264,19 @@ pub async fn assemble_subagent_context(
         permission_level: Some("semi_auto".into()),
         trusted_paths: vec![],
         tool_count: tool_names.len(),
+        workspace_path: None,
+        platform: None,
+        git_branch: None,
+        git_status: None,
+        workspace_context_files: vec![],
+        current_date: None,
+        todo_summary: None,
+        plan_mode: false,
+        escalation_level: None,
+        fixation_detail: None,
     };
 
     let mut sub_ctx = SubAgentContext::default();
-
-    // ── System info (always present) ─────────────────────────
     sub_ctx.system_info = build_system_info_block(shell_name, tool_names);
 
     // ── Memory ───────────────────────────────────────────────
@@ -213,8 +291,7 @@ pub async fn assemble_subagent_context(
                     .join("\n");
             }
             None => {
-                sub_ctx.memory_facts =
-                    "(no relevant memory facts found for this task)".into();
+                sub_ctx.memory_facts = "(no relevant memory facts found for this task)".into();
             }
         }
     }
@@ -231,8 +308,7 @@ pub async fn assemble_subagent_context(
                     .join("\n");
             }
             None => {
-                sub_ctx.domain_knowledge =
-                    "(no domain knowledge matched for this task)".into();
+                sub_ctx.domain_knowledge = "(no domain knowledge matched for this task)".into();
             }
         }
     }
@@ -242,6 +318,9 @@ pub async fn assemble_subagent_context(
 
     // ── Delegation note ──────────────────────────────────────
     sub_ctx.delegation_note = delegation_note;
+
+    // ── Todo state from parent agent ─────────────────────────
+    sub_ctx.todo_summary = todo_summary;
 
     sub_ctx
 }

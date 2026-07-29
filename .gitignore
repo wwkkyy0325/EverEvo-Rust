@@ -5,6 +5,9 @@ target/
 # ── Data (runtime, created on first launch) ──
 data/
 
+# ── EverEvo internals ──
+.everevo/
+
 # ── IDE ──
 .vscode/
 .idea/
@@ -31,3 +34,4 @@ src-tauri/gen/
 # ── Misc ──
 *.log
 tmp/
+sample-project/*

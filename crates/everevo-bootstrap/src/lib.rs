@@ -25,11 +25,14 @@ pub mod manifest;
 pub mod pipeline;
 pub mod runtime;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::sync::RwLock;
 
+use async_trait::async_trait;
+use everevo_core::provider::{BootstrapProvider, BootstrapStatus};
 use everevo_core::EverEvoError;
 use manifest::Manifest;
+use runtime::{RuntimeEnv, RuntimeManager};
 
 // ── Bootstrap ───────────────────────────────────────────────────────────
 
@@ -63,7 +66,10 @@ pub struct Provisioned {
 
 impl Bootstrap {
     pub fn new(data_dir: PathBuf) -> Self {
-        Self { data_dir, cached_result: RwLock::new(None) }
+        Self {
+            data_dir,
+            cached_result: RwLock::new(None),
+        }
     }
 
     /// The root data directory for all runtime + model assets.
@@ -115,10 +121,33 @@ impl Bootstrap {
         Ok(result)
     }
 
+    /// Build a runtime environment with PATH entries for all installed runtimes.
+    ///
+    /// Callers (e.g., `AppState::create_sandbox`) use this to inject portable
+    /// Python, Node, Git, and ONNX Runtime into sandboxed process PATHs.
+    pub async fn build_runtime_env(&self) -> RuntimeEnv {
+        let mgr = RuntimeManager::new(&self.data_dir);
+        mgr.build_env().await.unwrap_or_default()
+    }
+
     /// Invalidate the cached check result — forces re-scan on next `check()`.
     pub async fn invalidate(&self) {
         let mut cached = self.cached_result.write().await;
         *cached = None;
+    }
+}
+
+#[async_trait]
+impl BootstrapProvider for Bootstrap {
+    async fn check(&self) -> Result<BootstrapStatus, EverEvoError> {
+        // UFCS: call the inherent check(), not the trait method
+        let result = Bootstrap::check(self).await?;
+        Ok(BootstrapStatus {
+            ready: result.ready.into_iter().map(|r| r.key).collect(),
+            missing: result.missing.into_iter().map(|m| m.key).collect(),
+            corrupt: result.corrupt.into_iter().map(|c| c.key).collect(),
+            download_size_bytes: result.download_size_bytes,
+        })
     }
 }
 
@@ -152,8 +181,12 @@ pub struct Asset {
 }
 
 impl Asset {
-    pub fn is_model(&self) -> bool { matches!(self.kind, AssetKind::Model) }
-    pub fn is_runtime(&self) -> bool { matches!(self.kind, AssetKind::Runtime) }
+    pub fn is_model(&self) -> bool {
+        matches!(self.kind, AssetKind::Model)
+    }
+    pub fn is_runtime(&self) -> bool {
+        matches!(self.kind, AssetKind::Runtime)
+    }
 
     /// All URLs to try for this asset (primary first, then mirrors).
     pub fn all_urls(&self) -> Vec<&str> {
@@ -178,7 +211,7 @@ struct CheckOutcome {
 }
 
 /// Check all defined assets against a manifest file.
-async fn check_manifest(dir: &PathBuf, assets: &[Asset]) -> CheckOutcome {
+async fn check_manifest(dir: &Path, assets: &[Asset]) -> CheckOutcome {
     let manifest = Manifest::load(&dir.join(".manifest.json")).await;
 
     let mut ready = Vec::new();
@@ -265,7 +298,10 @@ fn verify_files_intact(asset: &Asset, install_dir: &std::path::Path) -> bool {
     // Model ONNX files must be at least 1 MB (real models are 20–280 MB)
     let onnx_path = install_dir.join("model_quantized.onnx");
     let onnx_ok = onnx_path.exists()
-        && onnx_path.metadata().map(|m| m.len() > 1_048_576).unwrap_or(false);
+        && onnx_path
+            .metadata()
+            .map(|m| m.len() > 1_048_576)
+            .unwrap_or(false);
 
     // Extra files (json configs, tokenizers) must be at least 10 bytes
     let extras_ok = asset.extra_files.iter().all(|ef| {
@@ -284,8 +320,12 @@ fn verify_files_intact(asset: &Asset, install_dir: &std::path::Path) -> bool {
 /// Read the `.extracted` sentinel version string, if present.
 fn read_sentinel_version(dir: &std::path::Path) -> Option<String> {
     let sentinel = dir.join(".extracted");
-    if !sentinel.exists() { return None; }
-    std::fs::read_to_string(&sentinel).ok().map(|s| s.trim().to_string())
+    if !sentinel.exists() {
+        return None;
+    }
+    std::fs::read_to_string(&sentinel)
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 /// Verify directory integrity via a marker file checksum.
@@ -524,19 +564,29 @@ mod tests {
     #[test]
     fn test_python_is_embeddable() {
         let python = RUNTIMES.iter().find(|a| a.key == "python").unwrap();
-        assert!(python.primary_url.contains("embed"), "Python must be embeddable version");
+        assert!(
+            python.primary_url.contains("embed"),
+            "Python must be embeddable version"
+        );
     }
 
     #[test]
     fn test_git_is_mingit() {
         let git = RUNTIMES.iter().find(|a| a.key == "git").unwrap();
-        assert!(git.primary_url.contains("MinGit"), "Git must be MinGit portable");
+        assert!(
+            git.primary_url.contains("MinGit"),
+            "Git must be MinGit portable"
+        );
     }
 
     #[test]
     fn test_models_have_primary_url() {
         for model in MODELS.iter() {
-            assert!(!model.primary_url.is_empty(), "Model {} lacks primary URL", model.key);
+            assert!(
+                !model.primary_url.is_empty(),
+                "Model {} lacks primary URL",
+                model.key
+            );
         }
     }
 
@@ -545,8 +595,14 @@ mod tests {
         let runtime_size: u64 = RUNTIMES.iter().map(|a| a.size_bytes).sum();
         let model_size: u64 = MODELS.iter().map(|a| a.size_bytes).sum();
         // ~90MB runtimes + ~57MB models = ~147MB
-        assert!(runtime_size > 50_000_000, "Runtime estimate too low: {runtime_size}");
-        assert!(model_size > 30_000_000, "Model estimate too low: {model_size}");
+        assert!(
+            runtime_size > 50_000_000,
+            "Runtime estimate too low: {runtime_size}"
+        );
+        assert!(
+            model_size > 30_000_000,
+            "Model estimate too low: {model_size}"
+        );
     }
 
     #[test]

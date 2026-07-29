@@ -76,7 +76,7 @@ impl SourcePointer {
     }
 }
 
-fn sha256_hash(s: &str) -> String {
+pub fn sha256_hash(s: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(s.as_bytes());
@@ -179,6 +179,9 @@ impl FactType {
         }
     }
 
+    /// Parse from a string, returning `None` for unknown values.
+    /// Prefer `s.parse::<FactType>()` via `FromStr` when an error is expected.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "user" => Some(Self::User),
@@ -186,6 +189,20 @@ impl FactType {
             "project" => Some(Self::Project),
             "reference" => Some(Self::Reference),
             _ => None,
+        }
+    }
+}
+
+impl std::str::FromStr for FactType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "user" => Ok(Self::User),
+            "feedback" => Ok(Self::Feedback),
+            "project" => Ok(Self::Project),
+            "reference" => Ok(Self::Reference),
+            _ => Err(format!("unknown FactType: {s}")),
         }
     }
 }
@@ -208,11 +225,7 @@ mod tests {
 
     #[test]
     fn test_source_pointer_verification() {
-        let sp = SourcePointer::new(
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            "hello world",
-        );
+        let sp = SourcePointer::new(Uuid::new_v4(), Uuid::new_v4(), "hello world");
         assert!(sp.verify("hello world"));
         assert!(!sp.verify("hello world!"));
     }
@@ -234,12 +247,7 @@ mod tests {
 
     #[test]
     fn test_projection_metadata_staleness() {
-        let meta = ProjectionMetadata::new(
-            "1.0.0",
-            "deepseek-v4",
-            vec![],
-            0.9,
-        );
+        let meta = ProjectionMetadata::new("1.0.0", "deepseek-v4", vec![], 0.9);
         assert!(meta.is_stale("2.0.0"));
         assert!(!meta.is_stale("1.0.0"));
         assert!(meta.model_changed("deepseek-v5"));
@@ -247,7 +255,12 @@ mod tests {
 
     #[test]
     fn test_fact_type_roundtrip() {
-        for ty in &[FactType::User, FactType::Feedback, FactType::Project, FactType::Reference] {
+        for ty in &[
+            FactType::User,
+            FactType::Feedback,
+            FactType::Project,
+            FactType::Reference,
+        ] {
             let s = ty.as_str();
             let parsed = FactType::from_str(s).unwrap();
             assert_eq!(parsed, *ty);

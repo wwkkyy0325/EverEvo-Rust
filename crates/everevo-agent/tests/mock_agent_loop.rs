@@ -29,28 +29,23 @@ async fn test_agent_react_loop_mocked() {
     let user = LlmMessage::user("What's new in Rust 2025 edition?");
 
     // Turn 1: ask LLM
-    let resp1 = mock.chat(&[system.clone(), user.clone()], &[]).await.unwrap();
+    let resp1 = mock
+        .chat(&[system.clone(), user.clone()], &[])
+        .await
+        .unwrap();
     assert_eq!(resp1.tool_calls.len(), 1);
     assert_eq!(resp1.tool_calls[0].name, "web_search");
 
     // Agent executes tool (simulated)
-    let tool_result = "Rust 2025 edition: async closures, return-type notation, RPIT lifetime capture...";
+    let tool_result =
+        "Rust 2025 edition: async closures, return-type notation, RPIT lifetime capture...";
 
     // Turn 2: feed tool result back to LLM
     let tool_msg = LlmMessage::tool(tool_result, &resp1.tool_calls[0].id);
-    let resp2 = mock
-        .chat(
-            &[system, user, tool_msg],
-            &[],
-        )
-        .await
-        .unwrap();
+    let resp2 = mock.chat(&[system, user, tool_msg], &[]).await.unwrap();
 
     assert!(resp2.content.is_some());
-    assert!(resp2
-        .content
-        .unwrap()
-        .contains("Rust 2025"));
+    assert!(resp2.content.unwrap().contains("Rust 2025"));
     assert_eq!(mock.call_count(), 2);
 }
 
@@ -62,14 +57,23 @@ async fn test_agent_empty_tool_result() {
         .with_text("I couldn't find any results for that query.");
 
     // Turn 1: LLM responds with a tool call
-    let resp1 = mock.chat(&[LlmMessage::user("search for nonexistent")], &[]).await.unwrap();
+    let resp1 = mock
+        .chat(&[LlmMessage::user("search for nonexistent")], &[])
+        .await
+        .unwrap();
     assert!(!resp1.tool_calls.is_empty());
 
     // Turn 2: tool returns empty, LLM gives final answer
-    let resp2 = mock.chat(&[
-        LlmMessage::user("search for nonexistent"),
-        LlmMessage::tool("", "call_empty"),
-    ], &[]).await.unwrap();
+    let resp2 = mock
+        .chat(
+            &[
+                LlmMessage::user("search for nonexistent"),
+                LlmMessage::tool("", "call_empty"),
+            ],
+            &[],
+        )
+        .await
+        .unwrap();
     assert!(resp2.content.is_some());
 }
 
@@ -79,7 +83,10 @@ async fn test_mock_exhausted_errors_correctly() {
     let mock = MockLlmProvider::new().with_text("one and only");
     mock.chat(&[LlmMessage::user("hi")], &[]).await.unwrap();
 
-    let err = mock.chat(&[LlmMessage::user("again")], &[]).await.unwrap_err();
+    let err = mock
+        .chat(&[LlmMessage::user("again")], &[])
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("no more responses"));
 }
 

@@ -15,18 +15,18 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use chrono::Utc;
-use everevo_core::context::{ContextBuildContext, default_pipeline};
+use everevo_core::context::{default_pipeline, ContextBuildContext};
 use everevo_core::llm::{LlmMessage, LlmRole};
 use everevo_core::types::ChatRequest;
 use everevo_db::models::MessageRow;
 use std::convert::Infallible;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
-use crate::app_state::{AppState, ConfirmationNotification, PendingConfirmation};
+use crate::app_state::{AppState, ConfirmationNotification};
+use crate::orchestration::{self, ContentBlockStreamer};
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new().route("/api/chat", post(handler))
@@ -40,9 +40,7 @@ async fn handler(
 
     tokio::spawn(async move {
         if let Err(e) = handle_chat(state, req, &tx).await {
-            let _ = tx
-                .send(Ok(Event::default().event("error").data(e.to_string())))
-                .await;
+            let _ = tx.send(Ok(Event::default().event("error").data(&e))).await;
         }
     });
 
@@ -54,64 +52,117 @@ async fn handle_chat(
     req: ChatRequest,
     tx: &mpsc::Sender<Result<Event, Infallible>>,
 ) -> Result<(), String> {
-    // ── 1. Resolve or create session ──────────────────────────────────
-    let session_id = match req.session_id {
-        Some(id) => {
-            state
-                .db
-                .get_session(id)
-                .await
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "Session not found".to_string())?;
-            // Restore sandbox if it doesn't exist (e.g., after restart)
-            if !state.sandboxes.read().await.contains_key(&id) {
-                let _ = state.create_sandbox(id, resolve_permission(&state.config.default_permission_level)).await;
+    // ── 0. Reconnection mode — replay messages from DB ──────────────
+    if req.reconnect {
+        return handle_reconnect(&state, req, tx).await;
+    }
+
+    // ── 1. Resolve session + load history ────────────────────────────
+    let (session_id, history) =
+        orchestration::resolve_session(&state, req.session_id, &req.message)
+            .await
+            .map_err(|e| e.message)?;
+
+    // ── 1.5. /plan command — user-initiated plan mode ───────────────
+    let effective_message = if let Some(plan_task) = req.message.strip_prefix("/plan") {
+        let plan_task = plan_task.trim();
+        if plan_task == "cancel" || plan_task == "exit" {
+            state.plan_mode_sessions.write().await.remove(&session_id);
+            let _ = tx.send(Ok(Event::default()
+                .event("plan_mode_exited")
+                .json_data(serde_json::json!({"session_id": session_id.to_string()}))
+                .unwrap_or_else(|_| Event::default().event("error")))).await;
+            tracing::info!(%session_id, "Plan mode cancelled by user");
+            "Plan mode cancelled. Normal operations resumed.".to_string()
+        } else {
+            state.plan_mode_sessions.write().await.insert(session_id, "semi_auto".to_string());
+            let _ = tx.send(Ok(Event::default()
+                .event("plan_mode_entered")
+                .json_data(serde_json::json!({"session_id": session_id.to_string(), "task": plan_task}))
+                .unwrap_or_else(|_| Event::default().event("error")))).await;
+            tracing::info!(%session_id, task = plan_task, "Plan mode entered via /plan command");
+            if plan_task.is_empty() {
+                "Plan mode entered via /plan. Explore the codebase, design an approach, \
+                 and write a plan. Write tools are blocked until the user approves.".to_string()
+            } else {
+                format!(
+                    "Plan mode entered for: {plan_task}\n\n\
+                     Explore the codebase, design an approach, and write a plan. \
+                     Write tools (shell, write_file, download) are blocked until approval."
+                )
             }
-            id
         }
-        None => {
-            let title = truncate_for_title(&req.message);
-            let row = state
-                .db
-                .create_session(&title)
-                .await
-                .map_err(|e| e.to_string())?;
-            let _ = state.create_sandbox(row.id, resolve_permission(&state.config.default_permission_level)).await;
-            row.id
-        }
+    } else {
+        req.message.clone()
     };
 
     // ── 1.5 Start telemetry trace for this session ──────────────────
     let trace = state.telemetry.start_trace(session_id);
     let trace_id = trace.as_ref().map(|t| t.trace_id);
 
-    // ── 2. Load conversation history ──────────────────────────────────
-    let db_messages = state
-        .db
-        .get_messages(session_id, Some(20))
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // Filter out tool-call and tool-result messages from DB history.
-    // DeepSeek V4 / Anthropic protocol requires every tool_use to have a
-    // matching tool_result in the next message. DB history may have
-    // incomplete pairs from previous sessions — skip them entirely.
-    let history: Vec<LlmMessage> = db_messages
-        .iter()
-        .filter(|m| m.role != "tool" && m.tool_calls.is_none())
-        .map(|m| db_message_to_llm(m))
-        .collect();
-
     // ── 3. Build context via pipeline ─────────────────────────────────
     let (shell_name, permission_level, trusted_paths) = {
         let sandboxes = state.sandboxes.read().await;
-        sandboxes.get(&session_id).map(|sb| {
-            (sb.engine().shell_name().to_string(), sb.permission_level().label().to_string(), sb.trusted_paths())
-        }).unwrap_or_default()
+        sandboxes
+            .get(&session_id)
+            .map(|sb| {
+                (
+                    sb.engine().shell_name().to_string(),
+                    sb.permission_level().label().to_string(),
+                    sb.trusted_paths(),
+                )
+            })
+            .unwrap_or_default()
     };
-    let tool_count = 4; // shell + download + bootstrap + memory
+    // Base tools: shell, download, bootstrap, memory, TodoWrite, EnterPlanMode,
+    // ExitPlanMode, Workflow, Skill, Verify, Task, WebFetch, Compact, Team,
+    // WorkflowRunner, CodeSearch, CodeMap = 17
+    let base_tool_count = 17usize;
+    let mcp_tool_count: usize = state
+        .mcp_clients
+        .read()
+        .await
+        .values()
+        .filter_map(|c| c.try_lock().ok().map(|g| g.tools.len()))
+        .sum();
+    let tool_count = base_tool_count + mcp_tool_count;
+    let workspace_path = state.workspace_dir.read().await.clone();
+    let workspace_path_str = workspace_path.as_ref().map(|p| p.display().to_string());
+
+    // Git detection (Claude Code alignment)
+    let (git_branch, git_status) = workspace_path
+        .as_ref()
+        .map(|ws| detect_git(ws))
+        .unwrap_or((None, None));
+
+    // CLAUDE.md / AGENTS.md auto-discovery (Claude Code alignment)
+    let workspace_context_files = workspace_path
+        .as_ref()
+        .map(|ws| discover_workspace_context(ws))
+        .unwrap_or_default();
+
+    // Build todo summary for the TaskStateStage — lets the agent distinguish
+    // pending from completed work and correctly interpret "继续" (continue).
+    let todo_summary = {
+        let store = state.todo_store.read().await;
+        store.get(&session_id).map(|items| {
+            if items.is_empty() {
+                "(empty)".to_string()
+            } else {
+                items.iter().map(|item| {
+                    let icon = match item.status.as_str() {
+                        "completed" => "✅",
+                        "in_progress" => "🔄",
+                        _ => "⬜",
+                    };
+                    format!("- {} {} ({})", icon, item.content, item.status)
+                }).collect::<Vec<_>>().join("\n")
+            }
+        })
+    };
+
     let ctx = ContextBuildContext {
-        user_message: req.message.clone(),
+        user_message: effective_message.clone(),
         session_id: Some(session_id),
         session_title: None,
         history,
@@ -121,13 +172,29 @@ async fn handle_chat(
         permission_level: Some(permission_level.clone()),
         trusted_paths,
         tool_count,
+        workspace_path: workspace_path_str,
+        platform: Some(std::env::consts::OS.to_string()),
+        git_branch,
+        git_status,
+        workspace_context_files,
+        current_date: Some(chrono::Utc::now().format("%Y-%m-%d").to_string()),
+        todo_summary: todo_summary.clone(),
+        plan_mode: {
+            let ps = state.plan_mode_sessions.read().await;
+            ps.contains_key(&session_id)
+        },
+        escalation_level: None,
+        fixation_detail: None,
     };
-    let persona_profile_path = state.config.data_dir
+    let persona_profile_path = state
+        .config
+        .data_dir
         .join("memory")
         .join("persona")
         .join("profile.json");
     let memory_stage = {
-        let stage = everevo_agent::memory::MemoryStage::new(state.fact_manager.clone());
+        let stage = everevo_agent::MemoryStage::new(state.fact_manager.clone())
+            .with_knowledge_graph(state.knowledge_graph.clone());
         if let Some(tid) = trace_id {
             stage.with_telemetry(state.telemetry.clone(), tid)
         } else {
@@ -135,43 +202,59 @@ async fn handle_chat(
         }
     };
     let domain_root = state.config.data_dir.join("domain");
-    let domain_stage = everevo_agent::DomainKnowledgeStage::new(&domain_root)
-        .with_max_docs(3);
+    let domain_stage = everevo_agent::DomainKnowledgeStage::new(&domain_root).with_max_docs(3);
 
     // Parent work dir for sub-agent path inheritance.
-    let parent_work_dir = state.sandboxes.read().await
+    let parent_work_dir = state
+        .sandboxes
+        .read()
+        .await
         .get(&session_id)
         .map(|sb| sb.work_dir().clone());
 
     // Build sub-agent context BEFORE the pipeline consumes domain_stage.
     let shell = shell_name.clone();
     let mut sub_ctx = everevo_agent::subagent_context::assemble_subagent_context(
-        &req.message,
+        &effective_message,
         None,
         Some(&domain_stage),
         parent_work_dir,
         None,
         &shell,
         &["shell".into(), "memory".into()],
-    ).await;
+        todo_summary.clone(),
+    )
+    .await;
     // Inherit parent session's permission level for sub-agents.
     sub_ctx.permission_level = Some(permission_level.clone());
 
+    // Inject T1 memory context for sub-agents (≤400 chars)
+    if let Ok(t1) = state.fact_manager.load_tier1() {
+        if !t1.is_empty() {
+            let lines: Vec<String> = t1.iter().take(5).map(|f| {
+                format!("- {} — {}", f.name, f.description)
+            }).collect();
+            sub_ctx.memory_context = Some(lines.join("\n"));
+        }
+    }
+    // Inject KG entity count
+    if let Ok(kg) = state.knowledge_graph.read() {
+        let ec = kg.entity_count();
+        if ec > 0 {
+            sub_ctx.kg_context = Some(format!("{ec} entities available. Use `memory` → `kg_search` to explore."));
+        }
+    }
+
     let pipeline = default_pipeline()
-        .with_stage(everevo_agent::persona::PersonaStage::new(persona_profile_path))
-        .with_stage(everevo_agent::skill::SkillStage::new(state.skill_registry.clone()))
+        .with_stage(everevo_agent::PersonaStage::new(persona_profile_path))
+        .with_stage(everevo_agent::BestPracticesStage)
+        .with_stage(everevo_agent::SkillStage::new(state.skill_registry.clone()))
         .with_stage(memory_stage)
         .with_stage(domain_stage);
     let messages = pipeline.assemble(&ctx);
 
     // ── 4. Persist user message ──────────────────────────────────────
-    let user_msg = MessageRow::new(
-        session_id,
-        "user",
-        req.message.clone(),
-        None,
-        None,
-    );
+    let user_msg = MessageRow::new(session_id, "user", req.message.clone(), None, None, None);
     state
         .db
         .add_message(&user_msg)
@@ -179,7 +262,9 @@ async fn handle_chat(
         .map_err(|e| format!("Failed to save user message: {e}"))?;
 
     // Feed raw message into the dreaming engine's buffer
-    state.dreaming_engine.push_message("user", &req.message, &user_msg.id.to_string());
+    state
+        .dreaming_engine
+        .push_message("user", &req.message, &user_msg.id.to_string(), &session_id.to_string());
 
     // Bump session updated_at
     let _ = state
@@ -203,141 +288,72 @@ async fn handle_chat(
     // The SSE stream listens on notif_rx while the tool sends on notif_tx.
     let (notif_tx, mut notif_rx) = mpsc::unbounded_channel::<ConfirmationNotification>();
 
-    let mut registry = everevo_core::tool::ToolRegistry::new();
-    // Per-session tools (shell, download) need the sandbox work_dir so
-    // relative paths resolve inside the sandbox instead of the process CWD.
-    let session_work_dir = {
-        let sandboxes = state.sandboxes.read().await;
-        if let Some(sb) = sandboxes.get(&session_id) {
-            let provider = sb.provider();
-            let work_dir = sb.work_dir().clone();
-            let sandbox = Arc::new(SandboxedShellTool {
-                inner: provider,
-                work_dir: work_dir.clone(),
-                session_id,
-                confirmations: state.confirmations.clone(),
-                notif_tx: notif_tx.clone(),
-                auto_confirm: false,
-            });
-            registry.register(sandbox);
-            Some(work_dir)
-        } else {
-            None
-        }
-    };
-    // Download tool: scoped to sandbox work_dir so downloads and
-    // their .resume.json sidecar files stay out of src-tauri/.
-    {
-        let mut dl = everevo_agent::tools::builtins::DownloadTool::new(
-            state.downloader.clone(),
-        );
-        if let Some(ref dir) = session_work_dir {
-            dl = dl.with_work_dir(dir.clone());
-        }
-        registry.register(Arc::new(dl));
-    }
-    // Global tools (bootstrap, memory) — always available
-    registry.register(Arc::new(everevo_agent::tools::builtins::BootstrapTool::new(
-        state.bootstrap.clone(),
-    )));
-    registry.register(Arc::new(everevo_agent::tools::builtins::MemoryTool::new(
-        state.fact_manager.clone(),
-    )));
-    // Task tool — LLM decides when to spawn subagents (Claude Code pattern).
-    // Needs the base registry (shell+memory) for subagent tool inheritance.
-    // When parent session is FullyAuto, sub-agent shell tool gets auto_confirm
-    // so commands execute without blocking on the confirmation interceptor.
-    let is_fully_auto = permission_level == "全自动" || permission_level == "fully_auto";
-    let mut base_for_task = everevo_core::tool::ToolRegistry::new();
-    if let Some(shell) = registry.get("shell") {
-        // Downcast to SandboxedShellTool to access with_auto_confirm()
-        if is_fully_auto {
-            // We need to create a clone with auto_confirm enabled.
-            // Since the tool is behind Arc<dyn Tool>, we use a different approach:
-            // create a second SandboxedShellTool instance with auto_confirm for sub-agents.
-            if let Some(sandboxes) = state.sandboxes.read().await.get(&session_id) {
-                let auto_shell = Arc::new(SandboxedShellTool {
-                    inner: sandboxes.provider(),
-                    work_dir: sandboxes.work_dir().clone(),
-                    session_id,
-                    confirmations: state.confirmations.clone(),
-                    notif_tx: notif_tx.clone(),
-                    auto_confirm: true,
-                });
-                base_for_task.register(auto_shell);
-            } else {
-                base_for_task.register(Arc::clone(shell));
-            }
-        } else {
-            base_for_task.register(Arc::clone(shell));
-        }
-    }
-    if let Some(memory) = registry.get("memory") { base_for_task.register(Arc::clone(memory)); }
-
-    let task_tool = everevo_agent::tools::builtins::TaskTool::new(
-        Arc::new(state.config.data_dir.join("sandbox")),
-        Arc::new(base_for_task),
-        Some(Arc::clone(&client)),
+    // ── 6. Build tool registry ────────────────────────────────────────
+    let assembled = orchestration::build_registry(
+        &state,
+        session_id,
+        &client,
+        &notif_tx,
+        &permission_level,
+        &sub_ctx,
     )
-    .with_subagent_limits(100, 600); // TODO: read from config_center when wired
-    let pending_subagents = task_tool.pending.clone();
-    let subagent_rx = task_tool.take_receiver(); // AgentLoop drains this each turn
-    // Set the pre-built sub-agent context on the TaskTool.
-    *task_tool.subagent_ctx.write().unwrap_or_else(|e| e.into_inner()) = sub_ctx;
-    let profile_path = state.config.data_dir.join("memory").join("persona").join("profile.json");
-    if let Ok(content) = std::fs::read_to_string(&profile_path) {
-        if let Ok(profile) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(injection) = profile.get("system_prompt_injection").and_then(|v| v.as_str()) {
-                task_tool.set_persona(injection.to_string());
-            }
-        }
-    }
+    .await;
+    let tools = assembled.tools;
+    let pending_subagents = assembled.pending;
+    let subagent_rx = assembled.subagent_rx;
+    let results_backlog = assembled.results_backlog;
+    let compact_focus = assembled.compact_focus;
 
-    // ── Extract sub-agent tracking refs before task_tool is moved ──
-    let task_handles = task_tool.handles.clone();
-    let task_statuses = task_tool.statuses.clone();
-    let results_backlog = task_tool.results_backlog.clone();
-    {
-        state.subagent_handles.write().await.insert(session_id, task_handles);
-        state.subagent_statuses.write().await.insert(session_id, task_statuses);
-    }
-
-    // ── Register cancellable session for interrupt endpoint ────────
+    // ── Register cancellable session + disconnect watcher ────────────
     let session_cancel = tokio_util::sync::CancellationToken::new();
-    {
-        state.session_actors.write().await.insert(session_id, session_cancel.clone());
-    }
+    state
+        .session_actors
+        .write()
+        .await
+        .insert(session_id, session_cancel.clone());
 
-    registry.register(Arc::new(task_tool));
-    let tools = Arc::new(registry);
-    tracing::info!(tool_count = tools.len(), "Agent tools ready");
+    let tx_disconnect = tx.clone();
+    let cancel_on_disconnect = session_cancel.clone();
+    tokio::spawn(async move {
+        tx_disconnect.closed().await;
+        cancel_on_disconnect.cancel();
+        tracing::info!("SSE client disconnected — session cancelled");
+    });
 
-    // ── 7. Run Agent Loop with Confirmation Support ────────────────
-    // We use tokio::select! to listen on TWO channels simultaneously:
-    //   1. agent_rx  — agent events (thinking, text, tool calls, done, error)
-    //   2. notif_rx  — confirmation notifications from the shell tool
+    // ── 7. Run Agent Loop — content-block SSE streaming ───────────────
     //
-    // When the shell tool needs user confirmation, it sends a notification
-    // on notif_tx and BLOCKS on a oneshot. The SSE stream forwards the
-    // notification to the frontend as a "confirmation_required" event.
-    // The user clicks Allow/Deny → /api/sandbox/confirm resolves the
-    // oneshot → the tool unblocks and continues. The LLM never sees any
-    // of this — it's transparent, just like Claude Code.
+    // Events follow Anthropic's content-block model:
+    //   message_start → content_block_start/delta/stop (repeated)
+    //   → message_delta → message_stop
+    //
+    // Each thinking / tool_use / text segment is a separate content block
+    // with an incrementing index.  This lets the frontend render blocks
+    // in order without any interleaving hacks.
     // Clone refs before moving into AgentLoop (needed for auto-continue)
     let pending_for_autocontinue = Arc::clone(&pending_subagents);
     let mut messages_for_autocontinue = messages.clone();
     let client_for_autocontinue = Arc::clone(&client);
     let tools_for_autocontinue = Arc::clone(&tools);
+    let proactivity = Arc::new(std::sync::Mutex::new(
+        everevo_agent::ProactivityState::new(),
+    ));
     let agent = everevo_agent::AgentLoop::new()
-        .with_subagent_channel(subagent_rx)  // non-blocking task tool results
-        .with_pending_subagents(pending_subagents); // block Done while sub-agents run
+        .with_subagent_channel(subagent_rx)
+        .with_pending_subagents(pending_subagents)
+        .with_cancel_token(session_cancel.clone())
+        .with_compact_focus(compact_focus.clone())
+        .with_proactivity(Arc::clone(&proactivity));
     let mut agent_rx = agent.run(client, tools, messages, None).await;
 
-    let mut full_response = String::new();
     let assistant_id = Uuid::new_v4();
-    // Accumulate tool calls within the current turn for DB persistence.
-    let mut turn_tool_calls: Vec<serde_json::Value> = Vec::new();
-    let mut turn_tool_results: Vec<(String, String, bool)> = Vec::new(); // (id, content, is_error)
+    let mut s = ContentBlockStreamer::new(session_id);
+
+    // ── message_start ──
+    let _ = tx
+        .send(orchestration::stream::message_start(
+            &assistant_id.to_string(),
+        ))
+        .await;
 
     let mut agent_yielded_for_subagents = false;
     loop {
@@ -345,85 +361,37 @@ async fn handle_chat(
             // ── Agent events (primary channel) ──────────────────────
             event = agent_rx.recv() => {
                 match event {
-                    Some(everevo_agent::AgentEvent::Thinking(t)) => {
-                        if tx.send(Ok(Event::default().event("thinking").data(t))).await.is_err() { break; }
-                    }
-                    Some(everevo_agent::AgentEvent::TextDelta(t)) => {
-                        full_response.push_str(&t);
-                        if tx.send(Ok(Event::default().event("token").data(t))).await.is_err() { break; }
-                    }
-                    Some(everevo_agent::AgentEvent::ToolCallStart { id, name, arguments }) => {
-                        turn_tool_calls.push(serde_json::json!({
-                            "id": id, "name": name, "arguments": arguments,
-                        }));
-                        let _ = tx.send(Ok(Event::default().event("tool_start").data(
-                            serde_json::json!({"id": id, "name": name, "arguments": arguments}).to_string(),
-                        ))).await;
-                    }
-                    Some(everevo_agent::AgentEvent::ToolCallEnd { id, name, content, is_error }) => {
-                        let id_c = id.clone();
-                        turn_tool_results.push((id, content.clone(), is_error));
-                        let _ = tx.send(Ok(Event::default().event("tool_end").data(
-                            serde_json::json!({"id": id_c, "name": name, "content": content, "is_error": is_error}).to_string(),
-                        ))).await;
-                    }
-                    Some(everevo_agent::AgentEvent::ConfirmationNeeded { command, reason }) => {
-                        let _ = tx.send(Ok(Event::default().event("confirmation_required").data(
-                            serde_json::json!({"command": command, "reason": reason}).to_string(),
-                        ))).await;
-                    }
-                    Some(everevo_agent::AgentEvent::TurnComplete) => {
-                        // Persist tool calls + results for this turn so they survive
-                        // SSE disconnects and server restarts.
-                        if !turn_tool_calls.is_empty() {
-                            let tc_json = serde_json::to_string(&turn_tool_calls).unwrap_or_default();
-                            let _ = state.db.add_message(&MessageRow::new(
-                                session_id, "assistant", "", Some(tc_json), None,
-                            )).await;
-                            for (tc_id, tc_content, _tc_err) in &turn_tool_results {
-                                let _ = state.db.add_message(&MessageRow::new(
-                                    session_id, "tool", tc_content, None, Some(tc_id.clone()),
-                                )).await;
-                            }
-                            turn_tool_calls.clear();
-                            turn_tool_results.clear();
+                    Some(ev) => {
+                        let is_turn = matches!(ev, everevo_agent::AgentEvent::TurnComplete);
+                        let is_waiting = matches!(ev, everevo_agent::AgentEvent::WaitingForSubAgents { .. });
+                        if is_waiting {
+                            tracing::info!("Main loop yielded — waiting for sub-agents");
+                            agent_yielded_for_subagents = true;
                         }
-                        state.scheduler.increment_turn();
+                        match s.handle_event(ev, tx).await {
+                            crate::orchestration::StreamerAction::Continue => {
+                                if is_turn {
+                                    // Per-tool persistence
+                                    for (_tc_id, tc_json, thinking) in s.pending_stubs.drain(..) {
+                                        let _ = state.db.add_message(&MessageRow::new(
+                                            session_id, "assistant", "",
+                                            Some(serde_json::to_string(&[tc_json]).unwrap_or_default()),
+                                            None, thinking,
+                                        )).await;
+                                    }
+                                    for (tc_id, tc_content, _tc_err) in s.pending_results.drain(..) {
+                                        let _ = state.db.add_message(&MessageRow::new(
+                                            session_id, "tool", tc_content, None, Some(tc_id), None,
+                                        )).await;
+                                    }
+                                    state.scheduler.increment_turn();
+                                }
+                            }
+                            crate::orchestration::StreamerAction::Done => break,
+                            crate::orchestration::StreamerAction::Error { .. } => break,
+                        }
                     }
-                    Some(everevo_agent::AgentEvent::SubAgentStarted { id, description }) => {
-                        let _ = tx.send(Ok(Event::default().event("subagent_started").data(
-                            serde_json::json!({"id": id, "description": description}).to_string(),
-                        ))).await;
-                    }
-                    Some(everevo_agent::AgentEvent::SubAgentResult { id, description, result }) => {
-                        let _ = tx.send(Ok(Event::default().event("subagent_result").data(
-                            serde_json::json!({
-                                "id": id,
-                                "description": description,
-                                "result": &result[..2000.min(result.len())],
-                            }).to_string(),
-                        ))).await;
-                    }
-                    Some(everevo_agent::AgentEvent::WaitingForSubAgents { pending }) => {
-                        tracing::info!(pending, "Main loop yielded — waiting for sub-agents");
-                        agent_yielded_for_subagents = true;
-                        let _ = tx.send(Ok(Event::default().event("waiting").data(
-                            serde_json::json!({"pending": pending}).to_string(),
-                        ))).await;
-                    }
-                    Some(everevo_agent::AgentEvent::Done { final_text }) => {
-                        full_response = final_text;
-                        break;
-                    }
-                    Some(everevo_agent::AgentEvent::Error { message }) => {
-                        let _ = tx.send(Ok(Event::default().event("error").data(message))).await;
-                        break;
-                    }
-                    None => {
-                        // agent_rx channel closed — agent loop paused (sub-agents pending)
-                        // or completed normally (Done was already received).
-                        break;
-                    }
+                    None => break,
                 }
             }
 
@@ -451,14 +419,28 @@ async fn handle_chat(
     }
 
     // ── 7.5 Auto-continue: sub-agent results arrive → restart agent loop ──
+    // Guard against infinite restarts: max 5 auto-continue cycles, and
+    // break if pending_subagents hasn't decreased between cycles.
     if agent_yielded_for_subagents {
         let mut drained = 0usize;
+        let mut auto_cycles = 0u32;
+        const MAX_AUTO_CYCLES: u32 = 5;
+        let mut last_pending = pending_for_autocontinue.load(std::sync::atomic::Ordering::SeqCst);
 
         loop {
+            auto_cycles += 1;
+            if auto_cycles > MAX_AUTO_CYCLES {
+                tracing::warn!(
+                    cycles = auto_cycles,
+                    "Auto-continue limit reached — forcing final synthesis"
+                );
+                break;
+            }
+
             let pending = pending_for_autocontinue.load(std::sync::atomic::Ordering::SeqCst);
 
             // ── Extract new results (drop lock before any await) ──
-            let new_results: Vec<String> = {
+            let new_results: Vec<(String, String, String)> = {
                 let backlog = results_backlog.lock().unwrap_or_else(|e| e.into_inner());
                 if drained < backlog.len() {
                     backlog[drained..].to_vec()
@@ -469,14 +451,32 @@ async fn handle_chat(
 
             if pending == 0 && new_results.is_empty() {
                 tracing::info!("All sub-agents completed — final synthesis");
+                // Inject verification nudge so the LLM can call Verify tool
+                messages_for_autocontinue.push(everevo_core::llm::LlmMessage::user(
+                    "All sub-agent tasks have completed. Review the results above. \
+                     If any task output needs verification, use the Verify tool \
+                     to check correctness before providing your final answer.",
+                ));
                 break;
             }
 
+            // If pending count hasn't changed and no new results, the sub-agents
+            // might be stuck — force final synthesis instead of looping forever.
             if new_results.is_empty() {
+                if pending >= last_pending {
+                    tracing::warn!(
+                        pending,
+                        cycles = auto_cycles,
+                        "Sub-agents stalled — forcing final synthesis"
+                    );
+                    break;
+                }
+                last_pending = pending;
                 // No new results — sleep and retry
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 continue;
             }
+            last_pending = pending;
 
             drained = {
                 let backlog = results_backlog.lock().unwrap_or_else(|e| e.into_inner());
@@ -484,21 +484,23 @@ async fn handle_chat(
             };
 
             // ── Inject results and send SSE events ──
-            for result in &new_results {
-                let short = &result[..2000.min(result.len())];
+            for (task_id, desc, result) in &new_results {
+                let short: String = result.chars().take(2000).collect();
                 let _ = tx
-                    .send(Ok(Event::default().event("subagent_result").data(
-                        serde_json::json!({"result": short}).to_string(),
-                    )))
+                    .send(Ok(Event::default()
+                        .event("subagent_result")
+                        .data(serde_json::json!({"id": task_id, "description": desc, "result": short}).to_string())))
                     .await;
-                messages_for_autocontinue.push(everevo_core::llm::LlmMessage::user(&format!(
+                messages_for_autocontinue.push(everevo_core::llm::LlmMessage::user(format!(
                     "[SubAgent Result]\n{result}"
                 )));
             }
 
             // ── Restart AgentLoop with updated messages ──
             let agent2 = everevo_agent::AgentLoop::new()
-                .with_pending_subagents(Arc::clone(&pending_for_autocontinue));
+                .with_pending_subagents(Arc::clone(&pending_for_autocontinue))
+                .with_cancel_token(session_cancel.clone())
+                .with_compact_focus(compact_focus.clone());
             let resumed_msgs = messages_for_autocontinue.clone();
             let mut agent_rx2 = agent2
                 .run(
@@ -509,50 +511,27 @@ async fn handle_chat(
                 )
                 .await;
 
-            // ── Stream events from the resumed run ──
-            full_response.clear();
+            // ── Stream events from the resumed run (content-block format) ──
+            let mut ac_streamer = ContentBlockStreamer::new(session_id);
+            ac_streamer.block_index = s.block_index;
             loop {
                 tokio::select! {
                     event = agent_rx2.recv() => {
                         match event {
-                            Some(everevo_agent::AgentEvent::Thinking(t)) => {
-                                let _ = tx.send(Ok(Event::default().event("thinking").data(t))).await;
-                            }
-                            Some(everevo_agent::AgentEvent::TextDelta(t)) => {
-                                full_response.push_str(&t);
-                                let _ = tx.send(Ok(Event::default().event("token").data(t))).await;
-                            }
-                            Some(everevo_agent::AgentEvent::ToolCallStart { id, name, arguments }) => {
-                                let _ = tx.send(Ok(Event::default().event("tool_start").data(
-                                    serde_json::json!({"id": id, "name": name, "arguments": arguments}).to_string(),
-                                ))).await;
-                            }
-                            Some(everevo_agent::AgentEvent::ToolCallEnd { id, name, content, is_error }) => {
-                                let _ = tx.send(Ok(Event::default().event("tool_end").data(
-                                    serde_json::json!({"id": id, "name": name, "content": content, "is_error": is_error}).to_string(),
-                                ))).await;
-                            }
-                            Some(everevo_agent::AgentEvent::WaitingForSubAgents { pending: p }) => {
-                                let _ = tx.send(Ok(Event::default().event("waiting").data(
-                                    serde_json::json!({"pending": p}).to_string(),
-                                ))).await;
-                                break;
-                            }
-                            Some(everevo_agent::AgentEvent::SubAgentResult { id, description, result }) => {
-                                let _ = tx.send(Ok(Event::default().event("subagent_result").data(
-                                    serde_json::json!({"id": id, "description": description, "result": &result[..2000.min(result.len())]}).to_string(),
-                                ))).await;
-                            }
-                            Some(everevo_agent::AgentEvent::Done { final_text }) => {
-                                full_response = final_text;
-                                break;
-                            }
-                            Some(everevo_agent::AgentEvent::Error { message }) => {
-                                let _ = tx.send(Ok(Event::default().event("error").data(message))).await;
-                                break;
+                            Some(ev) => {
+                                let is_terminal = matches!(ev,
+                                    everevo_agent::AgentEvent::Done { .. } |
+                                    everevo_agent::AgentEvent::Error { .. }
+                                );
+                                match ac_streamer.handle_event(ev, tx).await {
+                                    crate::orchestration::StreamerAction::Continue => {
+                                        if is_terminal { break; }
+                                    }
+                                    crate::orchestration::StreamerAction::Done => break,
+                                    crate::orchestration::StreamerAction::Error { .. } => break,
+                                }
                             }
                             None => break,
-                            _ => {}
                         }
                     }
                     Some(notif) = notif_rx.recv() => {
@@ -568,6 +547,11 @@ async fn handle_chat(
                     }
                 }
             }
+            // Sync streamer state back
+            s.block_index = ac_streamer.block_index;
+            s.thinking_open = ac_streamer.thinking_open;
+            s.text_block_idx = ac_streamer.text_block_idx;
+            s.full_response = ac_streamer.full_response;
 
             // Check if all sub-agents are done
             if pending_for_autocontinue.load(std::sync::atomic::Ordering::SeqCst) == 0 {
@@ -576,50 +560,164 @@ async fn handle_chat(
         }
     }
 
-    // ── 8. Persist assistant response ─────────────────────────────────
-    if !full_response.is_empty() {
-        let content_hash = everevo_db::models::sha256_hash(&full_response);
-        let assistant_msg = MessageRow {
-            id: assistant_id,
-            session_id,
-            role: "assistant".into(),
-            content: full_response.clone(),
-            content_hash,
-            tool_calls: None,
-            tool_call_id: None,
-            created_at: Utc::now(),
-        };
-        let _ = state.db.add_message(&assistant_msg).await;
-        state.dreaming_engine.push_message("assistant", &full_response, &assistant_id.to_string());
+    // ── 8-11. Persist + close blocks + cleanup ───────────────────────
+    let _ = orchestration::finalize_response(
+        tx,
+        &state,
+        session_id,
+        assistant_id,
+        &s.full_response,
+        &s.cur_thinking,
+        &s.persisted_blocks,
+        s.thinking_open,
+        s.text_block_idx,
+        s.block_index,
+    )
+    .await;
+
+    // ── Post-turn memory extraction (Mem0 pattern: async LLM extraction) ──
+    if !s.full_response.is_empty() {
+        let llm = state.llm.read().await;
+        if let Some(primary) = llm.values().find_map(|v| v.clone()) {
+            let fm = state.fact_manager.clone();
+            let user_msg = req.message.clone();
+            let assistant_msg = s.full_response.clone();
+            tokio::spawn(async move {
+                everevo_agent::memory::extractor::extract_from_turn(
+                    &primary,
+                    &fm,
+                    &user_msg,
+                    &assistant_msg,
+                )
+                .await;
+            });
+        }
     }
 
-    // ── 9. Flush audit trail ───────────────────────────────────────
-    if let Some(sb) = state.sandboxes.read().await.get(&session_id) {
-        sb.flush_audit();
-    }
+    Ok(())
+}
 
-    // ── 10. Done ─────────────────────────────────────────────────────
-    let done_payload = serde_json::json!({
-        "session_id": session_id,
-        "message_id": assistant_id,
-    });
+// ── Reconnection handler ─────────────────────────────────────────────────
+
+/// Replay all messages from DB as SSE events — for reconnecting to
+/// background/daemon sessions. Also notifies if the session is still running.
+async fn handle_reconnect(
+    state: &Arc<AppState>,
+    req: ChatRequest,
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
+) -> Result<(), String> {
+    let session_id = req.session_id.ok_or("session_id required for reconnect")?;
+
+    // Verify session exists
+    let session = state
+        .db
+        .get_session(session_id)
+        .await
+        .map_err(|e| format!("DB error: {e}"))?
+        .ok_or_else(|| "Session not found".to_string())?;
+
+    // Parse metadata
+    let meta: everevo_core::types::SessionMeta =
+        serde_json::from_str(&session.metadata).unwrap_or_default();
+
+    // Send session info event
     let _ = tx
-        .send(Ok(Event::default().event("done").data(done_payload.to_string())))
+        .send(Ok(Event::default()
+            .event("session_info")
+            .data(serde_json::json!({
+                "session_id": session_id,
+                "mode": meta.mode.as_str(),
+                "state": meta.state.as_str(),
+            })
+            .to_string())))
         .await;
 
-    // ── 11. Cleanup session actor + sub-agent tracking ──────────────
-    {
-        state.session_actors.write().await.remove(&session_id);
-        // Keep sub-agent entries for ~60s after completion so status
-        // queries still return them. A background cleanup task handles this.
+    // Load all messages
+    let messages = state
+        .db
+        .get_messages(session_id, None)
+        .await
+        .map_err(|e| format!("Load messages: {e}"))?;
+
+    // Replay messages as SSE events
+    for msg in &messages {
+        let event_type = match msg.role.as_str() {
+            "user" => "user_message",
+            "assistant" => "assistant_message",
+            "tool" => "tool_message",
+            _ => "message",
+        };
+        let _ = tx
+            .send(Ok(Event::default()
+                .event(event_type)
+                .data(serde_json::json!({
+                    "id": msg.id,
+                    "role": msg.role,
+                    "content": msg.content,
+                    "created_at": msg.created_at,
+                })
+                .to_string())))
+            .await;
     }
+
+    // Check if session is still running (has a bg worker)
+    let is_running = state.bg_sessions.read().await.contains_key(&session_id);
+
+    if is_running {
+        // Session is still active — hold connection open and poll for new messages
+        let mut last_count = messages.len();
+        // Poll every 500ms for new messages, up to 5 minutes
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            // Check if still running
+            if !state.bg_sessions.read().await.contains_key(&session_id) {
+                break; // bg worker finished
+            }
+
+            // Check for new messages
+            let current = state
+                .db
+                .get_messages(session_id, None)
+                .await
+                .map_err(|e| format!("Poll messages: {e}"))?;
+
+            // Send any new messages
+            for msg in &current[last_count..] {
+                let _ = tx
+                    .send(Ok(Event::default()
+                        .event("new_message")
+                        .data(serde_json::json!({
+                            "id": msg.id,
+                            "role": msg.role,
+                            "content": msg.content,
+                            "created_at": msg.created_at,
+                        })
+                        .to_string())))
+                    .await;
+            }
+            last_count = current.len();
+        }
+    }
+
+    // Done
+    let _ = tx
+        .send(Ok(Event::default()
+            .event("reconnect_done")
+            .data(serde_json::json!({
+                "session_id": session_id,
+                "message_count": messages.len(),
+            })
+            .to_string())))
+        .await;
 
     Ok(())
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
-fn truncate_for_title(text: &str) -> String {
+pub(crate) fn truncate_for_title(text: &str) -> String {
     let trimmed = text.trim();
     let first_line = trimmed.lines().next().unwrap_or(trimmed);
     if first_line.chars().count() > 60 {
@@ -629,162 +727,7 @@ fn truncate_for_title(text: &str) -> String {
     }
 }
 
-/// Wraps a sandbox to force all commands into the session work directory.
-/// Also handles the confirmation flow: when the sandbox requires user
-/// confirmation, this tool blocks on a oneshot channel until the user
-/// responds via the `/api/sandbox/confirm` endpoint.
-///
-/// When `auto_confirm` is true (sub-agent inheriting FullyAuto parent):
-/// commands execute with `confirmed: true` immediately, bypassing the
-/// confirmation gate. Admin commands fail-fast instead of deadlocking.
-struct SandboxedShellTool {
-    inner: Arc<dyn everevo_core::sandbox::SandboxProvider>,
-    work_dir: std::path::PathBuf,
-    session_id: Uuid,
-    /// Shared pending confirmations map — the confirm endpoint resolves these.
-    confirmations: Arc<RwLock<std::collections::HashMap<Uuid, PendingConfirmation>>>,
-    /// Channel to notify the SSE stream about a pending confirmation.
-    notif_tx: mpsc::UnboundedSender<ConfirmationNotification>,
-    /// When true, bypass the confirmation gate entirely.
-    /// Set for sub-agents that inherit a FullyAuto parent session.
-    auto_confirm: bool,
-}
-
-impl SandboxedShellTool {
-    // with_auto_confirm() removed — we construct a fresh instance directly
-    // in the base_for_task setup (see is_fully_auto block below).
-}
-
-#[async_trait::async_trait]
-impl everevo_core::tool::Tool for SandboxedShellTool {
-    fn name(&self) -> &str { "shell" }
-    fn description(&self) -> &str {
-        "Execute a shell command in an isolated sandbox. Use RELATIVE paths (e.g., ./file.txt)."
-    }
-    fn parameters_schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "command": { "type": "string", "description": "Shell command. Use relative paths." },
-                "timeout_secs": { "type": "integer", "description": "Timeout (default: 30, max: 300)", "default": 30 }
-            },
-            "required": ["command"]
-        })
-    }
-    fn risk_level(&self) -> everevo_core::types::RiskLevel { everevo_core::types::RiskLevel::Medium }
-    async fn execute(&self, params: serde_json::Value) -> Result<everevo_core::tool::ToolOutput, everevo_core::EverEvoError> {
-        let command = params["command"].as_str()
-            .ok_or_else(|| everevo_core::EverEvoError::InvalidInput("command is required".into()))?;
-        let timeout_secs = params["timeout_secs"].as_u64().unwrap_or(30).min(300);
-
-        // auto_confirm: sub-agents inheriting FullyAuto parent skip the gate.
-        // Pass confirmed=true so TieredSandbox proceeds past Confirm decisions.
-        let confirmed = self.auto_confirm || params.get("confirmed").and_then(|v| v.as_bool()).unwrap_or(false);
-
-        let config = everevo_core::sandbox::ExecutionConfig::new(command)
-            .with_timeout(timeout_secs)
-            .with_working_dir(self.work_dir.clone())
-            .with_confirmed(confirmed);
-        let mut result = self.inner.execute(&config).await?;
-
-        // ── Confirmation gate (Claude Code style) ───────────────────
-        // When the sandbox requires user confirmation, BLOCK the tool
-        // on a oneshot channel. The SSE stream notifies the frontend,
-        // and the /api/sandbox/confirm endpoint resolves the oneshot.
-        // The LLM never sees the confirmation — it's transparent.
-        if result.needs_confirmation {
-            // ── auto_confirm path: fail-fast, don't deadlock ────
-            // Sub-agents have no user to ask. Admin commands (sudo/runas)
-            // still trigger Confirm even at FullyAuto — fail with a clear
-            // error instead of blocking on a oneshot that nobody will answer.
-            if self.auto_confirm {
-                tracing::warn!(
-                    session_id = %self.session_id,
-                    command = %command,
-                    reason = %result.confirmation_reason,
-                    "Sub-agent admin command blocked (auto_confirm)"
-                );
-                return Ok(everevo_core::tool::ToolOutput {
-                    content: format!(
-                        "Command requires admin privileges and cannot run in a sub-agent: {}. \
-                         Use a non-admin alternative or ask the main agent to run this.",
-                        result.confirmation_reason
-                    ),
-                    is_error: true,
-                });
-            }
-
-            let reason = result.confirmation_reason.clone();
-
-            // Create oneshot — we'll wait for the user's response
-            let (tx, rx) = tokio::sync::oneshot::channel();
-
-            // Register the pending confirmation so the confirm endpoint can resolve it
-            self.confirmations.write().await.insert(self.session_id, PendingConfirmation {
-                command: command.to_string(),
-                reason: reason.clone(),
-                response_tx: tx,
-            });
-
-            // Notify the SSE stream so the frontend shows a dialog
-            let _ = self.notif_tx.send(ConfirmationNotification {
-                session_id: self.session_id,
-                command: command.to_string(),
-                reason: reason.clone(),
-            });
-
-            tracing::info!(
-                session_id = %self.session_id,
-                command = %command,
-                %reason,
-                "Waiting for user confirmation..."
-            );
-
-            // BLOCK until user clicks Allow or Deny
-            let approved = rx.await.unwrap_or(false);
-
-            // Clean up pending confirmation
-            self.confirmations.write().await.remove(&self.session_id);
-
-            if !approved {
-                tracing::info!(
-                    session_id = %self.session_id,
-                    command = %command,
-                    "User denied execution"
-                );
-                return Ok(everevo_core::tool::ToolOutput {
-                    content: format!("User denied execution: {reason}"),
-                    is_error: true,
-                });
-            }
-
-            tracing::info!(
-                session_id = %self.session_id,
-                command = %command,
-                "User approved — re-executing with confirmed=true"
-            );
-
-            // Re-execute with user confirmation
-            let config = everevo_core::sandbox::ExecutionConfig::new(command)
-                .with_timeout(timeout_secs)
-                .with_working_dir(self.work_dir.clone())
-                .with_confirmed(true);
-            result = self.inner.execute(&config).await?;
-        }
-
-        let content = if result.stdout.is_empty() { result.stderr.clone() } else { result.stdout.clone() };
-        let is_error = result.exit_code != 0 || result.killed_by_timeout;
-        if result.killed_by_timeout {
-            return Ok(everevo_core::tool::ToolOutput { content: format!("Timeout after {timeout_secs}s"), is_error: true });
-        }
-        if result.exit_code == 126 {
-            return Ok(everevo_core::tool::ToolOutput { content, is_error: true });
-        }
-        Ok(everevo_core::tool::ToolOutput { content, is_error })
-    }
-}
-
-fn db_message_to_llm(m: &MessageRow) -> LlmMessage {
+pub(crate) fn db_message_to_llm(m: &MessageRow) -> LlmMessage {
     let role = match m.role.as_str() {
         "user" => LlmRole::User,
         "assistant" => LlmRole::Assistant,
@@ -792,10 +735,23 @@ fn db_message_to_llm(m: &MessageRow) -> LlmMessage {
         "tool" => LlmRole::Tool,
         _ => LlmRole::User,
     };
+    // Only restore thinking for tool-call turns (DeepSeek Rule B).
+    // Final answers without tool calls must drop thinking (Rule A).
+    let has_tools = m
+        .tool_calls
+        .as_ref()
+        .and_then(|tc| serde_json::from_str::<Vec<serde_json::Value>>(tc).ok())
+        .map(|arr| !arr.is_empty())
+        .unwrap_or(false);
+    let thinking = if has_tools && !m.thinking.is_empty() {
+        Some(m.thinking.clone())
+    } else {
+        None
+    };
     LlmMessage {
         role,
         content: m.content.clone(),
-        thinking: None,
+        thinking,
         tool_calls: m
             .tool_calls
             .as_ref()
@@ -804,11 +760,155 @@ fn db_message_to_llm(m: &MessageRow) -> LlmMessage {
     }
 }
 
-fn resolve_permission(level: &str) -> everevo_sandbox::PermissionLevel {
+pub(crate) fn resolve_permission(level: &str) -> everevo_sandbox::PermissionLevel {
     match level {
         "fully_auto" => everevo_sandbox::PermissionLevel::FullyAuto,
         "fully_manual" => everevo_sandbox::PermissionLevel::FullyManual,
         "read_only" => everevo_sandbox::PermissionLevel::ReadOnly,
         _ => everevo_sandbox::PermissionLevel::SemiAuto,
+    }
+}
+
+// ── Git Detection ──────────────────────────────────────────────────────────
+
+/// Detect git repository info for the workspace (Claude Code alignment).
+/// Uses std::process to run git CLI — this runs at context-build time
+/// (NOT inside the sandbox tool), so sandbox restrictions don't apply.
+#[allow(clippy::disallowed_methods)]
+fn detect_git(workspace: &std::path::Path) -> (Option<String>, Option<String>) {
+    let git_dir = workspace.join(".git");
+    if !git_dir.exists() {
+        return (None, None);
+    }
+    let branch = std::process::Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(workspace)
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string());
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(workspace)
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| {
+            let modified = s.lines().filter(|l| {
+                let trimmed = l.trim();
+                !trimmed.is_empty() && !trimmed.starts_with("??")
+            }).count();
+            let untracked = s.lines().filter(|l| l.trim().starts_with("??")).count();
+            let mut parts = Vec::new();
+            if modified > 0 { parts.push(format!("{modified} modified")); }
+            if untracked > 0 { parts.push(format!("{untracked} untracked")); }
+            if parts.is_empty() { "clean".to_string() } else { parts.join(", ") }
+        });
+    (branch, status)
+}
+
+// ── Workspace Context Discovery ─────────────────────────────────────────────
+
+/// Walk up from workspace root discovering CLAUDE.md / AGENTS.md files
+/// (Claude Code alignment — hierarchical context chain).
+fn discover_workspace_context(
+    workspace: &std::path::Path,
+) -> Vec<(String, String)> {
+    let mut files = Vec::new();
+    let mut current = Some(workspace.to_path_buf());
+    while let Some(dir) = current {
+        for name in &["CLAUDE.md", "AGENTS.md", ".everevo.md"] {
+            let path = dir.join(name);
+            if path.exists() && path.is_file() {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    let trimmed = content.trim().to_string();
+                    if !trimmed.is_empty() {
+                        files.push((path.display().to_string(), trimmed));
+                    }
+                }
+            }
+        }
+        current = dir.parent().map(|p| p.to_path_buf());
+    }
+    // Reverse so root-level files come first, workspace-level last (root-to-leaf)
+    files.reverse();
+    files
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── truncate_for_title ─────────────────────────────────────────
+
+    #[test]
+    fn test_truncate_short_text() {
+        assert_eq!(truncate_for_title("Hello"), "Hello");
+    }
+
+    #[test]
+    fn test_truncate_trim_and_first_line() {
+        assert_eq!(truncate_for_title("  Hi\nSecond line\nThird  "), "Hi");
+    }
+
+    #[test]
+    fn test_truncate_long_text() {
+        let long = "a".repeat(100);
+        let result = truncate_for_title(&long);
+        assert_eq!(result.len(), 60); // 57 chars + "..."
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_truncate_exactly_60() {
+        let exact = "a".repeat(60);
+        assert_eq!(truncate_for_title(&exact), exact); // no truncation
+    }
+
+    #[test]
+    fn test_truncate_empty() {
+        assert_eq!(truncate_for_title(""), "");
+    }
+
+    // ── resolve_permission ─────────────────────────────────────────
+
+    #[test]
+    fn test_resolve_permission_known_levels() {
+        assert_eq!(
+            resolve_permission("fully_auto"),
+            everevo_sandbox::PermissionLevel::FullyAuto
+        );
+        assert_eq!(
+            resolve_permission("fully_manual"),
+            everevo_sandbox::PermissionLevel::FullyManual
+        );
+        assert_eq!(
+            resolve_permission("read_only"),
+            everevo_sandbox::PermissionLevel::ReadOnly
+        );
+    }
+
+    #[test]
+    fn test_resolve_permission_default_semiauto() {
+        // Unknown/invalid levels default to SemiAuto
+        assert_eq!(
+            resolve_permission("unknown"),
+            everevo_sandbox::PermissionLevel::SemiAuto
+        );
+        assert_eq!(
+            resolve_permission(""),
+            everevo_sandbox::PermissionLevel::SemiAuto
+        );
+    }
+
+    #[test]
+    fn test_resolve_permission_case_sensitive() {
+        assert_eq!(
+            resolve_permission("Fully_Auto"),
+            everevo_sandbox::PermissionLevel::SemiAuto
+        );
     }
 }

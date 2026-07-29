@@ -30,7 +30,9 @@ pub(crate) fn build_client(config: &DownloaderConfig) -> Result<HttpClient, Down
         .user_agent(&config.user_agent)
         .connect_timeout(std::time::Duration::from_secs(30))
         .timeout(std::time::Duration::from_secs(300))
-        .pool_idle_timeout(std::time::Duration::from_secs(config.pool_idle_timeout_secs))
+        .pool_idle_timeout(std::time::Duration::from_secs(
+            config.pool_idle_timeout_secs,
+        ))
         .tcp_nodelay(true)
         .tcp_keepalive(std::time::Duration::from_secs(60))
         .build()
@@ -88,21 +90,18 @@ pub(crate) async fn execute_task(
 
         // ── Probe: HEAD request to get Content-Length ──────────────
         // Try ureq first (sync Winsock works in Tauri), reqwest as fallback.
-        let (total_size, _supports_range) =
-            match probe_url_ureq(url).await {
+        let (total_size, _supports_range) = match probe_url_ureq(url).await {
+            Ok(v) => v,
+            Err(_) => match probe_url(url, client, effective_timeout).await {
                 Ok(v) => v,
-                Err(_) => {
-                    match probe_url(url, client, effective_timeout).await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            let detail = format_reqwest_error(&e);
-                            tracing::warn!(url, mirror = mirror_name, error = %e, %detail, "Probe failed");
-                            last_error = Some(e);
-                            continue;
-                        }
-                    }
+                Err(e) => {
+                    let detail = format_reqwest_error(&e);
+                    tracing::warn!(url, mirror = mirror_name, error = %e, %detail, "Probe failed");
+                    last_error = Some(e);
+                    continue;
                 }
-            };
+            },
+        };
 
         // ── Resume State ────────────────────────────────────────────
         let resume_path = task.resume_path();
@@ -149,16 +148,32 @@ pub(crate) async fn execute_task(
                     Ok(Err(ue)) => {
                         tracing::warn!(url, mirror = mirror_name, error = %ue, "ureq failed, trying reqwest");
                         download_simple(
-                            task, url, client, total_size, &mut resume, effective_retries,
-                            effective_timeout, events, observers, meta,
+                            task,
+                            url,
+                            client,
+                            total_size,
+                            &mut resume,
+                            effective_retries,
+                            effective_timeout,
+                            events,
+                            observers,
+                            meta,
                         )
                         .await
                     }
                     Err(join_err) => {
                         tracing::warn!(url, mirror = mirror_name, error = %join_err, "ureq spawn failed, trying reqwest");
                         download_simple(
-                            task, url, client, total_size, &mut resume, effective_retries,
-                            effective_timeout, events, observers, meta,
+                            task,
+                            url,
+                            client,
+                            total_size,
+                            &mut resume,
+                            effective_retries,
+                            effective_timeout,
+                            events,
+                            observers,
+                            meta,
                         )
                         .await
                     }
@@ -166,8 +181,18 @@ pub(crate) async fn execute_task(
             }
             DownloadStrategy::Chunked { concurrency } => {
                 download_chunked(
-                    task, url, client, total_size, chunk_size, concurrency,
-                    &mut resume, effective_retries, effective_timeout, events, observers, meta,
+                    task,
+                    url,
+                    client,
+                    total_size,
+                    chunk_size,
+                    concurrency,
+                    &mut resume,
+                    effective_retries,
+                    effective_timeout,
+                    events,
+                    observers,
+                    meta,
                 )
                 .await
             }
@@ -250,10 +275,12 @@ pub(crate) async fn execute_task(
     }
 
     // All mirrors exhausted
-    Err(last_error.unwrap_or_else(|| DownloadError::AllMirrorsExhausted {
-        url: task.url.clone(),
-        tried: urls_to_try.iter().map(|(_, n)| n.clone()).collect(),
-    }))
+    Err(
+        last_error.unwrap_or_else(|| DownloadError::AllMirrorsExhausted {
+            url: task.url.clone(),
+            tried: urls_to_try.iter().map(|(_, n)| n.clone()).collect(),
+        }),
+    )
 }
 
 // ── URL List Builder ────────────────────────────────────────────────────
@@ -301,9 +328,7 @@ async fn probe_url(
         .await?;
 
     if !resp.status().is_success() {
-        return Err(DownloadError::Http(
-            resp.error_for_status().unwrap_err(),
-        ));
+        return Err(DownloadError::Http(resp.error_for_status().unwrap_err()));
     }
 
     let total_size = resp
@@ -324,6 +349,7 @@ async fn probe_url(
 
 // ── Simple Download ─────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn download_simple(
     task: &DownloadTask,
     url: &str,
@@ -443,6 +469,7 @@ async fn download_simple(
 
 // ── Chunked Download ────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn download_chunked(
     task: &DownloadTask,
     url: &str,
@@ -486,7 +513,19 @@ async fn download_chunked(
 
             tokio::spawn(async move {
                 let _permit = sem.acquire().await;
-                download_chunk(&task_id, &url, &client, total_size, chunk_size, idx, &task_owned, retries, timeout_secs, &events).await?;
+                download_chunk(
+                    &task_id,
+                    &url,
+                    &client,
+                    total_size,
+                    chunk_size,
+                    idx,
+                    &task_owned,
+                    retries,
+                    timeout_secs,
+                    &events,
+                )
+                .await?;
                 // Permit dropped here
                 Ok(idx)
             })
@@ -498,7 +537,10 @@ async fn download_chunked(
     let _td = total_downloaded.clone();
 
     for handle in handles {
-        match handle.await.unwrap_or_else(|e| Err(DownloadError::Other(e.to_string()))) {
+        match handle
+            .await
+            .unwrap_or_else(|e| Err(DownloadError::Other(e.to_string())))
+        {
             Ok(idx) => {
                 resume.mark_chunk_done(idx);
                 // Emit chunk done
@@ -532,6 +574,7 @@ async fn download_chunked(
 }
 
 /// Download a single chunk with retry.
+#[allow(clippy::too_many_arguments)]
 async fn download_chunk(
     task_id: &str,
     url: &str,
@@ -605,10 +648,7 @@ async fn download_chunk(
 }
 
 /// Assemble all chunks into the final destination file in order.
-async fn assemble_file(
-    task: &DownloadTask,
-    total_chunks: usize,
-) -> Result<PathBuf, DownloadError> {
+async fn assemble_file(task: &DownloadTask, total_chunks: usize) -> Result<PathBuf, DownloadError> {
     if let Some(parent) = task.dest_path.parent() {
         fs::create_dir_all(parent)
             .await
@@ -645,11 +685,21 @@ fn format_reqwest_error(e: &DownloadError) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let DownloadError::Http(req_err) = e {
         parts.push(format!("reqwest: {req_err}"));
-        if req_err.is_timeout() { parts.push("(timeout)".into()); }
-        if req_err.is_connect() { parts.push("(connect)".into()); }
-        if req_err.is_redirect() { parts.push("(redirect)".into()); }
-        if req_err.is_body() { parts.push("(body)".into()); }
-        if req_err.is_decode() { parts.push("(decode)".into()); }
+        if req_err.is_timeout() {
+            parts.push("(timeout)".into());
+        }
+        if req_err.is_connect() {
+            parts.push("(connect)".into());
+        }
+        if req_err.is_redirect() {
+            parts.push("(redirect)".into());
+        }
+        if req_err.is_body() {
+            parts.push("(body)".into());
+        }
+        if req_err.is_decode() {
+            parts.push("(decode)".into());
+        }
         // Walk source chain
         let mut src = req_err.source();
         while let Some(inner) = src {
@@ -688,11 +738,17 @@ async fn probe_url_ureq(url: &str) -> Result<(u64, bool), DownloadError> {
 
 /// Synchronous download via `ureq` with `native-tls`.
 /// Used as primary path for simple downloads and fallback for chunked.
-fn download_ureq_fallback(task: &DownloadTask, url: &str, total_size: u64) -> Result<PathBuf, String> {
+fn download_ureq_fallback(
+    task: &DownloadTask,
+    url: &str,
+    total_size: u64,
+) -> Result<PathBuf, String> {
     use std::io::{Read, Write};
 
     let on_disk: u64 = if task.dest_path.exists() {
-        std::fs::metadata(&task.dest_path).map(|m| m.len()).unwrap_or(0)
+        std::fs::metadata(&task.dest_path)
+            .map(|m| m.len())
+            .unwrap_or(0)
     } else {
         0
     };
@@ -748,8 +804,7 @@ fn download_ureq_fallback(task: &DownloadTask, url: &str, total_size: u64) -> Re
             .open(&task.dest_path)
             .map_err(|e| format!("open append: {e}"))?
     } else {
-        std::fs::File::create(&task.dest_path)
-            .map_err(|e| format!("create dest: {e}"))?
+        std::fs::File::create(&task.dest_path).map_err(|e| format!("create dest: {e}"))?
     };
 
     let mut reader = resp.into_body().into_reader();
@@ -757,8 +812,11 @@ fn download_ureq_fallback(task: &DownloadTask, url: &str, total_size: u64) -> Re
     let mut last_log = std::time::Instant::now();
     loop {
         let n = reader.read(&mut buf).map_err(|e| format!("read: {e}"))?;
-        if n == 0 { break; }
-        file.write_all(&buf[..n]).map_err(|e| format!("write: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n])
+            .map_err(|e| format!("write: {e}"))?;
         downloaded += n as u64;
 
         // Log progress every 5 seconds

@@ -45,7 +45,9 @@ pub trait Retriever: Send + Sync {
     fn search(&self, query: &str, top_k: usize) -> Vec<SearchResult>;
 
     /// Whether this retriever is available (e.g., model loaded, index ready).
-    fn available(&self) -> bool { true }
+    fn available(&self) -> bool {
+        true
+    }
 }
 
 // ── Hybrid Fusion ─────────────────────────────────────────────────────────
@@ -62,13 +64,19 @@ pub struct HybridFusion {
 
 impl Default for HybridFusion {
     fn default() -> Self {
-        Self { rrf_k: 60.0, weights: Vec::new() }
+        Self {
+            rrf_k: 60.0,
+            weights: Vec::new(),
+        }
     }
 }
 
 impl HybridFusion {
     pub fn new(rrf_k: f32) -> Self {
-        Self { rrf_k, weights: Vec::new() }
+        Self {
+            rrf_k,
+            weights: Vec::new(),
+        }
     }
 
     /// Search across all retrievers and fuse results via RRF.
@@ -161,7 +169,13 @@ impl HybridFusion {
         let mut sorted: Vec<(SearchResult, f32)> = fused.into_values().collect();
         sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         sorted.truncate(output_k);
-        sorted.into_iter().map(|(mut r, s)| { r.score = s; r }).collect()
+        sorted
+            .into_iter()
+            .map(|(mut r, s)| {
+                r.score = s;
+                r
+            })
+            .collect()
     }
 }
 
@@ -207,26 +221,38 @@ mod tests {
         results: Vec<SearchResult>,
     }
     impl Retriever for DummyRetriever {
-        fn name(&self) -> &str { &self.name }
+        fn name(&self) -> &str {
+            &self.name
+        }
         fn search(&self, _query: &str, _top_k: usize) -> Vec<SearchResult> {
             self.results.clone()
         }
     }
 
     fn make_result(id: &str, label: &str, score: f32) -> SearchResult {
-        SearchResult { id: id.into(), label: label.into(), snippet: String::new(), score, source: "test".into(), metadata: serde_json::json!({}) }
+        SearchResult {
+            id: id.into(),
+            label: label.into(),
+            snippet: String::new(),
+            score,
+            source: "test".into(),
+            metadata: serde_json::json!({}),
+        }
     }
 
     #[test]
     fn test_rrf_fusion() {
-        let r1 = Box::new(DummyRetriever { name: "a".into(), results: vec![
-            make_result("1", "Doc1", 0.9),
-            make_result("2", "Doc2", 0.7),
-        ]});
-        let r2 = Box::new(DummyRetriever { name: "b".into(), results: vec![
-            make_result("2", "Doc2", 0.8),  // same doc, different score
-            make_result("3", "Doc3", 0.6),
-        ]});
+        let r1 = Box::new(DummyRetriever {
+            name: "a".into(),
+            results: vec![make_result("1", "Doc1", 0.9), make_result("2", "Doc2", 0.7)],
+        });
+        let r2 = Box::new(DummyRetriever {
+            name: "b".into(),
+            results: vec![
+                make_result("2", "Doc2", 0.8), // same doc, different score
+                make_result("3", "Doc3", 0.6),
+            ],
+        });
         let retrievers: Vec<Box<dyn Retriever>> = vec![r1, r2];
         let fusion = HybridFusion::default();
         let results = fusion.search(&retrievers, "test", 10, 5);
@@ -237,22 +263,39 @@ mod tests {
 
     #[test]
     fn test_query_classification() {
-        assert!(matches!(QueryType::classify("有几个项目"), QueryType::Structured));
-        assert!(matches!(QueryType::classify("如何优化性能"), QueryType::Semantic));
-        assert!(matches!(QueryType::classify("有几个项目且如何优化"), QueryType::Hybrid));
+        assert!(matches!(
+            QueryType::classify("有几个项目"),
+            QueryType::Structured
+        ));
+        assert!(matches!(
+            QueryType::classify("如何优化性能"),
+            QueryType::Semantic
+        ));
+        assert!(matches!(
+            QueryType::classify("有几个项目且如何优化"),
+            QueryType::Hybrid
+        ));
     }
 
     #[test]
     fn test_weighted_fusion() {
-        let r1 = Box::new(DummyRetriever { name: "vec".into(), results: vec![
-            make_result("a", "A", 0.9),
-        ]});
-        let r2 = Box::new(DummyRetriever { name: "text".into(), results: vec![
-            make_result("b", "B", 0.5),
-        ]});
+        let r1 = Box::new(DummyRetriever {
+            name: "vec".into(),
+            results: vec![make_result("a", "A", 0.9)],
+        });
+        let r2 = Box::new(DummyRetriever {
+            name: "text".into(),
+            results: vec![make_result("b", "B", 0.5)],
+        });
         let retrievers: Vec<Box<dyn Retriever>> = vec![r1, r2];
-        let fusion = HybridFusion { rrf_k: 60.0, weights: vec![0.7, 0.3] };
-        let results = fusion.fuse_weighted(&[retrievers[0].search("", 2), retrievers[1].search("", 2)], 5);
+        let fusion = HybridFusion {
+            rrf_k: 60.0,
+            weights: vec![0.7, 0.3],
+        };
+        let results = fusion.fuse_weighted(
+            &[retrievers[0].search("", 2), retrievers[1].search("", 2)],
+            5,
+        );
         assert_eq!(results.len(), 2);
         assert!(results[0].score > results[1].score);
     }

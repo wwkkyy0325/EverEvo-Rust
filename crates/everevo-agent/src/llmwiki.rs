@@ -68,10 +68,9 @@ impl LlmwikiManager {
     pub fn read_design(&self) -> Result<Option<String>, EverEvoError> {
         let path = self.design_path();
         if path.exists() {
-            Ok(Some(
-                std::fs::read_to_string(&path)
-                    .map_err(|e| EverEvoError::Internal(format!("Read design.md: {e}")))?,
-            ))
+            Ok(Some(std::fs::read_to_string(&path).map_err(|e| {
+                EverEvoError::Internal(format!("Read design.md: {e}"))
+            })?))
         } else {
             Ok(None)
         }
@@ -112,10 +111,9 @@ impl LlmwikiManager {
     pub fn read_changelog(&self) -> Result<Option<String>, EverEvoError> {
         let path = self.changelog_path();
         if path.exists() {
-            Ok(Some(
-                std::fs::read_to_string(&path)
-                    .map_err(|e| EverEvoError::Internal(format!("Read changelog.md: {e}")))?,
-            ))
+            Ok(Some(std::fs::read_to_string(&path).map_err(|e| {
+                EverEvoError::Internal(format!("Read changelog.md: {e}"))
+            })?))
         } else {
             Ok(None)
         }
@@ -128,9 +126,8 @@ impl LlmwikiManager {
             return Ok(vec![]);
         }
         let mut tasks = Vec::new();
-        for entry in
-            std::fs::read_dir(&tasks_dir)
-                .map_err(|e| EverEvoError::Internal(format!("Read tasks dir: {e}")))?
+        for entry in std::fs::read_dir(&tasks_dir)
+            .map_err(|e| EverEvoError::Internal(format!("Read tasks dir: {e}")))?
         {
             let entry = entry.map_err(|e| EverEvoError::Internal(format!("Entry: {e}")))?;
             let path = entry.path();
@@ -174,10 +171,9 @@ impl LlmwikiManager {
     pub fn read_task(&self, name: &str) -> Result<Option<String>, EverEvoError> {
         let path = self.root.join("tasks").join(name);
         if path.exists() {
-            Ok(Some(
-                std::fs::read_to_string(&path)
-                    .map_err(|e| EverEvoError::Internal(format!("Read task {name}: {e}")))?,
-            ))
+            Ok(Some(std::fs::read_to_string(&path).map_err(|e| {
+                EverEvoError::Internal(format!("Read task {name}: {e}"))
+            })?))
         } else {
             Ok(None)
         }
@@ -186,10 +182,7 @@ impl LlmwikiManager {
     /// Index all documents into a RAG pipeline for semantic search.
     ///
     /// Call this after significant changes to the knowledge base.
-    pub fn index_into_rag(
-        &self,
-        rag: &crate::rag::RagPipeline,
-    ) -> Result<usize, EverEvoError> {
+    pub fn index_into_rag(&self, rag: &crate::rag::RagPipeline) -> Result<usize, EverEvoError> {
         let mut count = 0;
         let paths = self.collect_all_documents()?;
 
@@ -226,7 +219,7 @@ impl LlmwikiManager {
             let path = entry.path();
             if path.is_dir() {
                 Self::walk_dir(&path, paths)?;
-            } else if path.extension().map_or(false, |e| e == "md") {
+            } else if path.extension().is_some_and(|e| e == "md") {
                 paths.push(path);
             }
         }
@@ -287,7 +280,8 @@ mod tests {
         let wiki = LlmwikiManager::open(dir.path()).unwrap();
         wiki.ensure_directories().unwrap();
 
-        wiki.write_design("# Test Project\n\nDesign document.").unwrap();
+        wiki.write_design("# Test Project\n\nDesign document.")
+            .unwrap();
         let content = wiki.read_design().unwrap();
         assert!(content.is_some());
         assert!(content.unwrap().contains("Test Project"));
@@ -336,7 +330,8 @@ mod tests {
 
     #[test]
     fn test_parse_frontmatter() {
-        let content = "---\ntitle: My Title\ndescription: A description\ntags: [rust, agent]\n---\n\n# Body";
+        let content =
+            "---\ntitle: My Title\ndescription: A description\ntags: [rust, agent]\n---\n\n# Body";
         let (title, desc, tags) = parse_simple_frontmatter(content);
         assert_eq!(title.unwrap(), "My Title");
         assert_eq!(desc.unwrap(), "A description");
@@ -351,60 +346,4 @@ mod tests {
         assert!(desc.is_none());
         assert!(tags.is_empty());
     }
-}
-
-// ── RAG Integration ─────────────────────────────────────────────────────
-
-/// Index all llmwiki documents into the RAG pipeline for semantic search.
-///
-/// Call this at startup to make project knowledge (design.md, changelog.md,
-/// task docs) searchable via the RAG endpoint.
-pub fn index_llmwiki_into_rag(
-    project_root: &std::path::Path,
-    rag: &crate::rag::RagPipeline,
-) {
-    let wiki_dir = project_root.join("docs").join("llmwiki");
-    if !wiki_dir.exists() {
-        tracing::info!("llmwiki dir not found, skipping RAG index");
-        return;
-    }
-
-    let mut count = 0usize;
-    if let Ok(entries) = std::fs::read_dir(&wiki_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() && path.extension().map_or(false, |e| e == "md") {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    let chunk = crate::rag::make_chunk(
-                        content,
-                        everevo_vector::ChunkType::Fact,
-                        vec![],
-                    );
-                    if rag.ingest(vec![chunk]).is_ok() {
-                        count += 1;
-                    }
-                }
-            }
-            // Also index tasks/ subdirectory
-            if path.is_dir() && path.file_name().map_or(false, |n| n == "tasks") {
-                if let Ok(task_entries) = std::fs::read_dir(&path) {
-                    for te in task_entries.flatten() {
-                        let tp = te.path();
-                        if tp.is_file() && tp.extension().map_or(false, |e| e == "md") {
-                            if let Ok(content) = std::fs::read_to_string(&tp) {
-                                let chunk = crate::rag::make_chunk(
-                                    content,
-                                    everevo_vector::ChunkType::Fact,
-                                    vec![],
-                                );
-                                let _ = rag.ingest(vec![chunk]);
-                                count += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    tracing::info!(count, "llmwiki docs indexed into RAG");
 }

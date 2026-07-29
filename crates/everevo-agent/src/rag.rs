@@ -8,8 +8,8 @@ use std::path::Path;
 use everevo_core::memory::{ProjectionMetadata, SourcePointer};
 use everevo_core::EverEvoError;
 use everevo_vector::{
-    ChunkType, DummyEmbedder, EmbeddingModel, OnnxEmbedder, PersistentStore,
-    RawChunk, ScoredChunk, VectorEngine, VectorStore,
+    ChunkType, DummyEmbedder, EmbeddingModel, HnswStore, OnnxEmbedder, RawChunk, ScoredChunk,
+    VectorEngine, VectorStore,
 };
 use uuid::Uuid;
 
@@ -19,7 +19,7 @@ use uuid::Uuid;
 /// Tries to load a real ONNX embedding model from `data/models/`.
 /// Falls back to `DummyEmbedder` (zero vectors) if model files are unavailable.
 pub struct RagPipeline {
-    engine: VectorEngine<Box<dyn EmbeddingModel>, PersistentStore>,
+    engine: VectorEngine<Box<dyn EmbeddingModel>, HnswStore>,
     /// Whether a real embedding model is loaded.
     pub real_embeddings: bool,
 }
@@ -31,9 +31,8 @@ impl RagPipeline {
     /// Embedding models are loaded from `{data_dir}/models/`.
     pub fn new(data_dir: &Path) -> Result<Self, EverEvoError> {
         let store_dir = data_dir.join("memory").join("vector");
-        std::fs::create_dir_all(&store_dir).map_err(|e| {
-            EverEvoError::Internal(format!("Create vector dir: {e}"))
-        })?;
+        std::fs::create_dir_all(&store_dir)
+            .map_err(|e| EverEvoError::Internal(format!("Create vector dir: {e}")))?;
 
         let models_dir = data_dir.join("models");
         let (embedder, real): (Box<dyn EmbeddingModel>, bool) =
@@ -47,17 +46,19 @@ impl RagPipeline {
                 (Box::new(DummyEmbedder::new(384)), false)
             };
 
-        let store = PersistentStore::open(store_dir.join("chunks.lance"), 384)?;
+        let store = HnswStore::open(store_dir.join("chunks"), 384)?;
         let engine = VectorEngine::new(embedder, store);
-        Ok(Self { engine, real_embeddings: real })
+        Ok(Self {
+            engine,
+            real_embeddings: real,
+        })
     }
 
     /// Create a Chinese-optimized RAG pipeline (uses bge-small-zh model).
     pub fn new_zh(data_dir: &Path) -> Result<Self, EverEvoError> {
         let store_dir = data_dir.join("memory").join("vector");
-        std::fs::create_dir_all(&store_dir).map_err(|e| {
-            EverEvoError::Internal(format!("Create vector dir: {e}"))
-        })?;
+        std::fs::create_dir_all(&store_dir)
+            .map_err(|e| EverEvoError::Internal(format!("Create vector dir: {e}")))?;
 
         let models_dir = data_dir.join("models");
         let (embedder, real): (Box<dyn EmbeddingModel>, bool) =
@@ -71,9 +72,12 @@ impl RagPipeline {
                 (Box::new(DummyEmbedder::new(384)), false)
             };
 
-        let store = PersistentStore::open(store_dir.join("chunks.lance"), 384)?;
+        let store = HnswStore::open(store_dir.join("chunks"), 384)?;
         let engine = VectorEngine::new(embedder, store);
-        Ok(Self { engine, real_embeddings: real })
+        Ok(Self {
+            engine,
+            real_embeddings: real,
+        })
     }
 
     pub fn ingest(&self, chunks: Vec<RawChunk>) -> Result<(), EverEvoError> {
@@ -84,7 +88,9 @@ impl RagPipeline {
         self.engine.search_text(query, top_k)
     }
 
-    pub fn count(&self) -> usize { self.engine.store.count() }
+    pub fn count(&self) -> usize {
+        self.engine.store.count()
+    }
 
     pub fn delete(&self, ids: &[Uuid]) -> Result<(), EverEvoError> {
         self.engine.store.delete(ids)
@@ -92,11 +98,7 @@ impl RagPipeline {
 }
 
 /// Convenience builder: create a [`RawChunk`] from agent data.
-pub fn make_chunk(
-    content: String,
-    chunk_type: ChunkType,
-    sources: Vec<SourcePointer>,
-) -> RawChunk {
+pub fn make_chunk(content: String, chunk_type: ChunkType, sources: Vec<SourcePointer>) -> RawChunk {
     RawChunk {
         id: Uuid::new_v4(),
         content,

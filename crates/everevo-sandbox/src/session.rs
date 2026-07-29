@@ -24,6 +24,9 @@ pub struct SessionSandbox {
     session_id: String,
     sandbox_dir: PathBuf,
     work_dir: PathBuf,
+    /// When set, paths inside the workspace are auto-approved at SemiAuto level.
+    /// Claude Code alignment: inside workspace = free, outside = confirm.
+    workspace_path: Option<PathBuf>,
     engine: Arc<TieredSandbox>,
     audit: Arc<AuditWriter>,
     permission_level: PermissionLevel,
@@ -34,10 +37,7 @@ impl SessionSandbox {
     ///
     /// Creates `data/sandbox/{session_id}/` and `work/` subdirectory,
     /// then opens the audit writer.
-    pub fn create(
-        session_id: &str,
-        base_config: &SandboxConfig,
-    ) -> Result<Self, EverEvoError> {
+    pub fn create(session_id: &str, base_config: &SandboxConfig) -> Result<Self, EverEvoError> {
         let sandbox_dir = base_config.sandbox_root.join(session_id);
         let work_dir = sandbox_dir.join("work");
 
@@ -48,10 +48,7 @@ impl SessionSandbox {
             ))
         })?;
 
-        let audit = Arc::new(
-            AuditWriter::open(&sandbox_dir)
-                .map_err(EverEvoError::Sandbox)?,
-        );
+        let audit = Arc::new(AuditWriter::open(&sandbox_dir).map_err(EverEvoError::Sandbox)?);
 
         // Each session gets its own TieredSandbox scoped to its sandbox root
         let sess_config = SandboxConfig {
@@ -64,17 +61,40 @@ impl SessionSandbox {
             session_id: session_id.to_string(),
             sandbox_dir,
             work_dir,
+            workspace_path: None,
             engine,
             audit,
             permission_level: PermissionLevel::SemiAuto,
         })
     }
 
+    /// Override the auto-created work_dir with a user-specified workspace.
+    /// When `path` is Some and exists, the sandbox uses it as the working directory.
+    /// Also sets workspace_path for permission auto-approval (Claude Code alignment).
+    /// Fallback: when None or invalid, keep the original sandbox work_dir.
+    pub fn with_workspace(mut self, path: Option<std::path::PathBuf>) -> Self {
+        if let Some(ref p) = path {
+            if p.is_dir() {
+                tracing::info!(
+                    workspace = %p.display(),
+                    session = %self.session_id,
+                    "Session sandbox bound to workspace"
+                );
+                self.work_dir = p.clone();
+                self.workspace_path = Some(p.clone());
+            } else {
+                tracing::warn!(
+                    path = %p.display(),
+                    session = %self.session_id,
+                    "Workspace path does not exist or is not a directory — using sandbox fallback"
+                );
+            }
+        }
+        self
+    }
+
     /// Run a command through the sandbox, writing an audit record on completion.
-    pub async fn execute(
-        &self,
-        ec: &ExecutionConfig,
-    ) -> Result<ExecutionResult, EverEvoError> {
+    pub async fn execute(&self, ec: &ExecutionConfig) -> Result<ExecutionResult, EverEvoError> {
         // Force working directory into session sandbox
         let mut ec = ec.clone();
         ec.working_dir = Some(self.work_dir.clone());
@@ -111,7 +131,10 @@ impl SessionSandbox {
     /// Add a path to the trusted paths list (user-approved).
     /// Trusted paths bypass SemiAuto external-path denial.
     pub fn trust_path(&self, pattern: &str) {
-        self.engine.rules_mut().trusted_paths.push(pattern.to_string());
+        self.engine
+            .rules_mut()
+            .trusted_paths
+            .push(pattern.to_string());
         tracing::info!(session = %self.session_id, %pattern, "Path trusted by user");
     }
 
@@ -122,7 +145,10 @@ impl SessionSandbox {
 
     /// Add paths to the write allowlist (e.g., for environment setup).
     pub fn allow_write_path(&mut self, pattern: &str) {
-        self.engine.rules_mut().filesystem_write_allowlist.push(pattern.to_string());
+        self.engine
+            .rules_mut()
+            .filesystem_write_allowlist
+            .push(pattern.to_string());
         tracing::info!(session = %self.session_id, %pattern, "Write allowlist expanded");
     }
 

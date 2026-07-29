@@ -20,6 +20,11 @@ use everevo_core::memory::{FactType, MemoryFact, ProjectionMetadata};
 
 /// Parse YAML-like frontmatter from markdown content.
 /// Returns `(key_value_map, body_text)` or `None` if no frontmatter found.
+///
+/// Handles two value formats:
+/// 1. Inline: `key: value` → inserted directly
+/// 2. Multiline: `key:\n  - item1\n  - item2` → empty marker inserted;
+///    caller may re-parse from raw content for multiline lists.
 pub fn parse_frontmatter(content: &str) -> Option<(HashMap<String, String>, &str)> {
     let content = content.trim();
     if !content.starts_with("---") {
@@ -31,11 +36,32 @@ pub fn parse_frontmatter(content: &str) -> Option<(HashMap<String, String>, &str
     let body = rest[end + 4..].trim();
 
     let mut map = HashMap::new();
+    let mut pending_key: Option<String> = None;
+
     for line in fm_text.lines() {
+        // Consume pending key — value was on next line(s)
+        if let Some(pending) = pending_key.take() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("- ") {
+                // Multiline list — store empty marker; caller re-parses raw content
+                map.insert(pending, String::new());
+            } else if !trimmed.is_empty() {
+                map.insert(pending, trimmed.to_string());
+            }
+            continue;
+        }
+
         if let Some((key, value)) = line.split_once(':') {
-            map.insert(key.trim().to_string(), value.trim().to_string());
+            let key = key.trim().to_string();
+            let value = value.trim().to_string();
+            if value.is_empty() {
+                pending_key = Some(key);
+            } else {
+                map.insert(key, value);
+            }
         }
     }
+
     Some((map, body))
 }
 
@@ -62,9 +88,14 @@ pub fn parse_fact_file(name: &str, content: &str) -> Option<MemoryFact> {
         .unwrap_or(created_at);
 
     let links: Vec<String> = if let Some(links_str) = fm.get("links") {
-        links_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+        links_str
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
     } else {
-        body.split("[[").skip(1)
+        body.split("[[")
+            .skip(1)
             .filter_map(|s| s.split("]]").next())
             .map(|s| s.to_string())
             .collect()
@@ -84,6 +115,11 @@ pub fn parse_fact_file(name: &str, content: &str) -> Option<MemoryFact> {
 
 /// Serialize a MemoryFact to markdown with frontmatter.
 pub fn serialize_fact_file(fact: &MemoryFact) -> String {
+    serialize_fact_file_with_meta(fact, 0, 3)
+}
+
+/// Serialize a fact file with recall count and tier metadata.
+pub fn serialize_fact_file_with_meta(fact: &MemoryFact, recall: u32, tier: u8) -> String {
     let mut out = String::new();
     out.push_str("---\n");
     out.push_str(&format!("name: {}\n", fact.name));
@@ -91,6 +127,8 @@ pub fn serialize_fact_file(fact: &MemoryFact) -> String {
     out.push_str(&format!("type: {}\n", fact.fact_type.as_str()));
     out.push_str(&format!("created: {}\n", fact.created_at.to_rfc3339()));
     out.push_str(&format!("updated: {}\n", fact.updated_at.to_rfc3339()));
+    out.push_str(&format!("recall: {}\n", recall));
+    out.push_str(&format!("tier: {}\n", tier));
     if !fact.links.is_empty() {
         out.push_str(&format!("links: {}\n", fact.links.join(", ")));
     }
@@ -100,6 +138,16 @@ pub fn serialize_fact_file(fact: &MemoryFact) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Extract recall count from frontmatter (default 0).
+pub fn get_recall(fm: &std::collections::HashMap<String, String>) -> u32 {
+    fm.get("recall").and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
+/// Extract tier from frontmatter (default 3 = archived).
+pub fn get_tier(fm: &std::collections::HashMap<String, String>) -> u8 {
+    fm.get("tier").and_then(|v| v.parse().ok()).unwrap_or(3)
 }
 
 #[cfg(test)]

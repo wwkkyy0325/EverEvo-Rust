@@ -2,18 +2,19 @@ import { useState, useEffect, useRef } from 'react';
 import BootstrapView from './components/BootstrapView';
 import ChatView from './components/ChatView';
 import SettingsView from './components/SettingsView';
+import DevPanel from './components/DevPanel';
 import SessionSidebar from './components/SessionSidebar';
-import AuditPanel from './components/AuditPanel';
 import ConfirmDialog from './components/ConfirmDialog';
-import MemoryPanel from './components/MemoryPanel';
-import DomainPanel from './components/DomainPanel';
+import ErrorBoundary from './components/ErrorBoundary';
 import AppStatusBar from './components/AppStatusBar';
 import { Dialog } from './components/ui/dialog';
 
-type View = 'bootstrap' | 'chat' | 'settings';
+type View = 'bootstrap' | 'chat' | 'settings' | 'devpanel';
+type SettingsTab = 'llm' | 'routing';
 
 function App() {
   const [view, setView] = useState<View>('bootstrap');
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>('llm');
   const [showLlmPrompt, setShowLlmPrompt] = useState(false);
   const llmPromptShown = useRef(false);
 
@@ -45,10 +46,10 @@ function App() {
     <div className="flex flex-col h-screen overflow-hidden bg-background text-foreground animate-fade-in">
       {/* Top: sidebar + main */}
       <div className="flex flex-1 min-h-0 overflow-hidden">
-        <SessionSidebar />
+        <SessionSidebar view={view} settingsTab={settingsTab} onSettingsTabChange={setSettingsTab} />
 
         <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
-          <nav className="shrink-0 bg-background px-4 py-2 flex items-center justify-end gap-2">
+          <nav className="shrink-0 bg-background px-4 py-2 flex items-center justify-start gap-2">
             <button
               onClick={() => setView('chat')}
               className={`text-xs px-3 py-1 rounded transition-colors ${
@@ -69,21 +70,29 @@ function App() {
             >
               设置
             </button>
+            <button
+              onClick={() => setView('devpanel')}
+              className={`text-xs px-3 py-1 rounded transition-colors ${
+                view === 'devpanel'
+                  ? 'bg-primary text-primary-foreground'
+                  : 'text-muted-foreground hover:text-foreground'
+              }`}
+            >
+              🔧 诊断
+            </button>
           </nav>
 
-          {view === 'chat' && <ChatView />}
-          {view === 'settings' && <SettingsView onBack={() => setView('chat')} />}
+          {view === 'chat' && <ErrorBoundary><ChatView /></ErrorBoundary>}
+          {view === 'settings' && <ErrorBoundary><SettingsView settingsTab={settingsTab} /></ErrorBoundary>}
+          {view === 'devpanel' && <ErrorBoundary><DevPanel /></ErrorBoundary>}
         </div>
       </div>
 
       {/* Bottom status bar */}
       <AppStatusBar />
 
-      {/* Panels & dialogs */}
-      <AuditPanel />
+      {/* Dialogs */}
       <ConfirmDialog />
-      <MemoryPanel />
-      <DomainPanel />
 
       {/* LLM config prompt — shown after bootstrap if no LLM configured */}
       <Dialog

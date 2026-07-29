@@ -25,10 +25,14 @@ impl Manifest {
     /// Load a manifest from a JSON file. Returns an empty manifest if the file doesn't exist.
     pub async fn load(path: &Path) -> Result<Self, std::io::Error> {
         if !path.exists() {
-            return Ok(Self { entries: HashMap::new() });
+            return Ok(Self {
+                entries: HashMap::new(),
+            });
         }
         let json = tokio::fs::read_to_string(path).await?;
-        Ok(serde_json::from_str(&json).unwrap_or_else(|_| Self { entries: HashMap::new() }))
+        Ok(serde_json::from_str(&json).unwrap_or_else(|_| Self {
+            entries: HashMap::new(),
+        }))
     }
 
     /// Save the manifest to a JSON file.
@@ -67,13 +71,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_manifest_load() {
-        let manifest = Manifest::load(Path::new("/nonexistent/path.json")).await.unwrap();
+        let manifest = Manifest::load(Path::new("/nonexistent/path.json"))
+            .await
+            .unwrap();
         assert!(manifest.entries.is_empty());
     }
 
     #[test]
     fn test_upsert_and_get() {
-        let mut manifest = Manifest { entries: HashMap::new() };
+        let mut manifest = Manifest {
+            entries: HashMap::new(),
+        };
         manifest.upsert("python", "3.12.8", Some("abc123"));
         let entry = manifest.get("python").unwrap();
         assert_eq!(entry.version, "3.12.8");
@@ -82,7 +90,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_save_and_load_roundtrip() {
-        let mut manifest = Manifest { entries: HashMap::new() };
+        let mut manifest = Manifest {
+            entries: HashMap::new(),
+        };
         manifest.upsert("node", "22.12.0", None);
         let tmp = NamedTempFile::new().unwrap();
         manifest.save(tmp.path()).await.unwrap();

@@ -1,4 +1,14 @@
 @import "tailwindcss";
+@import "highlight.js/styles/github-dark-dimmed.css";
+
+/* Scrollable without visible scrollbar */
+.scrollbar-none {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
 
 /* EverEvo — Pixel dark theme. One mode, one look.
    Minecraft-inspired: grass green, stone gray, gold accents, Press Start 2P font.

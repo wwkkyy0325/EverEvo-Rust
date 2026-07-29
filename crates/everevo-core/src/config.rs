@@ -53,9 +53,59 @@ pub struct AppConfig {
     /// "semi_auto" | "fully_auto" | "fully_manual" | "read_only"
     #[serde(default = "default_permission_level_str")]
     pub default_permission_level: String,
+
+    /// Default workspace directory. When set, all new sessions use this
+    /// as their primary working directory instead of the auto-created sandbox.
+    /// Overridable per-session via PUT /api/workspace.
+    #[serde(default)]
+    pub workspace_dir: Option<PathBuf>,
+
+    /// MCP (Model Context Protocol) servers to connect at startup.
+    /// Each entry: { name, command, args[] }
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
 }
 
-fn default_permission_level_str() -> String { "semi_auto".into() }
+/// Configuration for an MCP server connection.
+/// Mirrors Claude Code's `.mcp.json` format with three transport types.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    pub name: String,
+    /// Transport type: "stdio" (default), "sse" (Server-Sent Events), or "http" (Streamable HTTP).
+    #[serde(default = "default_transport")]
+    pub transport: String,
+    /// Command for stdio transport (e.g. "npx", "python"). Required for stdio.
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// URL for HTTP/SSE transport (e.g. "https://mcp.example.com/mcp").
+    #[serde(default)]
+    pub url: String,
+    /// HTTP headers for authentication (HTTP transport).
+    /// e.g. `{"Authorization": "Bearer ${TOKEN}"}`
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
+    /// Environment variables injected into the MCP server process (stdio transport).
+    /// e.g. `{"BRAVE_API_KEY": "xxx"}` — mirrors Claude Code's `"env"` field.
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+    /// Whether this server is enabled.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_transport() -> String {
+    "stdio".into()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_permission_level_str() -> String {
+    "semi_auto".into()
+}
 
 fn default_host() -> String {
     "127.0.0.1".into()
@@ -85,6 +135,8 @@ impl Default for AppConfig {
             max_context_tokens: default_max_context_tokens(),
             summarize_threshold: default_summarize_threshold(),
             default_permission_level: default_permission_level_str(),
+            mcp_servers: Vec::new(),
+            workspace_dir: None,
         }
     }
 }
@@ -133,8 +185,8 @@ impl AppConfig {
 
         for sub in &[
             "db",
-            "vectors",
-            "graph",
+            "memory/vector",
+            "memory/graph",
             "sandbox",
             "memory/diary",
             "memory/facts",

@@ -6,10 +6,10 @@
 
 disallowed-methods = [
     # Block direct process spawning outside sandbox crate
-    { path = "std::process::Command::new", reason = "Use everevo_sandbox::SandboxProvider::execute() instead" },
-    { path = "tokio::process::Command::new", reason = "Use everevo_sandbox::SandboxProvider::execute() instead" },
-    { path = "std::process::Command::output", reason = "Use everevo_sandbox::SandboxProvider::execute() instead" },
-    { path = "tokio::process::Command::output", reason = "Use everevo_sandbox::SandboxProvider::execute() instead" },
-    { path = "std::process::Command::spawn", reason = "Use everevo_sandbox::SandboxProvider::execute() instead" },
-    { path = "tokio::process::Command::spawn", reason = "Use everevo_sandbox::SandboxProvider::execute() instead" },
+    { path = "std::process::Command::new", reason = "Use everevo_sandbox::SandboxProvider::execute() instead", allow-invalid = true },
+    { path = "tokio::process::Command::new", reason = "Use everevo_sandbox::SandboxProvider::execute() instead", allow-invalid = true },
+    { path = "std::process::Command::output", reason = "Use everevo_sandbox::SandboxProvider::execute() instead", allow-invalid = true },
+    { path = "tokio::process::Command::output", reason = "Use everevo_sandbox::SandboxProvider::execute() instead", allow-invalid = true },
+    { path = "std::process::Command::spawn", reason = "Use everevo_sandbox::SandboxProvider::execute() instead", allow-invalid = true },
+    { path = "tokio::process::Command::spawn", reason = "Use everevo_sandbox::SandboxProvider::execute() instead", allow-invalid = true },
 ]

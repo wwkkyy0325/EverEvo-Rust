@@ -13,7 +13,10 @@ fn test_github_release_domestic_mirrors() {
         Region::Domestic,
     );
     // Should find at least Tsinghua TUNA and Aliyun
-    assert!(!candidates.is_empty(), "Expected domestic mirror candidates");
+    assert!(
+        !candidates.is_empty(),
+        "Expected domestic mirror candidates"
+    );
     for (url, name) in &candidates {
         println!("  {name}: {url}");
         // Original URL should not be returned as-is (ghproxy URLs contain github.com in path, that's OK)
@@ -31,8 +34,13 @@ fn test_raw_github_to_jsdelivr() {
     );
     assert!(!candidates.is_empty());
     // jsDelivr should be one of the candidates
-    let has_jsdelivr = candidates.iter().any(|(url, _)| url.contains("jsdelivr.net"));
-    assert!(has_jsdelivr, "Expected jsdelivr mirror, got: {candidates:?}");
+    let has_jsdelivr = candidates
+        .iter()
+        .any(|(url, _)| url.contains("jsdelivr.net"));
+    assert!(
+        has_jsdelivr,
+        "Expected jsdelivr mirror, got: {candidates:?}"
+    );
 }
 
 /// Test: task builder creates correct task.
@@ -76,7 +84,10 @@ fn test_effective_overrides() {
 
     // Task with custom chunks
     assert_eq!(config.effective_chunk_size(0), 4 * 1024 * 1024);
-    assert_eq!(config.effective_chunk_size(8 * 1024 * 1024), 8 * 1024 * 1024);
+    assert_eq!(
+        config.effective_chunk_size(8 * 1024 * 1024),
+        8 * 1024 * 1024
+    );
 
     // Task with custom timeout
     assert_eq!(config.effective_timeout_secs(0), 30);

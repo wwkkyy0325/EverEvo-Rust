@@ -20,7 +20,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-        /// Start backend + frontend dev server with full logging
+    /// Start backend + frontend dev server with full logging
     Dev {
         #[arg(long, env = "EVEREVO_HOST", default_value = "127.0.0.1")]
         host: String,
@@ -57,8 +57,7 @@ async fn main() {
     // ── Observability ──────────────────────────────────────────────
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("everevo=info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("everevo=info")),
         )
         .init();
 
@@ -82,9 +81,15 @@ async fn main() {
         no_frontend: false,
         tauri: false,
     }) {
-        Command::Dev { host, port, no_frontend, tauri: use_tauri } => {
+        Command::Dev {
+            host,
+            port,
+            no_frontend,
+            tauri: use_tauri,
+        } => {
             if use_tauri {
                 tracing::info!("Launching Tauri desktop shell...");
+                #[allow(clippy::disallowed_methods)]
                 let status = std::process::Command::new("npx")
                     .args(["tauri", "dev"])
                     .status()
@@ -120,14 +125,17 @@ async fn cmd_dev(config: everevo_core::AppConfig, host: &str, port: u16, no_fron
         let frontend_dir = cwd.join("frontend");
         if frontend_dir.join("package.json").exists() {
             tracing::info!("Starting frontend dev server...");
-            Some(tokio::process::Command::new("cmd")
-                .args(["/c", "npm", "run", "dev"])
-                .current_dir(&frontend_dir)
-                .stdout(std::process::Stdio::inherit())
-                .stderr(std::process::Stdio::inherit())
-                .kill_on_drop(true)
-                .spawn()
-                .expect("Failed to start frontend. Make sure Node.js is installed."))
+            #[allow(clippy::disallowed_methods)]
+            Some(
+                tokio::process::Command::new("cmd")
+                    .args(["/c", "npm", "run", "dev"])
+                    .current_dir(&frontend_dir)
+                    .stdout(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::inherit())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .expect("Failed to start frontend. Make sure Node.js is installed."),
+            )
         } else {
             tracing::warn!("frontend/package.json not found, skipping frontend");
             None
@@ -159,17 +167,21 @@ async fn cmd_serve(config: everevo_core::AppConfig, host: &str, port: u16) {
             std::process::exit(1);
         });
     }
-    let db = everevo_db::Database::connect(&db_path).await.unwrap_or_else(|e| {
-        tracing::error!("Database connection failed at {}: {e}", db_path.display());
-        std::process::exit(1);
-    });
+    let db = everevo_db::Database::connect(&db_path)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("Database connection failed at {}: {e}", db_path.display());
+            std::process::exit(1);
+        });
     tracing::info!(path = %db_path.display(), "Database connected");
 
     // ── Build app (creates InitPipeline + Downloader) ──────────
-    let (app, state) = everevo_server::build_app(config.clone(), db).await.unwrap_or_else(|e| {
-        tracing::error!("Failed to build app: {e}");
-        std::process::exit(1);
-    });
+    let (app, state) = everevo_server::build_app(config.clone(), db)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("Failed to build app: {e}");
+            std::process::exit(1);
+        });
 
     // ── Init orchestrator: provision assets → check LLM → startup checks ──
     let pipeline = state.init_pipeline.clone();
@@ -196,7 +208,7 @@ async fn cmd_serve(config: everevo_core::AppConfig, host: &str, port: u16) {
                         tracing::info!("All assets provisioned");
                         break;
                     }
-                    everevo_bootstrap::pipeline::InitEvent::FatalError(e) => {
+                    everevo_bootstrap::pipeline::InitEvent::FatalError { error: e } => {
                         tracing::error!(%e, "Init pipeline fatal error");
                         break;
                     }
@@ -226,18 +238,37 @@ async fn cmd_serve(config: everevo_core::AppConfig, host: &str, port: u16) {
     tracing::info!("Dreaming scheduler started");
 
     // ── Domain Global Inbox Watcher ───────────────────────────────
+    // Monitors data/domain/inbox/ for new files every 2 minutes.
+    // Documents are classified, chunked, and moved into named domains.
     let domain_root = state.config.data_dir.join("domain");
+    let models_dir = state.config.data_dir.join("models");
     let _domain_watcher_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(120)); // every 2 min
+        // Load once with ONNX embedder (non-fatal if models unavailable).
+        let mut mgr = match everevo_agent::knowledge::domain::DomainManager::load_with_onnx(
+            &domain_root, &models_dir,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(error = %e, "DomainManager load_with_onnx failed, trying fallback");
+                match everevo_agent::knowledge::domain::DomainManager::load(&domain_root) {
+                    Ok(m) => m,
+                    Err(e2) => {
+                        tracing::error!(error = %e2, "Domain inbox watcher disabled — cannot load DomainManager");
+                        return;
+                    }
+                }
+            }
+        };
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(120));
         loop {
             interval.tick().await;
-            let mut mgr = match everevo_domain::DomainManager::load(&domain_root) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
             match mgr.process_global_inbox().await {
                 Ok(result) if result.processed > 0 => {
-                    tracing::info!(processed = result.processed, new_domains = ?result.new_domains, "Global inbox processed");
+                    tracing::info!(
+                        processed = result.processed,
+                        new_domains = ?result.new_domains,
+                        "Global inbox processed"
+                    );
                 }
                 Ok(_) => {} // nothing new
                 Err(e) => tracing::warn!(error = %e, "Global inbox processing failed"),
@@ -246,28 +277,46 @@ async fn cmd_serve(config: everevo_core::AppConfig, host: &str, port: u16) {
     });
     tracing::info!("Domain inbox watcher started");
 
-    // ── llmwiki + Memory → RAG auto-index ──────────────────────
-    if let Ok(rag) = everevo_agent::rag::RagPipeline::new(&config.data_dir) {
-        let rag = Arc::new(rag);
-        everevo_agent::llmwiki::index_llmwiki_into_rag(
-            &std::env::current_dir().unwrap_or_default(),
-            &rag,
-        );
-        if let Err(e) = state.fact_manager.index_into_rag(&rag) {
-            tracing::warn!(error = %e, "Memory fact RAG indexing skipped");
-        }
-        // Enable real-time vector indexing for future fact saves
-        state.fact_manager.set_rag(Arc::clone(&rag));
-        tracing::info!("Real-time fact vector indexing enabled");
+    // ── RAG pipeline ────────────────────────────────────────────
+    // HNSW vector store is pure Rust, no nested-runtime conflicts.
+    // Facts auto-index on save (triple-write: MD + SQLite + Vector).
+    if state.rag_pipeline.is_some() {
+        tracing::info!("RAG pipeline active — vector search enabled (HNSW)");
+    } else {
+        tracing::info!("RAG pipeline unavailable — vector search disabled (non-fatal)");
     }
 
     let addr = format!("{host}:{port}");
+
+    // ── Startup diagnostic summary ───────────────────────────────
+    {
+        let mcp_count = state.mcp_clients.read().await.len();
+        let mcp: Vec<_> = state.mcp_clients.read().await.iter().map(|(n, c)| {
+            let tools = c.try_lock().map(|g| g.tools.len()).unwrap_or(0);
+            format!("{n}({tools}t)")
+        }).collect();
+        let llm = state.llm.read().await;
+        let primary = llm.get("primary").and_then(|c| c.as_ref()).is_some();
+
+        println!("╔══════════════════════════════════════════╗");
+        println!("║        EverEvo Server v{}           ║", env!("CARGO_PKG_VERSION"));
+        println!("╠══════════════════════════════════════════╣");
+        println!("║ DB:    {}  ║", if std::path::Path::new(&format!("{}/everevo.db", config.data_dir.display())).exists() { "connected" } else { "new" });
+        println!("║ LLM:   {}  ║", if primary { "primary configured" } else { "unconfigured" });
+        println!("║ MCP:   {} server(s) {}  ║", mcp_count, if mcp.is_empty() { "(none)".to_string() } else { mcp.join(", ") });
+        println!("║ Tools: {} built-in         ║", 17);
+        println!("║ Addr:  http://{addr}     ║");
+        println!("╚══════════════════════════════════════════╝");
+    }
+
     tracing::info!(%addr, "Server listening → http://{addr}");
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|e| {
-        tracing::error!("Failed to bind {addr}: {e}");
-        std::process::exit(1);
-    });
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("Failed to bind {addr}: {e}");
+            std::process::exit(1);
+        });
 
     // Auto-open browser
     let url = format!("http://{addr}");
@@ -288,7 +337,9 @@ async fn cmd_serve(config: everevo_core::AppConfig, host: &str, port: u16) {
         });
 
     // ── Cleanup ─────────────────────────────────────────────────
-    // Kill all active sandbox processes so no orphans linger.
+    // Drain in-flight connections before killing sandboxes.
+    tracing::info!("Shutting down — draining connections (5s timeout)...");
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     state.destroy_all_sandboxes().await;
     state.scheduler.stop();
     tracing::info!("Dreaming scheduler stopped, waiting for background task...");
@@ -312,7 +363,10 @@ async fn cmd_bootstrap(config: &everevo_core::AppConfig, check_only: bool) {
 
             if !status.corrupt.is_empty() {
                 println!();
-                println!("Corrupt ({} assets — re-download needed):", status.corrupt.len());
+                println!(
+                    "Corrupt ({} assets — re-download needed):",
+                    status.corrupt.len()
+                );
                 for c in &status.corrupt {
                     println!("  ⚠️  {}  v{}", c.key, c.version);
                 }
@@ -346,7 +400,9 @@ async fn cmd_bootstrap(config: &everevo_core::AppConfig, check_only: bool) {
                     };
                     let bs = std::sync::Arc::new(bootstrap);
                     let pipeline = everevo_bootstrap::pipeline::InitPipeline::new(
-                        config.data_dir.clone(), bs, dl,
+                        config.data_dir.clone(),
+                        bs,
+                        dl,
                     );
 
                     let mut events = pipeline.events();
@@ -354,23 +410,39 @@ async fn cmd_bootstrap(config: &everevo_core::AppConfig, check_only: bool) {
 
                     while let Ok(event) = events.recv().await {
                         match event {
-                            everevo_bootstrap::pipeline::InitEvent::DownloadProgress { key, percentage, .. } => {
+                            everevo_bootstrap::pipeline::InitEvent::DownloadProgress {
+                                key,
+                                percentage,
+                                ..
+                            } => {
                                 println!("  ⬇ {key}: {percentage:.0}%");
                             }
-                            everevo_bootstrap::pipeline::InitEvent::LayerStart { key, layer, .. } if layer == 2 => {
+                            everevo_bootstrap::pipeline::InitEvent::LayerStart {
+                                key,
+                                layer: 2,
+                                ..
+                            } => {
                                 println!("  📦 {key}: extracting...");
                             }
-                            everevo_bootstrap::pipeline::InitEvent::AssetDone { key, completed, total } => {
+                            everevo_bootstrap::pipeline::InitEvent::AssetDone {
+                                key,
+                                completed,
+                                total,
+                            } => {
                                 println!("  ✅ {key} ({completed}/{total})");
                             }
-                            everevo_bootstrap::pipeline::InitEvent::AssetFailed { key, error, .. } => {
+                            everevo_bootstrap::pipeline::InitEvent::AssetFailed {
+                                key,
+                                error,
+                                ..
+                            } => {
                                 eprintln!("  ❌ {key}: {error}");
                             }
                             everevo_bootstrap::pipeline::InitEvent::AllDone => {
                                 println!("All assets provisioned.");
                                 break;
                             }
-                            everevo_bootstrap::pipeline::InitEvent::FatalError(e) => {
+                            everevo_bootstrap::pipeline::InitEvent::FatalError { error: e } => {
                                 eprintln!("Fatal: {e}");
                                 break;
                             }
@@ -422,8 +494,7 @@ async fn cmd_chat(config: &everevo_core::AppConfig, message: &str) {
 
     // ── Tools ────────────────────────────────────────────────────────
     let tools = Arc::new(build_registry(
-        sandbox,
-        None, // no downloader for CLI chat
+        sandbox, None, // no downloader for CLI chat
         None, // no bootstrap for CLI chat
     ));
 
@@ -442,10 +513,14 @@ async fn cmd_chat(config: &everevo_core::AppConfig, message: &str) {
                 print!("{delta}");
                 final_text.push_str(&delta);
             }
-            AgentEvent::ToolCallStart { name, arguments, .. } => {
+            AgentEvent::ToolCallStart {
+                name, arguments, ..
+            } => {
                 println!("\n🔧 {name}({arguments})");
             }
-            AgentEvent::ToolCallEnd { content, is_error, .. } => {
+            AgentEvent::ToolCallEnd {
+                content, is_error, ..
+            } => {
                 if is_error {
                     println!("❌ {content}");
                 }
@@ -468,7 +543,9 @@ async fn cmd_chat(config: &everevo_core::AppConfig, message: &str) {
 use everevo_server::main_impl::run_init_llm_phase;
 
 /// Load the primary LLM provider from data/config.toml.
-async fn load_primary_llm(config: &everevo_core::AppConfig) -> Option<everevo_agent::llm::HttpClient> {
+async fn load_primary_llm(
+    config: &everevo_core::AppConfig,
+) -> Option<everevo_agent::llm::HttpClient> {
     let path = config.data_dir.join("config.toml");
     let content = tokio::fs::read_to_string(&path).await.ok()?;
     let table: toml::Value = toml::from_str(&content).ok()?;
@@ -484,5 +561,7 @@ async fn load_primary_llm(config: &everevo_core::AppConfig) -> Option<everevo_ag
         return None;
     }
 
-    Some(everevo_agent::llm::HttpClient::new(api_fmt, key, url, model))
+    Some(everevo_agent::llm::HttpClient::new(
+        api_fmt, key, url, model,
+    ))
 }

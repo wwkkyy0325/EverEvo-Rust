@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use everevo_bootstrap::Bootstrap;
+use tokio_util::sync::CancellationToken;
 
 use everevo_core::tool::{Tool, ToolOutput};
 use everevo_core::types::RiskLevel;
@@ -49,10 +50,16 @@ impl Tool for BootstrapTool {
     async fn execute(
         &self,
         _params: serde_json::Value,
+        _cancel: Option<&CancellationToken>,
     ) -> Result<ToolOutput, EverEvoError> {
-        let status = self.bootstrap.check().await.map_err(|e| {
-            EverEvoError::Tool(format!("Bootstrap check failed: {e}"))
-        })?;
+        let status = self
+            .bootstrap
+            .check()
+            .await
+            .map_err(|e| EverEvoError::Tool {
+                tool: "bootstrap_check".into(),
+                message: format!("Check failed: {e}"),
+            })?;
 
         let mut lines = Vec::new();
 
@@ -65,7 +72,10 @@ impl Tool for BootstrapTool {
         if !status.corrupt.is_empty() {
             lines.push(format!("Corrupt ({}):", status.corrupt.len()));
             for c in &status.corrupt {
-                lines.push(format!("  ⚠️  {} v{} — re-download needed", c.key, c.version));
+                lines.push(format!(
+                    "  ⚠️  {} v{} — re-download needed",
+                    c.key, c.version
+                ));
             }
         }
         if !status.missing.is_empty() {
@@ -75,10 +85,7 @@ impl Tool for BootstrapTool {
                 status.download_size_bytes / 1_048_576
             ));
             for m in &status.missing {
-                lines.push(format!(
-                    "  ❌ {} v{} — {}",
-                    m.key, m.version, m.description
-                ));
+                lines.push(format!("  ❌ {} v{} — {}", m.key, m.version, m.description));
             }
         }
         if status.ready.len() == 8 {

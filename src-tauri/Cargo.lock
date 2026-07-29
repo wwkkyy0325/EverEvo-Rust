@@ -2852,17 +2852,19 @@ dependencies = [
  "async-trait",
  "chrono",
  "everevo-bootstrap",
+ "everevo-code-search",
  "everevo-core",
- "everevo-domain",
+ "everevo-db",
  "everevo-downloader",
- "everevo-kg",
  "everevo-sandbox",
- "everevo-telemetry",
  "everevo-vector",
+ "everevo-workflow",
  "futures",
+ "oxigraph",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -2875,6 +2877,7 @@ dependencies = [
 name = "everevo-bootstrap"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "everevo-core",
  "everevo-downloader",
@@ -2887,6 +2890,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "everevo-code-search"
+version = "0.1.0"
+dependencies = [
+ "everevo-db",
+ "regex",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
 name = "everevo-core"
 version = "0.1.0"
 dependencies = [
@@ -2895,7 +2913,10 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sqlx",
  "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
  "toml 0.8.2",
  "tracing",
  "uuid",
@@ -2912,24 +2933,6 @@ dependencies = [
  "sha2",
  "sqlx",
  "tokio",
- "uuid",
-]
-
-[[package]]
-name = "everevo-domain"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "everevo-core",
- "everevo-db",
- "everevo-kg",
- "everevo-vector",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
  "uuid",
 ]
 
@@ -2953,16 +2956,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "everevo-kg"
+name = "everevo-mcp"
 version = "0.1.0"
 dependencies = [
- "chrono",
+ "async-trait",
  "everevo-core",
- "oxigraph",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "tokio",
+ "tokio-util",
  "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -2995,12 +2999,11 @@ dependencies = [
  "everevo-bootstrap",
  "everevo-core",
  "everevo-db",
- "everevo-domain",
  "everevo-downloader",
- "everevo-kg",
+ "everevo-mcp",
  "everevo-sandbox",
- "everevo-telemetry",
  "everevo-vector",
+ "everevo-workflow",
  "futures",
  "open",
  "reqwest 0.12.28",
@@ -3018,20 +3021,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "everevo-telemetry"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "everevo-core",
- "serde",
- "serde_json",
- "sqlx",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "everevo-vector"
 version = "0.1.0"
 dependencies = [
@@ -3041,6 +3030,22 @@ dependencies = [
  "futures",
  "lancedb",
  "ort",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "everevo-workflow"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "everevo-core",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

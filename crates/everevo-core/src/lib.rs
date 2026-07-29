@@ -1,9 +1,7 @@
-//! EverEvo shared types, traits, errors, and configuration.
+//! EverEvo shared types, traits, errors, configuration, and telemetry.
 //!
-//! This crate is the architectural **sink** — it has zero heavy I/O dependencies
-//! (no `tokio`, `reqwest`, `sqlx`, `oxigraph`, `lancedb`, or `wasmtime`).
-//! All other crates depend on it; it depends on nothing but the standard library
-//! and serialization helpers.
+//! Architectural **sink** — all crates depend on it. Telemetry module adds
+//! sqlx for the background writer; types stay I/O-free.
 
 pub mod agent;
 pub mod config;
@@ -15,18 +13,26 @@ pub mod memory;
 pub mod provider;
 pub mod retrieval;
 pub mod sandbox;
+pub mod telemetry;
 pub mod tool;
 pub mod types;
 
 // Re-export the public API surface
-pub use config::AppConfig;
-pub use config_center::ConfigCenter;
-pub use context::{ContextBuildContext, ContextFragment, ContextPipeline, ContextStage, default_pipeline};
+pub use config::{AppConfig, McpServerConfig};
+// ConfigCenter struct is defined but unused — available for future A/B experiment config
 pub use agent::{Agent, AgentContext, AgentOutput};
+pub use context::{
+    default_pipeline, ContextBuildContext, ContextFragment, ContextPipeline, ContextStage,
+};
 pub use error::EverEvoError;
-pub use provider::{BootstrapProvider, BootstrapStatus, DownloadProvider, DownloadResult};
-pub use llm::{FinishReason, LlmMessage, LlmProvider, LlmResponse, LlmRole, StreamEvent, ToolSchema};
+pub use llm::{
+    FinishReason, LlmMessage, LlmProvider, LlmResponse, LlmRole, StreamEvent, ToolSchema,
+};
 pub use memory::{FactType, MemoryFact, MemoryIndexEntry, ProjectionMetadata, SourcePointer};
+pub use provider::{BootstrapProvider, BootstrapStatus};
 pub use sandbox::{ExecutionConfig, ExecutionResult, SandboxProvider};
-pub use tool::{Tool, ToolOutput, ToolRegistry};
+pub use telemetry::{
+    AgentTurnRecord, RetrievalRecord, SpanGuard, Telemetry, TelemetryConfig, Trace,
+};
+pub use tool::{Tool, ToolHook, ToolOutput, ToolRegistry};
 pub use types::*;

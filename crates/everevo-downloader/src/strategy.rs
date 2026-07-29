@@ -23,8 +23,8 @@ impl DownloadStrategy {
         engine_concurrency: usize,
         chunk_threshold: u64,
     ) -> Self {
-        let use_chunks = task_concurrency > 0
-            || (chunk_threshold > 0 && file_size >= chunk_threshold);
+        let use_chunks =
+            task_concurrency > 0 || (chunk_threshold > 0 && file_size >= chunk_threshold);
         if use_chunks {
             let concurrency = if task_concurrency > 0 {
                 task_concurrency

@@ -56,10 +56,7 @@ pub enum InitEvent {
     Checking,
 
     /// Bootstrap check complete; some assets are missing.
-    FoundMissing {
-        total: usize,
-        total_bytes: u64,
-    },
+    FoundMissing { total: usize, total_bytes: u64 },
 
     /// Per-file download progress for an asset.
     DownloadProgress {
@@ -107,7 +104,7 @@ pub enum InitEvent {
     AllDone,
 
     /// Unrecoverable pipeline error.
-    FatalError(String),
+    FatalError { error: String },
 }
 
 // ── AssetDepth ───────────────────────────────────────────────────────────
@@ -211,7 +208,6 @@ fn truncate_error(s: &str) -> String {
     }
 }
 
-
 // ── InitError ────────────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
@@ -244,11 +240,7 @@ impl InitPipeline {
     ///
     /// The broadcast channel uses 256 capacity, matching the downloader's
     /// own event channel.
-    pub fn new(
-        data_dir: PathBuf,
-        bootstrap: Arc<Bootstrap>,
-        downloader: Arc<Downloader>,
-    ) -> Self {
+    pub fn new(data_dir: PathBuf, bootstrap: Arc<Bootstrap>, downloader: Arc<Downloader>) -> Self {
         let runtime_mgr = RuntimeManager::new(&data_dir);
         let marker_path = data_dir.join(".everevo_init");
         let (event_tx, _) = broadcast::channel(256);
@@ -326,11 +318,8 @@ impl InitPipeline {
         });
 
         // Build asset lookup map once.
-        let asset_map: HashMap<String, &Asset> = check
-            .missing
-            .iter()
-            .map(|a| (a.key.clone(), a))
-            .collect();
+        let asset_map: HashMap<String, &Asset> =
+            check.missing.iter().map(|a| (a.key.clone(), a)).collect();
 
         let mut trackers: HashMap<String, LayerTracker> = check
             .missing
@@ -458,7 +447,7 @@ impl InitPipeline {
 
         // ── Phase 4: Submit downloads ─────────────────────────
         let mut task_map: HashMap<String, String> = HashMap::new(); // task_id → asset_key
-        // URL fallback state — when a mirror fails, try the next URL from the Asset.
+                                                                    // URL fallback state — when a mirror fails, try the next URL from the Asset.
         let mut url_lists: HashMap<String, Vec<String>> = HashMap::new(); // asset_key → [urls]
         let mut url_index: HashMap<String, usize> = HashMap::new(); // asset_key → current index
 
@@ -488,8 +477,7 @@ impl InitPipeline {
                 {
                     tracker.increment_unit();
                 } else if let Some(url) = urls.first().copied() {
-                    let task =
-                        DownloadTask::new(url, &model_dest).with_priority(Priority::High);
+                    let task = DownloadTask::new(url, &model_dest).with_priority(Priority::High);
                     task_map.insert(task.id.clone(), asset.key.clone());
                     let _ = self.downloader.submit(task).await;
                 }
@@ -533,8 +521,7 @@ impl InitPipeline {
                 if !url_vec.is_empty() {
                     url_lists.insert(asset.key.clone(), url_vec);
                     url_index.insert(asset.key.clone(), 0);
-                    let task = DownloadTask::new(urls[0], &zip_dest)
-                        .with_priority(Priority::High);
+                    let task = DownloadTask::new(urls[0], &zip_dest).with_priority(Priority::High);
                     task_map.insert(task.id.clone(), asset.key.clone());
                     let _ = self.downloader.submit(task).await;
                 }
@@ -774,16 +761,14 @@ impl InitPipeline {
             self.write_marker().await?;
             self.emit(InitEvent::AllDone);
         } else {
-            let failed: Vec<String> = final_check
-                .missing
-                .iter()
-                .map(|a| a.key.clone())
-                .collect();
-            self.emit(InitEvent::FatalError(format!(
-                "{} assets could not be provisioned: {}",
-                failed.len(),
-                failed.join(", ")
-            )));
+            let failed: Vec<String> = final_check.missing.iter().map(|a| a.key.clone()).collect();
+            self.emit(InitEvent::FatalError {
+                error: format!(
+                    "{} assets could not be provisioned: {}",
+                    failed.len(),
+                    failed.join(", ")
+                ),
+            });
         }
 
         Ok(())
@@ -822,5 +807,266 @@ fn emit_pending_asset_dones(
             completed: i + 1,
             total,
         });
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Asset, AssetKind};
+
+    // ── AssetDepth ──────────────────────────────────────────────────
+
+    fn make_asset(key: &str, kind: AssetKind) -> Asset {
+        Asset {
+            key: key.into(),
+            kind,
+            version: "v1".into(),
+            primary_url: "https://example.com/test.zip".into(),
+            mirror_urls: vec![],
+            extra_files: vec![],
+            sha256: None,
+            size_bytes: 1000,
+            description: "test asset".into(),
+        }
+    }
+
+    #[test]
+    fn test_asset_depth_from_asset() {
+        let runtime = make_asset("python", AssetKind::Runtime);
+        let model = make_asset("bge", AssetKind::Model);
+
+        assert_eq!(AssetDepth::from_asset(&runtime), AssetDepth::Deep);
+        assert_eq!(AssetDepth::from_asset(&model), AssetDepth::Shallow);
+    }
+
+    #[test]
+    fn test_asset_depth_layer_count() {
+        assert_eq!(AssetDepth::Deep.layer_count(), 2);
+        assert_eq!(AssetDepth::Shallow.layer_count(), 1);
+    }
+
+    // ── LayerTracker ────────────────────────────────────────────────
+
+    #[test]
+    fn test_layer_tracker_new() {
+        let t = LayerTracker::new("python".into(), AssetDepth::Deep);
+        assert_eq!(t.current_layer, 1);
+        assert_eq!(t.layer_units_done, 0);
+        assert_eq!(t.layer_units_total, 0);
+        assert!(!t.is_current_layer_done()); // 0 >= 0 guard prevents false positive
+        assert!(!t.is_asset_done());
+    }
+
+    #[test]
+    fn test_layer_tracker_shallow_lifecycle() {
+        // Model: single layer (download only) with 5 files
+        let mut t = LayerTracker::new("bge".into(), AssetDepth::Shallow);
+        t.layer_units_total = 5;
+
+        // Progress through units
+        assert!(!t.is_current_layer_done());
+        for _ in 0..4 {
+            t.increment_unit();
+        }
+        assert!(!t.is_current_layer_done()); // 4/5 done
+
+        t.increment_unit(); // 5/5
+        assert!(t.is_current_layer_done());
+        assert!(
+            t.is_asset_done(),
+            "Shallow asset done when layer 1 complete"
+        );
+
+        // advance_layer should return false (already at max depth)
+        assert!(!t.advance_layer(10));
+    }
+
+    #[test]
+    fn test_layer_tracker_deep_lifecycle() {
+        // Runtime: two layers (download → extract)
+        let mut t = LayerTracker::new("python".into(), AssetDepth::Deep);
+        t.layer_units_total = 1;
+
+        // Layer 1: download
+        t.increment_unit();
+        assert!(t.is_current_layer_done());
+        assert!(!t.is_asset_done(), "Deep asset not done after layer 1");
+
+        // Advance to layer 2: extract
+        assert!(t.advance_layer(1));
+        assert_eq!(t.current_layer, 2);
+        assert_eq!(t.layer_units_done, 0);
+        assert_eq!(t.layer_units_total, 1);
+        assert!(!t.is_current_layer_done()); // layer 2 not yet done
+
+        t.increment_unit();
+        assert!(t.is_current_layer_done());
+        assert!(t.is_asset_done(), "Deep asset done after layer 2");
+
+        // advance_layer at max depth returns false
+        assert!(!t.advance_layer(1));
+    }
+
+    #[test]
+    fn test_layer_tracker_advance_resets_counters() {
+        let mut t = LayerTracker::new("node".into(), AssetDepth::Deep);
+        t.layer_units_total = 3;
+        t.layer_units_done = 3;
+        assert!(t.is_current_layer_done());
+
+        assert!(t.advance_layer(1));
+        assert_eq!(t.current_layer, 2);
+        assert_eq!(t.layer_units_done, 0);
+        assert_eq!(t.layer_units_total, 1);
+    }
+
+    #[test]
+    fn test_layer_tracker_no_guard_bypass() {
+        // layer_units_total == 0 → is_current_layer_done must return false
+        // even though layer_units_done (0) >= layer_units_total (0)
+        let t = LayerTracker::new("test".into(), AssetDepth::Shallow);
+        assert!(
+            !t.is_current_layer_done(),
+            "Guard: 0 >= 0 must not trigger done when no work was assigned"
+        );
+    }
+
+    // ── truncate_error ──────────────────────────────────────────────
+
+    #[test]
+    fn test_truncate_error_short() {
+        assert_eq!(truncate_error("hi"), "hi");
+    }
+
+    #[test]
+    fn test_truncate_error_boundary() {
+        let exact = "a".repeat(200);
+        assert_eq!(truncate_error(&exact), exact);
+    }
+
+    #[test]
+    fn test_truncate_error_long() {
+        let long = "a".repeat(300);
+        let truncated = truncate_error(&long);
+        assert_eq!(truncated.len(), 200); // "..." takes 3 chars, so 197 + "..." = 200
+        assert!(truncated.ends_with("..."));
+    }
+
+    // ── emit_pending_asset_dones ────────────────────────────────────
+
+    #[test]
+    fn test_emit_empty_trackers() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let trackers: HashMap<String, LayerTracker> = HashMap::new();
+        emit_pending_asset_dones(&tx, &trackers, 0);
+        // No events emitted — receiver gets nothing
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_emit_single_done() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let mut trackers = HashMap::new();
+        let mut t = LayerTracker::new("bge".into(), AssetDepth::Shallow);
+        t.layer_units_total = 1;
+        t.increment_unit();
+        assert!(t.is_asset_done());
+        trackers.insert("bge".into(), t);
+
+        emit_pending_asset_dones(&tx, &trackers, 3);
+
+        let event = rx.try_recv().unwrap();
+        match event {
+            InitEvent::AssetDone {
+                key,
+                completed,
+                total,
+            } => {
+                assert_eq!(key, "bge");
+                assert_eq!(completed, 1);
+                assert_eq!(total, 3);
+            }
+            other => panic!("expected AssetDone, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_emit_only_done_trackers() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let mut trackers = HashMap::new();
+
+        // Python (Deep): layer 1 done but not layer 2 → not asset-done
+        let mut py = LayerTracker::new("python".into(), AssetDepth::Deep);
+        py.layer_units_total = 1;
+        py.increment_unit(); // layer 1 done
+        trackers.insert("python".into(), py);
+
+        // BGE (Shallow): all done
+        let mut bge = LayerTracker::new("bge".into(), AssetDepth::Shallow);
+        bge.layer_units_total = 1;
+        bge.increment_unit();
+        trackers.insert("bge".into(), bge);
+
+        emit_pending_asset_dones(&tx, &trackers, 5);
+
+        // Only bge should be emitted (1 event), python not yet done
+        let event = rx.try_recv().unwrap();
+        match event {
+            InitEvent::AssetDone { key, .. } => assert_eq!(key, "bge"),
+            other => panic!("expected AssetDone for bge, got {other:?}"),
+        }
+        // No second event
+        assert!(rx.try_recv().is_err());
+    }
+
+    // ── InitEvent serialization (tag-based JSON) ────────────────────
+
+    #[test]
+    fn test_init_event_json_tag() {
+        let event = InitEvent::Checking;
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "Checking");
+
+        let event = InitEvent::AllDone;
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "AllDone");
+    }
+
+    #[test]
+    fn test_init_event_json_found_missing() {
+        let event = InitEvent::FoundMissing {
+            total: 3,
+            total_bytes: 150_000_000,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "FoundMissing");
+        assert_eq!(json["total"], 3);
+        assert_eq!(json["total_bytes"], 150_000_000);
+    }
+
+    #[test]
+    fn test_init_event_json_download_progress() {
+        let event = InitEvent::DownloadProgress {
+            key: "python".into(),
+            percentage: 45.5,
+            speed_mb: 2.3,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "DownloadProgress");
+        assert_eq!(json["key"], "python");
+        assert_eq!(json["percentage"], 45.5);
+    }
+
+    #[test]
+    fn test_init_event_json_fatal_error() {
+        let event = InitEvent::FatalError {
+            error: "disk full".into(),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "FatalError");
+        assert_eq!(json["error"], "disk full");
     }
 }

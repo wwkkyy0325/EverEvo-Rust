@@ -9,8 +9,7 @@ use uuid::Uuid;
 pub type TaskId = String;
 
 /// Task priority — higher values execute first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
 pub enum Priority {
     #[default]
     Normal = 1,
@@ -20,8 +19,7 @@ pub enum Priority {
 }
 
 /// The network region hint — helps the mirror resolver prefer domestic/international mirrors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Region {
     #[default]
     Auto,
@@ -156,10 +154,7 @@ impl DownloadTask {
     /// Derive a chunk file path.
     pub fn chunk_path(&self, index: usize) -> PathBuf {
         let mut base = self.dest_path.clone();
-        let ext = base
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        let ext = base.extension().and_then(|e| e.to_str()).unwrap_or("");
         base.set_extension(format!("{ext}.part.{index}"));
         base
     }

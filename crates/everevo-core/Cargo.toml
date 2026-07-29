@@ -16,6 +16,15 @@ tracing.workspace = true
 async-trait = "0.1"
 sha2 = "0.10"
 toml = "0.8"
+tokio-util = { workspace = true, features = ["rt"] }
+
+# Telemetry writer (fire-and-forget SQLite background thread)
+sqlx = { workspace = true, features = ["sqlite"] }
+tokio = { workspace = true, features = ["rt"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tempfile = "3"
 
 [lints]
 workspace = true

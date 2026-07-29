@@ -65,9 +65,13 @@ pub struct DreamingEngine {
     /// Path to the `.dreams/` directory for pipeline internal state.
     dreams_dir: PathBuf,
     /// Raw conversation message buffer — drained by LIGHT phase.
-    /// Each tuple: (role, content, message_id).
+    /// Each tuple: (role, content, message_id, session_id).
+    /// session_id enables per-session grouping during diary distillation.
     /// Thread-safe via Mutex.
-    message_buffer: std::sync::Mutex<Vec<(String, String, String)>>,
+    message_buffer: std::sync::Mutex<Vec<(String, String, String, String)>>,
+    /// Shared knowledge graph for entity extraction during DEEP.
+    /// When set, DEEP writes here instead of opening a new KG instance.
+    knowledge_graph: Option<Arc<std::sync::RwLock<crate::knowledge::graph::KnowledgeGraph>>>,
 }
 
 impl DreamingEngine {
@@ -83,33 +87,62 @@ impl DreamingEngine {
     ) -> Result<Self, EverEvoError> {
         let memory_dir: PathBuf = memory_dir.into();
         let dreams_dir = memory_dir.join(".dreams");
-        std::fs::create_dir_all(&dreams_dir).map_err(|e| {
-            EverEvoError::Internal(format!("Failed to create .dreams dir: {e}"))
-        })?;
+        std::fs::create_dir_all(&dreams_dir)
+            .map_err(|e| EverEvoError::Internal(format!("Failed to create .dreams dir: {e}")))?;
         Ok(Self {
             diary_manager,
             fact_manager,
             llm,
             dreams_dir,
             message_buffer: std::sync::Mutex::new(Vec::new()),
+            knowledge_graph: None,
         })
+    }
+
+    /// Attach the shared knowledge graph for entity extraction during DEEP.
+    pub fn set_knowledge_graph(&mut self, kg: Arc<std::sync::RwLock<crate::knowledge::graph::KnowledgeGraph>>) {
+        self.knowledge_graph = Some(kg);
     }
 
     /// Push a raw conversation message into the buffer.
     /// Called by the chat route after each message is persisted.
     /// The LIGHT phase drains this buffer when triggered.
-    pub fn push_message(&self, role: &str, content: &str, message_id: &str) {
+    pub fn push_message(&self, role: &str, content: &str, message_id: &str, session_id: &str) {
         if let Ok(mut buf) = self.message_buffer.lock() {
-            buf.push((role.to_string(), content.to_string(), message_id.to_string()));
+            buf.push((
+                role.to_string(),
+                content.to_string(),
+                message_id.to_string(),
+                session_id.to_string(),
+            ));
         }
     }
 
     /// Drain the message buffer — returns all buffered messages and clears it.
-    pub fn drain_messages(&self) -> Vec<(String, String, String)> {
+    /// Each tuple: (role, content, message_id, session_id).
+    pub fn drain_messages(&self) -> Vec<(String, String, String, String)> {
         self.message_buffer
             .lock()
             .map(|mut buf| std::mem::take(&mut *buf))
             .unwrap_or_default()
+    }
+
+    /// Group drained messages by session_id for per-session diary entries.
+    #[allow(clippy::type_complexity)]
+    fn group_by_session(
+        messages: &[(String, String, String, String)]
+    ) -> Vec<(String, Vec<(String, String, String)>)> {
+        let mut groups: std::collections::HashMap<String, Vec<(String, String, String)>> =
+            std::collections::HashMap::new();
+        for (role, content, msg_id, session_id) in messages {
+            groups
+                .entry(session_id.clone())
+                .or_default()
+                .push((role.clone(), content.clone(), msg_id.clone()));
+        }
+        let mut result: Vec<_> = groups.into_iter().collect();
+        result.sort_by_key(|(sid, _)| sid.clone());
+        result
     }
 
     /// Check if the message buffer has unprocessed messages.
@@ -132,7 +165,9 @@ impl DreamingEngine {
             count = messages.len(),
             "Session end flush — running LIGHT on buffered messages"
         );
-        let _ = self.execute_light_with_messages("session_end", &messages).await;
+        let _ = self
+            .execute_light_with_messages("session_end", &messages)
+            .await;
     }
 
     // ── Unified Pipeline Entry ──────────────────────────────────────
@@ -214,7 +249,10 @@ impl DreamingEngine {
                     tracing::debug!("LIGHT phase — no buffered messages to process");
                     return Ok(());
                 }
-                tracing::info!(count = messages.len(), "LIGHT phase — processing buffered messages");
+                tracing::info!(
+                    count = messages.len(),
+                    "LIGHT phase — processing buffered messages"
+                );
                 self.execute_light_with_messages(reason, &messages).await
             }
             ScheduledPhase::Rem => {
@@ -235,16 +273,15 @@ impl DreamingEngine {
 
     /// Execute LIGHT phase with raw conversation messages.
     ///
-    /// When an LLM is configured, calls `DiaryManager::build_trim_prompt()`,
-    /// sends it to the LLM, parses the distilled response, and writes a diary
-    /// entry. Falls back to stub behavior when `llm` is `None` or messages
-    /// are empty.
+    /// Groups messages by session, calls the LLM trimmer per session group,
+    /// and writes diary entries with real session IDs. Falls back to stub
+    /// behavior when `llm` is `None` or messages are empty.
     ///
-    /// Each tuple is `(role, content, message_id)`.
+    /// Each tuple is `(role, content, message_id, session_id)`.
     pub async fn execute_light_with_messages(
         &self,
         reason: &str,
-        messages: &[(String, String, String)],
+        messages: &[(String, String, String, String)],
     ) -> Result<(), EverEvoError> {
         if messages.is_empty() {
             return self.execute_light_stub(reason).await;
@@ -252,29 +289,47 @@ impl DreamingEngine {
 
         match &self.llm {
             Some(llm) => {
-                let prompt = DiaryManager::build_trim_prompt(messages);
-                let llm_messages = vec![LlmMessage::user(&prompt)];
-                let response = llm.chat(&llm_messages, &[]).await?;
-                let distilled = response.content.unwrap_or_default();
+                // Group messages by session for per-session diary entries
+                let session_groups = Self::group_by_session(messages);
+                let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+                let mut entries: Vec<DiaryEntry> = Vec::new();
 
-                if distilled.is_empty() || distilled.contains("[NO_SUBSTANCE]") {
-                    tracing::info!("LIGHT phase — LLM found no substantive content");
+                for (session_id, msgs) in &session_groups {
+                    // Convert (role, content, msg_id) back for build_trim_prompt
+                    let prompt_input: Vec<(String, String, String)> = msgs.clone();
+                    let prompt = DiaryManager::build_trim_prompt(&prompt_input);
+                    let llm_messages = vec![LlmMessage::user(&prompt)];
+                    match llm.chat(&llm_messages, &[]).await {
+                        Ok(response) => {
+                            let distilled = response.content.unwrap_or_default();
+                            if distilled.is_empty() || distilled.contains("[NO_SUBSTANCE]") {
+                                tracing::debug!(%session_id, "LIGHT — no substance in session");
+                                continue;
+                            }
+                            entries.push(DiaryEntry {
+                                timestamp: chrono::Utc::now().to_rfc3339(),
+                                session_id: session_id.clone(),
+                                content: distilled,
+                                source_message_ids: msgs.iter().map(|(_, _, id)| id.clone()).collect(),
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!(%session_id, error = %e, "LIGHT — LLM trim failed for session");
+                        }
+                    }
+                }
+
+                if entries.is_empty() {
+                    tracing::info!("LIGHT phase — no substantive content across {} sessions", session_groups.len());
                     return Ok(());
                 }
 
-                let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-                let entry = DiaryEntry {
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                    session_id: "llm-light".into(),
-                    content: distilled,
-                    source_message_ids: messages
-                        .iter()
-                        .map(|(_, _, id)| id.clone())
-                        .collect(),
-                };
-                self.diary_manager
-                    .append_entries_to_date(&today, &[entry])?;
-                tracing::info!("LIGHT phase — LLM trim complete, wrote diary entry");
+                self.diary_manager.append_entries_to_date(&today, &entries)?;
+                tracing::info!(
+                    entries = entries.len(),
+                    sessions = session_groups.len(),
+                    "LIGHT phase — wrote diary entries"
+                );
                 Ok(())
             }
             None => self.execute_light_stub(reason).await,
@@ -452,16 +507,29 @@ impl DreamingEngine {
         if let Some(ref llm) = self.llm {
             if let Ok(all_facts) = self.fact_manager.load_all() {
                 for fact in &all_facts {
-                    let prompt = everevo_kg::build_extraction_prompt(&fact.content);
-                    match llm.chat(
-                        &[everevo_core::llm::LlmMessage::user(&prompt)],
-                        &[],
-                    ).await {
+                    let prompt = crate::knowledge::graph::build_extraction_prompt(&fact.content);
+                    match llm
+                        .chat(&[everevo_core::llm::LlmMessage::user(&prompt)], &[])
+                        .await
+                    {
                         Ok(resp) => {
                             if let Some(text) = resp.content {
-                                // Open KG and write extracted entities/relations
-                                let kg_dir = self.dreams_dir.parent().unwrap_or(std::path::Path::new("data/memory")).join("graph");
-                                if let Ok(mut kg) = everevo_kg::KnowledgeGraph::open(&kg_dir) {
+                                // Use shared KG if available (syncs with AppState + MemoryStage)
+                                if let Some(ref kg_lock) = self.knowledge_graph {
+                                    if let Ok(mut kg) = kg_lock.write() {
+                                        extract_and_write_to_kg(&text, &fact.name, &mut kg);
+                                        continue;
+                                    }
+                                }
+                                // Fallback: open a standalone KG instance
+                                let kg_dir = self
+                                    .dreams_dir
+                                    .parent()
+                                    .unwrap_or(std::path::Path::new("data/memory"))
+                                    .join("graph");
+                                if let Ok(mut kg) =
+                                    crate::knowledge::graph::KnowledgeGraph::open(&kg_dir)
+                                {
                                     extract_and_write_to_kg(&text, &fact.name, &mut kg);
                                 }
                             }
@@ -486,8 +554,7 @@ impl DreamingEngine {
         if !path.exists() {
             return Ok(Vec::new());
         }
-        let content =
-            std::fs::read_to_string(&path).unwrap_or_default();
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
         let mut themes = Vec::new();
         for line in content.lines() {
             let line = line.trim();
@@ -509,9 +576,8 @@ impl DreamingEngine {
             content.push_str(&line);
             content.push('\n');
         }
-        std::fs::write(&path, &content).map_err(|e| {
-            EverEvoError::Internal(format!("Write themes: {e}"))
-        })?;
+        std::fs::write(&path, &content)
+            .map_err(|e| EverEvoError::Internal(format!("Write themes: {e}")))?;
         Ok(())
     }
 }
@@ -580,35 +646,62 @@ fn theme_to_memory_fact(theme: &Theme) -> MemoryFact {
         fact_type: FactType::Project,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
-        projection: ProjectionMetadata::new(
-            "dreaming-pipeline",
-            "llm",
-            vec![],
-            theme.confidence,
-        ),
+        projection: ProjectionMetadata::new("dreaming-pipeline", "llm", vec![], theme.confidence),
         links: vec![],
     }
 }
 
 // ── KG Extraction Helper ───────────────────────────────────────────────────
 
-fn extract_and_write_to_kg(json_text: &str, _source: &str, kg: &mut everevo_kg::KnowledgeGraph) {
-    let cleaned = json_text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+fn extract_and_write_to_kg(
+    json_text: &str,
+    _source: &str,
+    kg: &mut crate::knowledge::graph::KnowledgeGraph,
+) {
+    use crate::knowledge::graph::{Entity, EntityType, Relation, RelationStatus};
+    let cleaned = json_text
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(cleaned) {
         if let Some(entities) = parsed.get("entities").and_then(|e| e.as_array()) {
             for e in entities {
                 let id = e["id"].as_str().unwrap_or("unknown");
                 let label = e["label"].as_str().unwrap_or(id);
                 let etype = match e["type"].as_str().unwrap_or("Concept") {
-                    "Person" => everevo_kg::EntityType::Person, "Project" => everevo_kg::EntityType::Project,
-                    "Tool" => everevo_kg::EntityType::Tool, "File" => everevo_kg::EntityType::File,
-                    "Event" => everevo_kg::EntityType::Event, _ => everevo_kg::EntityType::Concept,
+                    "Person" => EntityType::Person,
+                    "Project" => EntityType::Project,
+                    "Tool" => EntityType::Tool,
+                    "File" => EntityType::File,
+                    "Event" => EntityType::Event,
+                    _ => EntityType::Concept,
                 };
-                kg.upsert_entity(everevo_kg::Entity { id: id.to_string(), label: label.to_string(), entity_type: etype, properties: std::collections::HashMap::new(), sources: vec![], created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), merged_into: None });
+                kg.upsert_entity(Entity {
+                    id: id.to_string(),
+                    label: label.to_string(),
+                    entity_type: etype,
+                    properties: std::collections::HashMap::new(),
+                    sources: vec![],
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                    merged_into: None,
+                });
             }
         }
         if let Some(relations) = parsed.get("relations").and_then(|r| r.as_array()) {
-            for r in relations { kg.add_relation(everevo_kg::Relation { from: r["from"].as_str().unwrap_or("").into(), predicate: r["predicate"].as_str().unwrap_or("related_to").into(), to: r["to"].as_str().unwrap_or("").into(), status: everevo_kg::RelationStatus::Active, valid_from: chrono::Utc::now(), valid_until: None, sources: vec![] }); }
+            for r in relations {
+                kg.add_relation(Relation {
+                    from: r["from"].as_str().unwrap_or("").into(),
+                    predicate: r["predicate"].as_str().unwrap_or("related_to").into(),
+                    to: r["to"].as_str().unwrap_or("").into(),
+                    status: RelationStatus::Active,
+                    valid_from: chrono::Utc::now(),
+                    valid_until: None,
+                    sources: vec![],
+                });
+            }
         }
         let _ = kg.save();
     }
@@ -683,16 +776,10 @@ mod tests {
             .unwrap();
 
         // REM stub (no crash)
-        engine
-            .execute_phase(&ScheduledPhase::Rem)
-            .await
-            .unwrap();
+        engine.execute_phase(&ScheduledPhase::Rem).await.unwrap();
 
         // DEEP (always runs consolidator pass)
-        engine
-            .execute_phase(&ScheduledPhase::Deep)
-            .await
-            .unwrap();
+        engine.execute_phase(&ScheduledPhase::Deep).await.unwrap();
     }
 
     #[tokio::test]

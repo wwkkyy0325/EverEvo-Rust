@@ -15,7 +15,10 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/sandbox/status", get(status))
         .route("/api/sandbox/shells", get(available_shells))
-        .route("/api/sandbox/sessions/{id}/trust", get(get_trusted).post(add_trusted))
+        .route(
+            "/api/sandbox/sessions/{id}/trust",
+            get(get_trusted).post(add_trusted),
+        )
         .route("/api/sandbox/sessions/{id}/audit", get(get_audit))
         .route("/api/sandbox/sessions/{id}/permission", put(set_permission))
         .route("/api/sandbox/sessions/{id}/confirm", post(confirm_command))
@@ -28,13 +31,18 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/agent/tasks", get(list_subagent_tasks))
         .route("/api/agent/tasks/{id}/cancel", post(cancel_subagent))
         .route("/api/chat/{id}/interrupt", post(interrupt_chat))
+        .route("/api/session/{id}/todos", get(get_session_todos))
 }
 
 #[derive(Deserialize)]
-struct TrustRequest { path: String }
+struct TrustRequest {
+    path: String,
+}
 
 #[derive(Deserialize)]
-struct AuditQuery { limit: Option<usize> }
+struct AuditQuery {
+    limit: Option<usize>,
+}
 
 #[derive(Deserialize)]
 struct PermissionRequest {
@@ -53,7 +61,11 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let (shell_name, permission_key, permission_label) = match sample {
         Some(sb) => {
             let level = sb.permission_level();
-            (sb.engine().shell_name().to_string(), level_key(level).to_string(), level.label().to_string())
+            (
+                sb.engine().shell_name().to_string(),
+                level_key(level).to_string(),
+                level.label().to_string(),
+            )
         }
         None => ("none".into(), "semi_auto".into(), "—".into()),
     };
@@ -77,9 +89,14 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
 
 async fn available_shells(State(_state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let shells = everevo_sandbox::ShellResolver::detect_all();
-    let list: Vec<_> = shells.iter().map(|s| serde_json::json!({
-        "name": s.name, "executable": s.executable.display().to_string(),
-    })).collect();
+    let list: Vec<_> = shells
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name, "executable": s.executable.display().to_string(),
+            })
+        })
+        .collect();
     Json(serde_json::json!({ "data": list }))
 }
 
@@ -90,7 +107,10 @@ async fn add_trusted(
 ) -> Json<serde_json::Value> {
     let sandboxes = state.sandboxes.read().await;
     match sandboxes.get(&session_id) {
-        Some(sb) => { sb.trust_path(&body.path); Json(serde_json::json!({ "data": { "trusted": true } })) }
+        Some(sb) => {
+            sb.trust_path(&body.path);
+            Json(serde_json::json!({ "data": { "trusted": true } }))
+        }
         None => Json(serde_json::json!({ "error": "not found" })),
     }
 }
@@ -120,10 +140,13 @@ async fn get_audit(
                 Ok(content) => {
                     let limit = q.limit.unwrap_or(100);
                     let lines: Vec<&str> = content.lines().rev().take(limit).collect();
-                    let records: Vec<serde_json::Value> = lines.iter()
+                    let records: Vec<serde_json::Value> = lines
+                        .iter()
                         .filter_map(|l| serde_json::from_str(l).ok())
                         .collect();
-                    Json(serde_json::json!({ "data": { "records": records, "total": content.lines().count() } }))
+                    Json(
+                        serde_json::json!({ "data": { "records": records, "total": content.lines().count() } }),
+                    )
                 }
                 Err(_) => Json(serde_json::json!({ "data": { "records": [], "total": 0 } })),
             }
@@ -260,11 +283,15 @@ async fn dreaming_trigger(
     use everevo_agent::memory::scheduler::ScheduledPhase;
 
     let phases: Vec<ScheduledPhase> = match body.phase.as_str() {
-        "light" => vec![ScheduledPhase::Light { reason: "manual".into() }],
+        "light" => vec![ScheduledPhase::Light {
+            reason: "manual".into(),
+        }],
         "rem" => vec![ScheduledPhase::Rem],
         "deep" => vec![ScheduledPhase::Deep],
         "all" => vec![
-            ScheduledPhase::Light { reason: "manual".into() },
+            ScheduledPhase::Light {
+                reason: "manual".into(),
+            },
             ScheduledPhase::RemAndDeep,
         ],
         other => {
@@ -277,7 +304,11 @@ async fn dreaming_trigger(
     let mut results = Vec::new();
     for phase in &phases {
         let phase_name = format!("{:?}", phase);
-        match state.scheduler.trigger_phase(phase, &state.dreaming_engine).await {
+        match state
+            .scheduler
+            .trigger_phase(phase, &state.dreaming_engine)
+            .await
+        {
             Ok(()) => {
                 tracing::info!(%phase_name, "Manual dreaming phase completed");
                 results.push(serde_json::json!({ "phase": phase_name, "status": "ok" }));
@@ -302,43 +333,49 @@ async fn dreaming_trigger(
 async fn list_facts(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     match state.fact_manager.load_all() {
         Ok(facts) => {
-            let items: Vec<_> = facts.iter().map(|f| serde_json::json!({
-                "name": f.name, "description": f.description,
-                "fact_type": f.fact_type.as_str(),
-                "created_at": f.created_at.to_rfc3339(),
-                "updated_at": f.updated_at.to_rfc3339(),
-            })).collect();
+            let items: Vec<_> = facts
+                .iter()
+                .map(|f| {
+                    serde_json::json!({
+                        "name": f.name, "description": f.description,
+                        "fact_type": f.fact_type.as_str(),
+                        "created_at": f.created_at.to_rfc3339(),
+                        "updated_at": f.updated_at.to_rfc3339(),
+                    })
+                })
+                .collect();
             Json(serde_json::json!({ "data": { "facts": items, "total": items.len() } }))
         }
         Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
     }
 }
 
-async fn delete_fact(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Json<serde_json::Value> {
+async fn delete_fact(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Json<serde_json::Value> {
     match state.fact_manager.delete(&name) {
         Ok(()) => Json(serde_json::json!({ "data": { "deleted": true, "name": name } })),
         Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
     }
 }
 
-// ── Agent Orchestration API ──────────────────────────────────────
+// ── Agent Orchestration API (deprecated — use /api/agent/tasks + TaskTool) ──
 
 #[derive(Deserialize)]
-struct AgentDelegateRequest { task: String, persona: Option<String> }
+#[allow(dead_code)]
+struct AgentDelegateRequest {
+    task: String,
+    persona: Option<String>,
+}
 
-async fn agent_delegate(State(state): State<Arc<AppState>>, Json(body): Json<AgentDelegateRequest>) -> Json<serde_json::Value> {
-    let guard = state.llm.read().await;
-    let client = guard.values().find_map(|c| c.as_ref()).cloned();
-    drop(guard);
-    let Some(client) = client else {
-        return Json(serde_json::json!({ "error": "No LLM configured" }));
-    };
-    let tools = Arc::new(everevo_core::tool::ToolRegistry::new());
-    let mut supervisor = everevo_agent::orchestration::SupervisorAgent::new(
-        tools, state.config.data_dir.join("sandbox"),
-    );
-    let result = supervisor.orchestrate(&body.task, client, supervisor.tool_registry.clone(), body.persona, vec![]).await;
-    Json(serde_json::json!({ "data": { "result": result.content, "subtasks": result.subtask_results.len(), "re_plans": result.re_plans, "duration_ms": result.duration_ms }}))
+async fn agent_delegate(
+    State(_state): State<Arc<AppState>>,
+    Json(_body): Json<AgentDelegateRequest>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "data": { "result": "The /api/agent/delegate endpoint is deprecated. Use the Task tool in chat to spawn sub-agents.", "subtasks": 0 }
+    }))
 }
 
 async fn agent_pool_status(State(_state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -366,16 +403,24 @@ async fn list_subagent_tasks(
             .get(&sid)
             .and_then(|arc| {
                 let list = arc.lock().ok()?;
-                Some(list.iter().map(|s| serde_json::to_value(s).unwrap_or_default()).collect())
+                Some(
+                    list.iter()
+                        .map(|s| serde_json::to_value(s).unwrap_or_default())
+                        .collect(),
+                )
             })
             .unwrap_or_default()
     } else {
         statuses
-            .iter()
-            .flat_map(|(_sid, arc)| {
+            .values()
+            .flat_map(|arc| {
                 let list = arc.lock().ok();
-                list.map(|l| l.iter().map(|s| serde_json::to_value(s).unwrap_or_default()).collect::<Vec<_>>())
-                    .unwrap_or_default()
+                list.map(|l| {
+                    l.iter()
+                        .map(|s| serde_json::to_value(s).unwrap_or_default())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
             })
             .collect()
     };
@@ -391,7 +436,7 @@ async fn cancel_subagent(
     Path(id): Path<Uuid>,
 ) -> Json<serde_json::Value> {
     let handles = state.subagent_handles.read().await;
-    for (_sid, arc) in handles.iter() {
+    for arc in handles.values() {
         if let Ok(list) = arc.lock() {
             if let Some(entry) = list.iter().find(|e| e.id == id) {
                 entry.cancel.cancel();
@@ -404,6 +449,18 @@ async fn cancel_subagent(
     }
     Json(serde_json::json!({
         "error": format!("Sub-agent not found: {id}")
+    }))
+}
+
+/// GET /api/session/{id}/todos — return current task list for a session.
+async fn get_session_todos(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<Uuid>,
+) -> Json<serde_json::Value> {
+    let store = state.todo_store.read().await;
+    let todos = store.get(&session_id).cloned().unwrap_or_default();
+    Json(serde_json::json!({
+        "data": { "todos": todos }
     }))
 }
 

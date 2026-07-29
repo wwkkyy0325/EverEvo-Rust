@@ -1,13 +1,19 @@
 //! Shared init logic used by both the CLI binary (`main.rs`) and the
 //! Tauri desktop binary (`src-tauri/src/main.rs`).
 
-use std::sync::Arc;
 use crate::app_state::{AppState, InitPhase};
+use std::sync::Arc;
 
 /// Phase 2–4 of init: check LLM availability, wait for config if missing,
 /// then run startup self-checks.
 pub async fn run_init_llm_phase(state: &Arc<AppState>, data_dir: &std::path::Path) {
-    let llm_count = state.llm.read().await.values().filter(|c| c.is_some()).count();
+    let llm_count = state
+        .llm
+        .read()
+        .await
+        .values()
+        .filter(|c| c.is_some())
+        .count();
     println!("[init] LLM check: {} configured provider(s)", llm_count);
 
     if llm_count == 0 {

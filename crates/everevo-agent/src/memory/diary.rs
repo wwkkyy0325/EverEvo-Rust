@@ -44,9 +44,8 @@ impl DiaryManager {
     /// Create a new diary manager. Creates the diary directory if missing.
     pub fn new(diary_dir: impl Into<PathBuf>) -> Result<Self, EverEvoError> {
         let diary_dir: PathBuf = diary_dir.into();
-        std::fs::create_dir_all(&diary_dir).map_err(|e| {
-            EverEvoError::Internal(format!("Failed to create diary dir: {e}"))
-        })?;
+        std::fs::create_dir_all(&diary_dir)
+            .map_err(|e| EverEvoError::Internal(format!("Failed to create diary dir: {e}")))?;
         Ok(Self { diary_dir })
     }
 
@@ -79,7 +78,11 @@ impl DiaryManager {
     }
 
     /// Append entries to a specific date's diary.
-    pub fn append_entries_to_date(&self, date: &str, entries: &[DiaryEntry]) -> Result<(), EverEvoError> {
+    pub fn append_entries_to_date(
+        &self,
+        date: &str,
+        entries: &[DiaryEntry],
+    ) -> Result<(), EverEvoError> {
         let path = self.diary_path(date);
         let mut content = if path.exists() {
             std::fs::read_to_string(&path).unwrap_or_default()
@@ -106,13 +109,12 @@ impl DiaryManager {
     /// List all diary files (for REM phase to read recent days).
     pub fn list_files(&self) -> Result<Vec<PathBuf>, EverEvoError> {
         let mut files = Vec::new();
-        let entries = std::fs::read_dir(&self.diary_dir).map_err(|e| {
-            EverEvoError::Internal(format!("Read diary dir: {e}"))
-        })?;
+        let entries = std::fs::read_dir(&self.diary_dir)
+            .map_err(|e| EverEvoError::Internal(format!("Read diary dir: {e}")))?;
         for entry in entries {
             let entry = entry.map_err(|e| EverEvoError::Internal(format!("Dir entry: {e}")))?;
             let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "md") {
+            if path.extension().is_some_and(|ext| ext == "md") {
                 files.push(path);
             }
         }
@@ -200,7 +202,11 @@ mod tests {
     fn test_trim_prompt() {
         let msgs = vec![
             ("user".into(), "你好".into(), "1".into()),
-            ("assistant".into(), "你好！有什么可以帮你的？".into(), "2".into()),
+            (
+                "assistant".into(),
+                "你好！有什么可以帮你的？".into(),
+                "2".into(),
+            ),
             ("user".into(), "帮我写个 Rust 函数".into(), "3".into()),
         ];
         let prompt = DiaryManager::build_trim_prompt(&msgs);

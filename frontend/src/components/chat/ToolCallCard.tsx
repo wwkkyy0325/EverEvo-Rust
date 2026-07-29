@@ -1,57 +1,54 @@
 import { useState } from 'react';
-import type { ToolCallEvent } from '../../store';
 
-interface ToolCallCardProps {
-  tc: ToolCallEvent;
+interface TcProps {
+  tc: {
+    id: string;
+    name: string;
+    arguments?: unknown;
+    content?: string;
+    is_error?: boolean;
+    status: 'running' | 'done';
+  };
 }
 
-const TOOL_COLORS: Record<string, { border: string; bg: string }> = {
-  shell:  { border: 'border-tool-shell/50',  bg: 'bg-tool-shell/10' },
-  web_search: { border: 'border-tool-web/50', bg: 'bg-tool-web/10' },
-  web_fetch:  { border: 'border-tool-web/50', bg: 'bg-tool-web/10' },
-  file_read:  { border: 'border-tool-file/50', bg: 'bg-tool-file/10' },
-  file_write: { border: 'border-tool-file/50', bg: 'bg-tool-file/10' },
-  code_exec:  { border: 'border-tool-code/50', bg: 'bg-tool-code/10' },
-};
-
-function getToolColors(name: string) {
-  return TOOL_COLORS[name] ?? { border: 'border-border', bg: 'bg-secondary/30' };
+function fmtArgs(args: unknown): string {
+  if (!args || typeof args !== 'object') return '';
+  const entries = Object.entries(args as Record<string, unknown>);
+  if (entries.length === 0) return '';
+  return entries.map(([k, v]) => {
+    const val = typeof v === 'string' ? (v.length > 80 ? v.slice(0, 80) + '…' : v) : JSON.stringify(v);
+    return `${k}: ${val}`;
+  }).join(', ');
 }
 
-export default function ToolCallCard({ tc }: ToolCallCardProps) {
+export default function ToolCallCard({ tc }: TcProps) {
   const [expanded, setExpanded] = useState(false);
-  const colors = getToolColors(tc.name);
+  const argsStr = fmtArgs(tc.arguments);
 
   return (
-    <div className={`max-w-[90%] mx-auto border rounded-lg overflow-hidden text-xs ${colors.border} ${colors.bg}`}>
-      {/* Header — always visible */}
+    <div className="my-0.5">
       <button
         onClick={() => setExpanded(!expanded)}
-        className="w-full flex items-center gap-2 px-3 py-1.5 text-left hover:opacity-80 transition-opacity"
+        className="flex items-center gap-1.5 text-xs font-mono text-muted-foreground hover:text-foreground transition-colors w-full text-left"
       >
-        <span>{tc.status === 'running' ? '⏳' : tc.is_error ? '❌' : '✅'}</span>
-        <span className="font-mono font-bold text-foreground">{tc.name}</span>
-        <span className="text-muted-foreground ml-auto text-[10px]">
-          {tc.status === 'running' ? '执行中...' : expanded ? '收起' : '展开'}
-        </span>
+        <span className="shrink-0">{expanded ? '▾' : '▸'}</span>
+        <span>{tc.status === 'running' ? '⏳' : tc.is_error ? '✗' : '✓'}</span>
+        <span>tool:{tc.name}</span>
+        {argsStr && !expanded && (
+          <span className="text-muted-foreground/60 truncate">({argsStr})</span>
+        )}
       </button>
-
-      {/* Expandable body */}
       {expanded && (
-        <>
-          {tc.arguments != null && (
-            <div className="px-3 py-1 text-muted-foreground font-mono break-all border-t border-inherit">
-              {JSON.stringify(tc.arguments, null, 2)}
-            </div>
+        <div className="mt-1 ml-4 pl-3 border-l-2 border-muted">
+          {argsStr && (
+            <div className="text-xs text-muted-foreground/60 mb-1">({argsStr})</div>
           )}
           {tc.content && (
-            <div className={`px-3 py-1.5 whitespace-pre-wrap break-all border-t border-inherit ${
-              tc.is_error ? 'text-destructive' : 'text-muted-foreground'
-            }`}>
-              {tc.content.slice(0, 500)}{tc.content.length > 500 ? '...' : ''}
+            <div className={`text-xs whitespace-pre-wrap break-all ${tc.is_error ? 'text-destructive' : 'text-muted-foreground'}`}>
+              {tc.content.length > 4000 ? tc.content.slice(0, 4000) + '…' : tc.content}
             </div>
           )}
-        </>
+        </div>
       )}
     </div>
   );

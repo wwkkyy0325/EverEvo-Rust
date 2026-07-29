@@ -94,9 +94,8 @@ impl JobObject {
                     std::io::Error::last_os_error()
                 )));
             }
-            let ret = windows_sys::Win32::System::JobObjects::AssignProcessToJobObject(
-                self.handle, h,
-            );
+            let ret =
+                windows_sys::Win32::System::JobObjects::AssignProcessToJobObject(self.handle, h);
             windows_sys::Win32::Foundation::CloseHandle(h);
             if ret == 0 {
                 return Err(crate::error::SandboxError::JobObject(format!(

@@ -53,11 +53,7 @@ impl<E: EmbeddingModel, S: VectorStore> VectorEngine<E, S> {
     }
 
     /// Search by raw text query (auto-embeds).
-    pub fn search_text(
-        &self,
-        query: &str,
-        top_k: usize,
-    ) -> Result<Vec<ScoredChunk>, EverEvoError> {
+    pub fn search_text(&self, query: &str, top_k: usize) -> Result<Vec<ScoredChunk>, EverEvoError> {
         let query_vector = self.embedder.encode(query)?;
         self.store.search(&query_vector, top_k)
     }
@@ -78,5 +74,40 @@ mod tests {
         let a = vec![1.0, 0.0];
         let b = vec![0.0, 1.0];
         assert!((cosine_similarity(&a, &b) - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_cosine_similarity_opposite() {
+        let a = vec![1.0, 0.0];
+        let b = vec![-1.0, 0.0];
+        assert!((cosine_similarity(&a, &b) + 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_cosine_similarity_different_length() {
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![1.0, 0.0];
+        assert_eq!(cosine_similarity(&a, &b), 0.0);
+    }
+
+    #[test]
+    fn test_cosine_similarity_zero_vector() {
+        let a = vec![0.0, 0.0];
+        let b = vec![1.0, 0.0];
+        assert_eq!(cosine_similarity(&a, &b), 0.0);
+    }
+
+    #[test]
+    fn test_cosine_similarity_both_zero() {
+        let a = vec![0.0, 0.0, 0.0];
+        let b = vec![0.0, 0.0, 0.0];
+        assert_eq!(cosine_similarity(&a, &b), 0.0);
+    }
+
+    #[test]
+    fn test_cosine_similarity_high_dim() {
+        let a: Vec<f32> = (0..128).map(|i| i as f32).collect();
+        let b: Vec<f32> = (0..128).map(|i| i as f32).collect();
+        assert!((cosine_similarity(&a, &b) - 1.0).abs() < 0.001);
     }
 }

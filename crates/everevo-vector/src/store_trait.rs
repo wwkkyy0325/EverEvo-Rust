@@ -10,11 +10,7 @@ pub trait VectorStore: Send + Sync {
     /// Insert chunks into the store.
     fn insert(&self, chunks: Vec<MemoryChunk>) -> Result<(), EverEvoError>;
     /// Search for the top-k most similar chunks by cosine similarity.
-    fn search(
-        &self,
-        query_vector: &[f32],
-        top_k: usize,
-    ) -> Result<Vec<ScoredChunk>, EverEvoError>;
+    fn search(&self, query_vector: &[f32], top_k: usize) -> Result<Vec<ScoredChunk>, EverEvoError>;
     /// Delete chunks by ID.
     fn delete(&self, ids: &[Uuid]) -> Result<(), EverEvoError>;
     /// Total number of chunks in the store.

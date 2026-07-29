@@ -164,7 +164,9 @@ impl Mirror {
 
 fn extract_host(url: &str) -> Option<String> {
     // Simple string-based extraction (avoids heavy url crate in hot paths)
-    let after_scheme = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
+    let after_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
     let host = after_scheme.split('/').next()?;
     // Remove port if present
     let host = host.split(':').next()?;
@@ -172,7 +174,9 @@ fn extract_host(url: &str) -> Option<String> {
 }
 
 fn extract_path(url: &str) -> Option<String> {
-    let after_scheme = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
+    let after_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
     let after_host = after_scheme.find('/')?;
     let path_and_query = &after_scheme[after_host..];
     // Strip query string
@@ -181,7 +185,9 @@ fn extract_path(url: &str) -> Option<String> {
 }
 
 fn extract_path_and_query(url: &str) -> Option<String> {
-    let after_scheme = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
+    let after_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
     let after_host = after_scheme.find('/')?;
     Some(after_scheme[after_host + 1..].to_string())
 }
@@ -230,18 +236,27 @@ impl MirrorRegistry {
                 if let Some(mirrored) = self.mirrors[idx].try_map(url) {
                     let score = self.score(&self.mirrors[idx], region_hint);
                     // Attach score to mirror name for sorting without re-parsing later
-                    scored.push((mirrored, format!("{}__score__{score}", self.mirrors[idx].name)));
+                    scored.push((
+                        mirrored,
+                        format!("{}__score__{score}", self.mirrors[idx].name),
+                    ));
                 }
             }
         }
 
-        // Sort by score descending (higher = better)
+        // Sort by score descending (higher = better), then by name for determinism
         scored.sort_by(|a, b| {
-            let sa = a.1.rsplit("__score__").next()
-                .and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
-            let sb = b.1.rsplit("__score__").next()
-                .and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
-            sb.cmp(&sa)
+            let sa =
+                a.1.rsplit("__score__")
+                    .next()
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .unwrap_or(0);
+            let sb =
+                b.1.rsplit("__score__")
+                    .next()
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .unwrap_or(0);
+            sb.cmp(&sa).then_with(|| a.1.cmp(&b.1))
         });
 
         // Clean up score suffix
@@ -310,7 +325,9 @@ impl MirrorRegistry {
 
         // USTC — general
         self.register(Mirror::new_path_only(
-            "USTC", "https://mirrors.ustc.edu.cn", cn,
+            "USTC",
+            "https://mirrors.ustc.edu.cn",
+            cn,
             &["github.com", "pypi.org", "repo1.maven.org", "nodejs.org"],
         ));
 
@@ -321,7 +338,9 @@ impl MirrorRegistry {
             cn,
         ));
         self.register(Mirror::new_path_only(
-            "Aliyun PyPI", "https://mirrors.aliyun.com/pypi/simple", cn,
+            "Aliyun PyPI",
+            "https://mirrors.aliyun.com/pypi/simple",
+            cn,
             &["pypi.org", "files.pythonhosted.org"],
         ));
 
@@ -330,7 +349,13 @@ impl MirrorRegistry {
             "Tencent Cloud",
             "https://mirrors.cloud.tencent.com",
             cn,
-            &["github.com", "pypi.org", "nodejs.org", "golang.org", "repo1.maven.org"],
+            &[
+                "github.com",
+                "pypi.org",
+                "nodejs.org",
+                "golang.org",
+                "repo1.maven.org",
+            ],
         ));
 
         // Huawei Cloud
@@ -346,7 +371,12 @@ impl MirrorRegistry {
             "NetEase 163",
             "https://mirrors.163.com",
             cn,
-            &["github.com", "pypi.org", "dl-cdn.alpinelinux.org", "repo.mysql.com"],
+            &[
+                "github.com",
+                "pypi.org",
+                "dl-cdn.alpinelinux.org",
+                "repo.mysql.com",
+            ],
         ));
 
         // npmmirror CDN — general-purpose binary mirror for CN (primary)
@@ -369,11 +399,11 @@ impl MirrorRegistry {
     fn register_international_defaults(&mut self) {
         let intl = Region::International;
 
-        // jsDelivr — GitHub raw: user/repo@ref/path
+        // jsDelivr — GitHub raw: user/repo@ref/path (global CDN)
         self.register(Mirror::new_gh_raw(
             "jsDelivr",
             "https://cdn.jsdelivr.net/gh",
-            Region::Auto,
+            intl,
         ));
 
         // Fastly-backed jsDelivr
@@ -392,7 +422,7 @@ impl MirrorRegistry {
         self.register(Mirror::new_path_only(
             "ghproxy",
             "https://ghproxy.com/https://github.com",
-            Region::Auto,
+            intl,
             gh_all,
         ));
     }
@@ -402,14 +432,6 @@ impl Default for MirrorRegistry {
     fn default() -> Self {
         Self::with_defaults()
     }
-}
-
-// ── Utility ─────────────────────────────────────────────────────────────
-
-/// Heuristic: check if we're likely on a Chinese network.
-/// Stub — real implementation would do async connectivity probes.
-pub fn is_likely_china_network() -> bool {
-    false
 }
 
 #[cfg(test)]
@@ -438,10 +460,10 @@ mod tests {
 
     #[test]
     fn test_gh_release_transform() {
-        let mirror = Mirror::new_gh_release("Test", "https://mirror.example.com/releases", Region::Auto);
-        let result = mirror.try_map(
-            "https://github.com/myuser/myrepo/releases/download/v1.0/file.zip",
-        );
+        let mirror =
+            Mirror::new_gh_release("Test", "https://mirror.example.com/releases", Region::Auto);
+        let result =
+            mirror.try_map("https://github.com/myuser/myrepo/releases/download/v1.0/file.zip");
         assert_eq!(
             result,
             Some("https://mirror.example.com/releases/myuser/myrepo/v1.0/file.zip".into())
@@ -451,9 +473,8 @@ mod tests {
     #[test]
     fn test_gh_raw_transform() {
         let mirror = Mirror::new_gh_raw("Test", "https://cdn.example.com/gh", Region::Auto);
-        let result = mirror.try_map(
-            "https://raw.githubusercontent.com/myuser/myrepo/main/readme.md",
-        );
+        let result =
+            mirror.try_map("https://raw.githubusercontent.com/myuser/myrepo/main/readme.md");
         assert_eq!(
             result,
             Some("https://cdn.example.com/gh/myuser/myrepo/main/readme.md".into())
@@ -468,7 +489,10 @@ mod tests {
             Region::Domestic,
         );
         // Should find Tsinghua TUNA and Aliyun mirrors for GitHub releases
-        assert!(!candidates.is_empty(), "Expected domestic mirror candidates");
+        assert!(
+            !candidates.is_empty(),
+            "Expected domestic mirror candidates"
+        );
         for (url, name) in &candidates {
             println!("  {name}: {url}");
         }

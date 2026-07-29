@@ -2,7 +2,9 @@
 
 pub mod app_state;
 pub mod main_impl;
+pub mod orchestration;
 pub mod routes;
+pub mod sandbox_tool;
 pub mod startup_check;
 
 use std::sync::Arc;
@@ -47,21 +49,26 @@ pub async fn build_app(
         .merge(routes::session_routes::router())
         .merge(routes::sandbox_routes::router())
         .merge(routes::domain_routes::router())
-        .merge(routes::kg_routes::router());
+        .merge(routes::kg_routes::router())
+        .merge(routes::mcp_routes::router())
+        .merge(routes::tools_routes::router())
+        .merge(routes::workspace_routes::router())
+        .merge(routes::diary_routes::router())
+        .merge(routes::memory_routes::router());
 
     // Serve frontend static files + SPA fallback if built
     let dist = std::path::Path::new("frontend/dist");
     let router = if dist.join("index.html").exists() {
         tracing::info!("Serving frontend from frontend/dist/");
         api_routes.fallback_service(
-            ServeDir::new("frontend/dist")
-                .fallback(ServeFile::new("frontend/dist/index.html"))
+            ServeDir::new("frontend/dist").fallback(ServeFile::new("frontend/dist/index.html")),
         )
     } else {
         api_routes
     };
 
     let router = router
+        .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)) // 1MB cap
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(Arc::clone(&state));

@@ -29,7 +29,6 @@ impl Database {
     /// with Windows paths. Pass `":memory:"` for in-memory databases.
     pub async fn connect(path: &Path) -> Result<Self, EverEvoError> {
         let options = if path == Path::new(":memory:") {
-            // In-memory DB: use URI with shared cache so pool connections share the same database
             use std::str::FromStr;
             SqliteConnectOptions::from_str("sqlite::memory:?cache=shared")
                 .map_err(|e| EverEvoError::Database(format!("Invalid in-memory URL: {e}")))?
@@ -37,6 +36,7 @@ impl Database {
             SqliteConnectOptions::new()
                 .filename(path)
                 .create_if_missing(true)
+                .foreign_keys(true)
         };
 
         let pool = SqlitePool::connect_with(options)

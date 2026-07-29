@@ -62,7 +62,7 @@ impl ChunkExtractor {
     }
 
     /// Extract entities and relations from a memory fact.
-    /// Phase 2c: replace with LLM call using everevo_kg::build_extraction_prompt().
+    /// Phase 2c: replace with LLM call using knowledge::graph::build_extraction_prompt().
     pub fn extract(&self, fact: &MemoryFact) -> ExtractionResult {
         // Simple keyword-based extraction as MVP
         let entities = extract_entities_basic(fact);
@@ -100,7 +100,7 @@ impl ChunkExtractor {
     pub async fn apply_with_kg(
         results: &[ExtractionResult],
         fact_manager: &FactManager,
-        kg: Option<&mut everevo_kg::KnowledgeGraph>,
+        kg: Option<&mut crate::knowledge::graph::KnowledgeGraph>,
     ) -> Result<ApplyStats, EverEvoError> {
         let stats = Self::apply(results, fact_manager).await?;
 
@@ -108,10 +108,11 @@ impl ChunkExtractor {
         if let Some(kg) = kg {
             for result in results {
                 for entity in &result.entities {
-                    let e = everevo_kg::Entity {
+                    use crate::knowledge::graph::{Entity, EntityType};
+                    let e = Entity {
                         id: entity.id.clone(),
                         label: entity.label.clone(),
-                        entity_type: everevo_kg::EntityType::Concept,
+                        entity_type: EntityType::Concept,
                         properties: std::collections::HashMap::new(),
                         sources: vec![],
                         created_at: chrono::Utc::now(),
@@ -121,11 +122,12 @@ impl ChunkExtractor {
                     kg.upsert_entity(e);
                 }
                 for rel in &result.relations {
-                    let r = everevo_kg::Relation {
+                    use crate::knowledge::graph::{Relation, RelationStatus};
+                    let r = Relation {
                         from: rel.from.clone(),
                         predicate: rel.predicate.clone(),
                         to: rel.to.clone(),
-                        status: everevo_kg::RelationStatus::Active,
+                        status: RelationStatus::Active,
                         valid_from: chrono::Utc::now(),
                         valid_until: None,
                         sources: vec![],
@@ -200,12 +202,19 @@ fn extract_entities_basic(fact: &MemoryFact) -> Vec<ExtractedEntity> {
     let mut i = 0;
     while i < words.len() {
         let word = words[i].trim_matches(|c: char| !c.is_alphanumeric());
-        if word.len() > 2 && word.chars().next().map_or(false, |c| c.is_uppercase()) {
+        if word.len() > 2 && word.chars().next().is_some_and(|c| c.is_uppercase()) {
             let label = if i + 1 < words.len()
-                && words[i + 1].chars().next().map_or(false, |c| c.is_uppercase())
+                && words[i + 1]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_uppercase())
             {
                 // Multi-word proper noun
-                let multi = format!("{} {}", word, words[i + 1].trim_matches(|c: char| !c.is_alphanumeric()));
+                let multi = format!(
+                    "{} {}",
+                    word,
+                    words[i + 1].trim_matches(|c: char| !c.is_alphanumeric())
+                );
                 i += 1;
                 multi
             } else {
@@ -338,10 +347,7 @@ mod tests {
 
     #[test]
     fn test_extract_relations() {
-        let fact = make_fact(
-            "test",
-            "EverEvo uses Rust for sandbox isolation",
-        );
+        let fact = make_fact("test", "EverEvo uses Rust for sandbox isolation");
         let result = ChunkExtractor::new().extract(&fact);
         assert!(!result.relations.is_empty());
     }

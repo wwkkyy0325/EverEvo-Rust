@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use everevo_downloader::Downloader;
 use everevo_downloader::task::{DownloadTask, Priority, Region};
+use everevo_downloader::Downloader;
+use tokio_util::sync::CancellationToken;
 
 use everevo_core::tool::{Tool, ToolOutput};
 use everevo_core::types::RiskLevel;
@@ -86,6 +87,7 @@ impl Tool for DownloadTool {
     async fn execute(
         &self,
         params: serde_json::Value,
+        _cancel: Option<&CancellationToken>,
     ) -> Result<ToolOutput, EverEvoError> {
         let url = params["url"]
             .as_str()
@@ -131,7 +133,9 @@ impl Tool for DownloadTool {
             Ok(r) => r,
             Err(e) => {
                 return Ok(ToolOutput {
-                    content: format!("Download failed: {e}. Network may be unavailable in sandbox environment."),
+                    content: format!(
+                        "Download failed: {e}. Network may be unavailable in sandbox environment."
+                    ),
                     is_error: true,
                 });
             }
@@ -142,14 +146,21 @@ impl Tool for DownloadTool {
                 content: format!(
                     "Downloaded {} bytes to {} in {}ms",
                     result.size_bytes,
-                    result.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+                    result
+                        .path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
                     result.duration_ms
                 ),
                 is_error: false,
             })
         } else {
             Ok(ToolOutput {
-                content: format!("Download failed: {}", result.error_message().unwrap_or("unknown error")),
+                content: format!(
+                    "Download failed: {}",
+                    result.error_message().unwrap_or("unknown error")
+                ),
                 is_error: true,
             })
         }

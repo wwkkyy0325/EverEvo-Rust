@@ -1,5 +1,6 @@
 //! Bootstrap routes — status check + download with SSE progress.
 
+use crate::app_state::AppState;
 use axum::{
     extract::State,
     response::sse::{Event, KeepAlive, Sse},
@@ -9,7 +10,6 @@ use axum::{
 use futures::Stream;
 use std::convert::Infallible;
 use std::sync::Arc;
-use crate::app_state::AppState;
 
 // ── Routes ──────────────────────────────────────────────────────────────
 
@@ -115,7 +115,7 @@ async fn download_handler(
                     yield sse("done", serde_json::json!({"message": "all ready"}));
                     break;
                 }
-                Ok(everevo_bootstrap::pipeline::InitEvent::FatalError(e)) => {
+                Ok(everevo_bootstrap::pipeline::InitEvent::FatalError { error: e }) => {
                     yield sse("error", serde_json::json!({"error": e}));
                     break;
                 }
@@ -137,19 +137,26 @@ fn sse(name: &str, data: serde_json::Value) -> Result<Event, Infallible> {
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-fn build_status_json(
-    status: &everevo_bootstrap::BootstrapResult,
-) -> serde_json::Value {
+fn build_status_json(status: &everevo_bootstrap::BootstrapResult) -> serde_json::Value {
     let assets: Vec<serde_json::Value> = status
         .ready
         .iter()
         .map(|r| asset_json(&r.key, &r.version, "ready", 0, ""))
         .chain(status.missing.iter().map(|m| {
-            asset_json(&m.key, &m.version, "missing", m.size_bytes / 1_048_576, &m.description)
+            asset_json(
+                &m.key,
+                &m.version,
+                "missing",
+                m.size_bytes / 1_048_576,
+                &m.description,
+            )
         }))
-        .chain(status.corrupt.iter().map(|c| {
-            asset_json(&c.key, &c.version, "corrupt", 0, "checksum mismatch")
-        }))
+        .chain(
+            status
+                .corrupt
+                .iter()
+                .map(|c| asset_json(&c.key, &c.version, "corrupt", 0, "checksum mismatch")),
+        )
         .collect();
 
     serde_json::json!({
@@ -162,7 +169,13 @@ fn build_status_json(
     })
 }
 
-fn asset_json(key: &str, version: &str, status: &str, size_mb: u64, desc: &str) -> serde_json::Value {
+fn asset_json(
+    key: &str,
+    version: &str,
+    status: &str,
+    size_mb: u64,
+    desc: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "key": key,
         "name": asset_display_name(key),

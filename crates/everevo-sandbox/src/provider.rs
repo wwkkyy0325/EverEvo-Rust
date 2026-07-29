@@ -1,49 +1,20 @@
 //! TieredSandbox — resolves and delegates to the best available isolation tier.
 //!
 //! Every command passes through a single `check_permission()` chokepoint
-//! before reaching the shell. The chokepoint returns Allow / Deny / Confirm.
-//! At SemiAuto, the caller is expected to present Confirm decisions to the
-//! user and only proceed after explicit approval.
-
-#![allow(clippy::disallowed_methods)]
+//! before reaching the shell.
 
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::time::Instant;
-use tokio::process::Command;
 use tokio::time::timeout;
 
 use everevo_core::sandbox::{ExecutionConfig, ExecutionResult, SandboxProvider};
 use everevo_core::EverEvoError;
 
+use crate::audit::AuditRecord;
 use crate::config::SandboxConfig;
-use crate::permission::{
-    check_permission, PermissionDecision, PermissionLevel, PermissionRules,
-};
+use crate::permission::{check_permission, PermissionDecision, PermissionLevel, PermissionRules};
 use crate::resolved::ShellResolver;
-
-/// Structured audit record — one per sandbox execution.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct AuditRecord {
-    pub timestamp: String,
-    pub shell: String,
-    pub command: String,
-    pub working_dir: String,
-    pub timeout_secs: u64,
-    pub exit_code: i32,
-    pub duration_ms: u64,
-    pub killed_by_timeout: bool,
-    pub stdout_len: usize,
-    pub stderr_len: usize,
-    pub permission_level: String,
-    pub was_confirmed: bool,
-    pub requires_admin: bool,
-    pub network_allowed: bool,
-    pub memory_limit_mb: Option<u64>,
-    pub job_object_applied: bool,
-    pub external_paths: Vec<String>,
-    pub decision: String, // "allow" | "deny" | "confirmed"
-}
 
 pub struct TieredSandbox {
     config: SandboxConfig,
@@ -53,10 +24,10 @@ pub struct TieredSandbox {
 }
 
 impl TieredSandbox {
+    // ── Construction ─────────────────────────────────────────────────
     pub fn new(config: SandboxConfig) -> Result<Self, EverEvoError> {
-        let shell = ShellResolver::resolve().ok_or_else(|| {
-            EverEvoError::Sandbox("No shell available".into())
-        })?;
+        let shell = ShellResolver::resolve()
+            .ok_or_else(|| EverEvoError::Sandbox("No shell available".into()))?;
         std::fs::create_dir_all(&config.sandbox_root).ok();
         Ok(Self {
             config,
@@ -125,33 +96,74 @@ impl TieredSandbox {
         &self.shell.name
     }
 
-    fn shell_args(&self, command: &str) -> Vec<String> {
+    // ── Command building ──────────────────────────────────────────────
+    #[allow(clippy::disallowed_methods)]
+    fn build_command(
+        &self,
+        ec: &ExecutionConfig,
+        working_dir: &PathBuf,
+    ) -> tokio::process::Command {
+        let timeout_secs = ec.timeout_secs.min(self.config.max_timeout_secs);
+        let memory_mb = ec
+            .memory_limit_mb
+            .or(self.config.default_memory_mb)
+            .unwrap_or(512);
+
+        let shell_args = self.shell_args(&ec.command, memory_mb, timeout_secs);
+        let mut cmd = tokio::process::Command::new(&self.shell.executable);
+        cmd.args(&shell_args)
+            .current_dir(working_dir)
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null());
+        let mut path_parts: Vec<String> = self
+            .config
+            .injected_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        path_parts.push(std::env::var("PATH").unwrap_or_default());
+        cmd.env(
+            "PATH",
+            path_parts.join(if cfg!(windows) { ";" } else { ":" }),
+        );
+        for (k, v) in &ec.env_vars {
+            cmd.env(k, v);
+        }
+        for (k, v) in &self.config.injected_env {
+            cmd.env(k, v);
+        }
+        cmd
+    }
+
+    /// Build shell args for the current shell, wrapping WSL commands with
+    /// Linux ulimit for resource isolation.
+    fn shell_args(&self, command: &str, memory_mb: u64, timeout_secs: u64) -> Vec<String> {
         match self.shell.kind {
             crate::resolved::ShellKind::Wsl => {
-                vec!["-e".into(), "sh".into(), "-c".into(), command.into()]
+                let mem_kb = memory_mb * 1024;
+                let wrapped = format!(
+                    "ulimit -v {mem_kb} -t {timeout_secs} -f {mem_kb} -u 64 2>/dev/null; {command}"
+                );
+                vec!["-e".into(), "sh".into(), "-c".into(), wrapped]
             }
-            crate::resolved::ShellKind::GitBash => {
-                vec!["-c".into(), command.into()]
-            }
+            crate::resolved::ShellKind::GitBash => vec!["-c".into(), command.into()],
             crate::resolved::ShellKind::PowerShell => {
                 vec!["-NoProfile".into(), "-Command".into(), command.into()]
             }
-            crate::resolved::ShellKind::Cmd => {
-                vec!["/c".into(), command.into()]
-            }
+            crate::resolved::ShellKind::Cmd => vec!["/c".into(), command.into()],
             crate::resolved::ShellKind::Unix => {
+                // On native Linux, use rlimit (set in unix_limits.rs) + command
                 vec!["-c".into(), command.into()]
             }
         }
     }
 }
 
+// ── SandboxProvider trait impl ─────────────────────────────────────
+
 #[async_trait]
 impl SandboxProvider for TieredSandbox {
-    async fn execute(
-        &self,
-        ec: &ExecutionConfig,
-    ) -> Result<ExecutionResult, EverEvoError> {
+    async fn execute(&self, ec: &ExecutionConfig) -> Result<ExecutionResult, EverEvoError> {
         let start = Instant::now();
         let timeout_secs = ec.timeout_secs.min(self.config.max_timeout_secs);
         let working_dir = ec
@@ -226,7 +238,13 @@ impl SandboxProvider for TieredSandbox {
                         stderr_len: 0,
                         permission_level: self.lock_rules().level.label().into(),
                         was_confirmed: false,
-                        requires_admin: matches!(&decision, PermissionDecision::Confirm { requires_admin: true, .. }),
+                        requires_admin: matches!(
+                            &decision,
+                            PermissionDecision::Confirm {
+                                requires_admin: true,
+                                ..
+                            }
+                        ),
                         network_allowed: ec.network_allowed,
                         memory_limit_mb: None,
                         job_object_applied: false,
@@ -270,43 +288,14 @@ impl SandboxProvider for TieredSandbox {
         );
 
         // ── Shell Execution ─────────────────────────────────────────
-        let shell_args = self.shell_args(&ec.command);
-        let mut cmd = Command::new(&self.shell.executable);
-        cmd.args(&shell_args)
-            .current_dir(&working_dir)
-            .kill_on_drop(true)
-            .stdin(std::process::Stdio::null());
-
-        // PATH injection
-        {
-            let mut parts: Vec<String> = self
-                .config
-                .injected_paths
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect();
-            parts.push(std::env::var("PATH").unwrap_or_default());
-            cmd.env(
-                "PATH",
-                parts.join(if cfg!(windows) { ";" } else { ":" }),
-            );
-            for (k, v) in &ec.env_vars {
-                cmd.env(k, v);
-            }
-            // Inject UTF-8 env vars (PYTHONIOENCODING, etc.) into every command
-            for (k, v) in &self.config.injected_env {
-                cmd.env(k, v);
-            }
-        }
+        let mut cmd = self.build_command(ec, &working_dir);
 
         // Job Objects (Windows)
         #[cfg(windows)]
         let _job = if self.config.use_job_objects {
             match crate::job_object::JobObject::new() {
                 Ok(j) => {
-                    if let Some(mb) =
-                        ec.memory_limit_mb.or(self.config.default_memory_mb)
-                    {
+                    if let Some(mb) = ec.memory_limit_mb.or(self.config.default_memory_mb) {
                         let _ = j.set_memory_limit(mb as usize * 1024 * 1024);
                     }
                     Some(j)
@@ -320,15 +309,12 @@ impl SandboxProvider for TieredSandbox {
             None
         };
 
-        let result =
-            timeout(std::time::Duration::from_secs(timeout_secs), cmd.output()).await;
+        let result = timeout(std::time::Duration::from_secs(timeout_secs), cmd.output()).await;
         let duration_ms = start.elapsed().as_millis() as u64;
 
         // Extract external paths from the decision
         let ext_paths = match &decision {
-            PermissionDecision::Confirm {
-                external_paths, ..
-            } => external_paths.clone(),
+            PermissionDecision::Confirm { external_paths, .. } => external_paths.clone(),
             _ => vec![],
         };
 
@@ -345,7 +331,13 @@ impl SandboxProvider for TieredSandbox {
             stderr_len: 0,
             permission_level: self.lock_rules().level.label().into(),
             was_confirmed,
-            requires_admin: matches!(&decision, PermissionDecision::Confirm { requires_admin: true, .. }),
+            requires_admin: matches!(
+                &decision,
+                PermissionDecision::Confirm {
+                    requires_admin: true,
+                    ..
+                }
+            ),
             network_allowed: ec.network_allowed,
             memory_limit_mb: ec.memory_limit_mb.or(self.config.default_memory_mb),
             job_object_applied: self.config.use_job_objects,
@@ -423,15 +415,22 @@ fn redact_secrets(cmd: &str) -> String {
     result = re_apikey.replace_all(&result, "${1}[REDACTED]").to_string();
 
     // Environment variable assignment with secret values
-    let re_envkey = Regex::new(r#"(?i)((?:ANTHROPIC|OPENAI|DEEPSEEK|COHERE|HF)_?(?:API)?_?KEY\s*=\s*)[\w\.\-_]+"#).unwrap();
+    let re_envkey = Regex::new(
+        r#"(?i)((?:ANTHROPIC|OPENAI|DEEPSEEK|COHERE|HF)_?(?:API)?_?KEY\s*=\s*)[\w\.\-_]+"#,
+    )
+    .unwrap();
     result = re_envkey.replace_all(&result, "${1}[REDACTED]").to_string();
 
     // Authorization header in curl-style -H flags
-    let re_curl_auth = Regex::new(r#"(?i)(-H\s*["']Authorization:\s*Bearer\s+)[\w\.\-_]+"#).unwrap();
-    result = re_curl_auth.replace_all(&result, "${1}[REDACTED]").to_string();
+    let re_curl_auth =
+        Regex::new(r#"(?i)(-H\s*["']Authorization:\s*Bearer\s+)[\w\.\-_]+"#).unwrap();
+    result = re_curl_auth
+        .replace_all(&result, "${1}[REDACTED]")
+        .to_string();
 
     // Generic secret-like patterns: key=xxxxxx (common in CLI tools)
-    let re_keyval = Regex::new(r#"(?i)(--?(?:api[_-]?key|secret|token|password)\s+)[\w\.\-_/+=]+"#).unwrap();
+    let re_keyval =
+        Regex::new(r#"(?i)(--?(?:api[_-]?key|secret|token|password)\s+)[\w\.\-_/+=]+"#).unwrap();
     result = re_keyval.replace_all(&result, "${1}[REDACTED]").to_string();
 
     result
