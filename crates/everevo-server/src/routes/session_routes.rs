@@ -312,6 +312,8 @@ async fn delete_session(
     state.dreaming_engine.flush_on_session_end().await;
     // Destroy sandbox + audit trail first
     state.destroy_sandbox(id).await;
+    // Clean up context snapshots for this session
+    state.context_snapshots.write().await.remove(&id);
     match state.db.delete_session(id).await {
         Ok(()) => Json(serde_json::json!({ "data": { "deleted": true } })),
         Err(e) => Json(serde_json::json!({ "error": e.to_string() })),

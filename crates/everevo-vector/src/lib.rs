@@ -24,6 +24,8 @@
 mod embedding;
 mod engine;
 mod hnsw_store;
+mod model_registry;
+mod multi_collection;
 mod onnx_embedder;
 mod store_trait;
 mod types;
@@ -31,6 +33,8 @@ mod types;
 pub use embedding::{DummyEmbedder, EmbeddingModel};
 pub use engine::{cosine_similarity, VectorEngine};
 pub use hnsw_store::HnswStore;
+pub use model_registry::{ModelMeta, ModelRegistry};
+pub use multi_collection::{MultiCollectionStore, ALL_COLLECTIONS, COLLECTION_CODE, COLLECTION_DOMAIN, COLLECTION_MEMORY, COLLECTION_WIKI};
 pub use onnx_embedder::{check_onnx_model, configure_ort_dylib, OnnxCheckResult, OnnxEmbedder};
 pub use store_trait::VectorStore;
-pub use types::{ChunkType, MemoryChunk, RawChunk, ScoredChunk};
+pub use types::{make_chunk, make_chunk_with_sources, ChunkType, MemoryChunk, RawChunk, ScoredChunk};

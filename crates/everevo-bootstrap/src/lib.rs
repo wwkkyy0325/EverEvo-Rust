@@ -23,6 +23,7 @@
 
 pub mod manifest;
 pub mod pipeline;
+pub mod resource_extractor;
 pub mod runtime;
 
 use std::path::{Path, PathBuf};
@@ -91,8 +92,22 @@ impl Bootstrap {
         let runtime_dir = self.data_dir.join("runtime");
         let models_dir = self.data_dir.join("models");
 
-        let runtime_result = check_manifest(&runtime_dir, &RUNTIMES).await;
-        let model_result = check_manifest(&models_dir, &MODELS).await;
+        let target = detect_target();
+        let all_assets = assets_for_target(&target);
+        // Split into runtimes (Runtime + SystemProvided) and models.
+        let runtimes: Vec<Asset> = all_assets
+            .iter()
+            .filter(|a| !a.is_model())
+            .cloned()
+            .collect();
+        let models: Vec<Asset> = all_assets
+            .iter()
+            .filter(|a| a.is_model())
+            .cloned()
+            .collect();
+
+        let runtime_result = check_manifest(&runtime_dir, &runtimes).await;
+        let model_result = check_manifest(&models_dir, &models).await;
 
         let mut ready = runtime_result.ready;
         ready.extend(model_result.ready);
@@ -187,9 +202,15 @@ impl Asset {
     pub fn is_runtime(&self) -> bool {
         matches!(self.kind, AssetKind::Runtime)
     }
+    pub fn is_system_provided(&self) -> bool {
+        matches!(self.kind, AssetKind::SystemProvided)
+    }
 
     /// All URLs to try for this asset (primary first, then mirrors).
     pub fn all_urls(&self) -> Vec<&str> {
+        if self.is_system_provided() {
+            return vec![];
+        }
         std::iter::once(self.primary_url.as_str())
             .chain(self.mirror_urls.iter().map(|s| s.as_str()))
             .collect()
@@ -198,8 +219,13 @@ impl Asset {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssetKind {
+    /// Downloaded + extracted from CDN (portable runtime).
     Runtime,
+    /// ONNX model files (platform-independent, download only).
     Model,
+    /// Expected to exist on system PATH (e.g., git on macOS/Linux).
+    /// Not downloaded; checked at startup via `which`.
+    SystemProvided,
 }
 
 // ── Manifest Check Logic ────────────────────────────────────────────────
@@ -219,6 +245,16 @@ async fn check_manifest(dir: &Path, assets: &[Asset]) -> CheckOutcome {
     let mut corrupt = Vec::new();
 
     for asset in assets {
+        // SystemProvided assets are not extracted — skip filesystem checks.
+        if asset.is_system_provided() {
+            ready.push(Provisioned {
+                key: asset.key.clone(),
+                version: asset.version.clone(),
+                path: PathBuf::new(),
+            });
+            continue;
+        }
+
         let install_dir = dir.join(&asset.key);
         let entry = manifest.as_ref().ok().and_then(|m| m.get(&asset.key));
 
@@ -346,103 +382,26 @@ async fn verify_dir_checksum(dir: &std::path::Path, expected_sha: &str) -> bool 
     true // Can't verify → assume OK if version match
 }
 
-// ── Runtimes ────────────────────────────────────────────────────────────
+// ── Cross-Platform Asset Definitions ───────────────────────────────────
+//
+// Models are platform-independent (ONNX). Runtimes are per-platform.
+// SystemProvided assets (git on macOS/Linux) are NOT downloaded — they
+// are expected to exist on the system PATH and are checked at startup.
 
 const PYTHON_VERSION: &str = "3.12.8";
+/// python-build-standalone release tag (date, not Python version).
+const PBS_RELEASE: &str = "20241215";
 const NODE_VERSION: &str = "22.12.0";
 const GIT_VERSION: &str = "2.47.1";
 const ONNX_VERSION: &str = "1.24.2";
 
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
-static RUNTIMES: LazyLock<Vec<Asset>> = LazyLock::new(|| {
-    vec![
-        Asset {
-            key: "python".into(),
-            kind: AssetKind::Runtime,
-            version: PYTHON_VERSION.into(),
-            primary_url: format!(
-                "https://cdn.npmmirror.com/binaries/python/{0}/python-{0}-embed-amd64.zip",
-                PYTHON_VERSION
-            ),
-            mirror_urls: vec![
-                format!(
-                    "https://registry.npmmirror.com/-/binary/python/{0}/python-{0}-embed-amd64.zip",
-                    PYTHON_VERSION
-                ),
-            ],
-            extra_files: vec![],
-            sha256: None,
-            size_bytes: 10_000_000, // ~10 MB
-            description: "Python 3.12 embeddable runtime (portable, no install)".into(),
-        },
-        Asset {
-            key: "node".into(),
-            kind: AssetKind::Runtime,
-            version: NODE_VERSION.into(),
-            primary_url: format!(
-                "https://cdn.npmmirror.com/binaries/node/v{0}/node-v{0}-win-x64.zip",
-                NODE_VERSION
-            ),
-            mirror_urls: vec![
-                format!(
-                    "https://npmmirror.com/mirrors/node/v{0}/node-v{0}-win-x64.zip",
-                    NODE_VERSION
-                ),
-            ],
-            extra_files: vec![],
-            sha256: None,
-            size_bytes: 30_000_000, // ~30 MB
-            description: "Node.js portable runtime".into(),
-        },
-        Asset {
-            key: "git".into(),
-            kind: AssetKind::Runtime,
-            version: GIT_VERSION.into(),
-            primary_url: format!(
-                "https://cdn.npmmirror.com/binaries/git-for-windows/v{0}.windows.1/MinGit-{0}-64-bit.zip",
-                GIT_VERSION
-            ),
-            mirror_urls: vec![
-                format!(
-                    "https://npmmirror.com/mirrors/git-for-windows/v{0}.windows.1/MinGit-{0}-64-bit.zip",
-                    GIT_VERSION
-                ),
-            ],
-            extra_files: vec![],
-            sha256: None,
-            size_bytes: 50_000_000, // ~50 MB
-            description: "MinGit portable (minimal Git for Windows)".into(),
-        },
-        Asset {
-            key: "onnxruntime".into(),
-            kind: AssetKind::Runtime,
-            version: ONNX_VERSION.into(),
-            primary_url: format!(
-                "https://github.com/microsoft/onnxruntime/releases/download/v{0}/onnxruntime-win-x64-{0}.zip",
-                ONNX_VERSION
-            ),
-            mirror_urls: vec![
-                // npmmirror CDN — confirmed working in China (direct, no redirect)
-                format!(
-                    "https://cdn.npmmirror.com/binaries/onnxruntime/v{0}/onnxruntime-win-x64-{0}.zip",
-                    ONNX_VERSION
-                ),
-                // npmmirror registry (302 redirect to CDN)
-                format!(
-                    "https://registry.npmmirror.com/-/binary/onnxruntime/v{0}/onnxruntime-win-x64-{0}.zip",
-                    ONNX_VERSION
-                ),
-            ],
-            extra_files: vec![],
-            sha256: None,
-            size_bytes: 71_000_000, // ~71 MB (v1.24.2)
-            description: "ONNX Runtime for model inference".into(),
-        },
-    ]
-});
+// ── Models (platform-independent) ──────────────────────────────────────
 
-static MODELS: LazyLock<Vec<Asset>> = LazyLock::new(|| {
+/// Shared across ALL platforms — ONNX models work everywhere.
+fn shared_models() -> Vec<Asset> {
     vec![
         Asset {
             key: "bge-small-zh".into(),
@@ -457,7 +416,7 @@ static MODELS: LazyLock<Vec<Asset>> = LazyLock::new(|| {
                 AssetFile { filename: "tokenizer_config.json".into(), url: "https://hf-mirror.com/Xenova/bge-small-zh-v1.5/resolve/main/tokenizer_config.json".into(), mirror_url: None },
             ],
             sha256: None,
-            size_bytes: 35_500_000, // ~35 MB ONNX INT8
+            size_bytes: 35_500_000,
             description: "BGE-small-zh — Chinese sentence embedding, 384 dims".into(),
         },
         Asset {
@@ -476,7 +435,6 @@ static MODELS: LazyLock<Vec<Asset>> = LazyLock::new(|| {
             size_bytes: 22_500_000,
             description: "all-MiniLM-L6-v2 — English sentence embedding, 384 dims".into(),
         },
-        // ── EN Reranker (cross-encoder, lightweight) ────────────────
         Asset {
             key: "reranker-en".into(),
             kind: AssetKind::Model,
@@ -493,7 +451,6 @@ static MODELS: LazyLock<Vec<Asset>> = LazyLock::new(|| {
             size_bytes: 90_000_000,
             description: "EN cross-encoder reranker — re-rank retrieved docs".into(),
         },
-        // ── CN Reranker (cross-encoder, bilingual) ──────────────────
         Asset {
             key: "reranker-cn".into(),
             kind: AssetKind::Model,
@@ -511,7 +468,335 @@ static MODELS: LazyLock<Vec<Asset>> = LazyLock::new(|| {
             description: "BGE cross-encoder reranker — bilingual CN+EN re-ranking".into(),
         },
     ]
+}
+
+// ── Platform runtimes ──────────────────────────────────────────────────
+
+fn win_runtimes() -> Vec<Asset> {
+    vec![
+        Asset {
+            key: "python".into(),
+            kind: AssetKind::Runtime,
+            version: PYTHON_VERSION.into(),
+            primary_url: format!(
+                "https://cdn.npmmirror.com/binaries/python/{0}/python-{0}-embed-amd64.zip",
+                PYTHON_VERSION
+            ),
+            mirror_urls: vec![format!(
+                "https://registry.npmmirror.com/-/binary/python/{0}/python-{0}-embed-amd64.zip",
+                PYTHON_VERSION
+            )],
+            extra_files: vec![],
+            sha256: None,
+            size_bytes: 10_000_000,
+            description: "Python 3.12 embeddable runtime (portable, no install)".into(),
+        },
+        Asset {
+            key: "node".into(),
+            kind: AssetKind::Runtime,
+            version: NODE_VERSION.into(),
+            primary_url: format!(
+                "https://cdn.npmmirror.com/binaries/node/v{0}/node-v{0}-win-x64.zip",
+                NODE_VERSION
+            ),
+            mirror_urls: vec![format!(
+                "https://npmmirror.com/mirrors/node/v{0}/node-v{0}-win-x64.zip",
+                NODE_VERSION
+            )],
+            extra_files: vec![],
+            sha256: None,
+            size_bytes: 30_000_000,
+            description: "Node.js portable runtime".into(),
+        },
+        Asset {
+            key: "git".into(),
+            kind: AssetKind::Runtime,
+            version: GIT_VERSION.into(),
+            primary_url: format!(
+                "https://cdn.npmmirror.com/binaries/git-for-windows/v{0}.windows.1/MinGit-{0}-64-bit.zip",
+                GIT_VERSION
+            ),
+            mirror_urls: vec![format!(
+                "https://npmmirror.com/mirrors/git-for-windows/v{0}.windows.1/MinGit-{0}-64-bit.zip",
+                GIT_VERSION
+            )],
+            extra_files: vec![],
+            sha256: None,
+            size_bytes: 50_000_000,
+            description: "MinGit portable (minimal Git for Windows)".into(),
+        },
+        Asset {
+            key: "onnxruntime".into(),
+            kind: AssetKind::Runtime,
+            version: ONNX_VERSION.into(),
+            primary_url: format!(
+                "https://github.com/microsoft/onnxruntime/releases/download/v{0}/onnxruntime-win-x64-{0}.zip",
+                ONNX_VERSION
+            ),
+            mirror_urls: vec![
+                format!("https://cdn.npmmirror.com/binaries/onnxruntime/v{0}/onnxruntime-win-x64-{0}.zip", ONNX_VERSION),
+                format!("https://registry.npmmirror.com/-/binary/onnxruntime/v{0}/onnxruntime-win-x64-{0}.zip", ONNX_VERSION),
+            ],
+            extra_files: vec![],
+            sha256: None,
+            size_bytes: 71_000_000,
+            description: "ONNX Runtime for model inference".into(),
+        },
+    ]
+}
+
+fn mac_runtimes() -> Vec<Asset> {
+    let mut rt = unix_runtimes("x86_64-apple-darwin");
+    rt.push(system_git());
+    rt
+}
+
+fn linux_runtimes() -> Vec<Asset> {
+    let mut rt = unix_runtimes("x86_64-unknown-linux-gnu");
+    rt.push(system_git());
+    rt
+}
+
+fn system_git() -> Asset {
+    Asset {
+        key: "git".into(),
+        kind: AssetKind::SystemProvided,
+        version: "system".into(),
+        primary_url: String::new(),
+        mirror_urls: vec![],
+        extra_files: vec![],
+        sha256: None,
+        size_bytes: 0,
+        description: "Git (system-provided)".into(),
+    }
+}
+
+/// Build runtime assets for a unix target triple.
+/// `pbs_target` is the python-build-standalone target suffix
+/// (e.g. "x86_64-apple-darwin", "x86_64-unknown-linux-gnu").
+fn unix_runtimes(pbs_target: &str) -> Vec<Asset> {
+    let (node_os, node_ext) = if pbs_target.contains("apple") {
+        ("darwin", "tar.gz")
+    } else {
+        ("linux", "tar.xz")
+    };
+    let node_arch = if pbs_target.contains("aarch64") { "arm64" } else { "x64" };
+
+    let (ort_os, ort_ext) = if pbs_target.contains("apple") {
+        ("osx-universal2", "tgz")
+    } else if pbs_target.contains("aarch64") {
+        ("linux-aarch64", "tgz")
+    } else {
+        ("linux-x64", "tgz")
+    };
+
+    vec![
+        Asset {
+            key: "python".into(),
+            kind: AssetKind::Runtime,
+            version: PYTHON_VERSION.into(),
+            primary_url: format!(
+                "https://github.com/astral-sh/python-build-standalone/releases/download/{0}/cpython-{1}+{0}-{2}-install_only.tar.gz",
+                PBS_RELEASE, PYTHON_VERSION, pbs_target
+            ),
+            mirror_urls: vec![],
+            extra_files: vec![],
+            sha256: None,
+            size_bytes: 40_000_000,
+            description: format!("Python {PYTHON_VERSION} standalone ({pbs_target})"),
+        },
+        Asset {
+            key: "node".into(),
+            kind: AssetKind::Runtime,
+            version: NODE_VERSION.into(),
+            primary_url: format!(
+                "https://cdn.npmmirror.com/binaries/node/v{0}/node-v{0}-{1}-{2}.{3}",
+                NODE_VERSION, node_os, node_arch, node_ext
+            ),
+            mirror_urls: vec![format!(
+                "https://npmmirror.com/mirrors/node/v{0}/node-v{0}-{1}-{2}.{3}",
+                NODE_VERSION, node_os, node_arch, node_ext
+            )],
+            extra_files: vec![],
+            sha256: None,
+            size_bytes: 40_000_000,
+            description: format!("Node.js {NODE_VERSION} ({node_os}-{node_arch})"),
+        },
+        Asset {
+            key: "onnxruntime".into(),
+            kind: AssetKind::Runtime,
+            version: ONNX_VERSION.into(),
+            primary_url: format!(
+                "https://github.com/microsoft/onnxruntime/releases/download/v{0}/onnxruntime-{1}-{0}.{2}",
+                ONNX_VERSION, ort_os, ort_ext
+            ),
+            mirror_urls: vec![
+                format!("https://cdn.npmmirror.com/binaries/onnxruntime/v{0}/onnxruntime-{1}-{0}.{2}", ONNX_VERSION, ort_os, ort_ext),
+                format!("https://registry.npmmirror.com/-/binary/onnxruntime/v{0}/onnxruntime-{1}-{0}.{2}", ONNX_VERSION, ort_os, ort_ext),
+            ],
+            extra_files: vec![],
+            sha256: None,
+            size_bytes: 80_000_000,
+            description: format!("ONNX Runtime {ONNX_VERSION} ({ort_os})"),
+        },
+    ]
+}
+
+/// Linux ARM64 runtimes: same as x86_64 but ARM64 URLs (deprecated — use unix_runtimes).
+#[allow(dead_code)]
+fn arm_linux_runtimes() -> Vec<Asset> {
+    let mut rt = vec![
+        Asset {
+            key: "python".into(),
+            kind: AssetKind::Runtime,
+            version: PYTHON_VERSION.into(),
+            primary_url: format!(
+                "https://github.com/astral-sh/python-build-standalone/releases/download/{0}/cpython-{1}+{0}-aarch64-unknown-linux-gnu-install_only.tar.gz",
+                PBS_RELEASE, PYTHON_VERSION
+            ),
+            mirror_urls: vec![],
+            extra_files: vec![],
+            sha256: None,
+            size_bytes: 40_000_000,
+            description: "Python 3.12 standalone (ARM64 Linux)".into(),
+        },
+        Asset {
+            key: "node".into(),
+            kind: AssetKind::Runtime,
+            version: NODE_VERSION.into(),
+            primary_url: format!(
+                "https://cdn.npmmirror.com/binaries/node/v{0}/node-v{0}-linux-arm64.tar.xz",
+                NODE_VERSION
+            ),
+            mirror_urls: vec![format!(
+                "https://npmmirror.com/mirrors/node/v{0}/node-v{0}-linux-arm64.tar.xz",
+                NODE_VERSION
+            )],
+            extra_files: vec![],
+            sha256: None,
+            size_bytes: 40_000_000,
+            description: "Node.js portable runtime (ARM64 Linux)".into(),
+        },
+        Asset {
+            key: "onnxruntime".into(),
+            kind: AssetKind::Runtime,
+            version: ONNX_VERSION.into(),
+            primary_url: format!(
+                "https://github.com/microsoft/onnxruntime/releases/download/v{0}/onnxruntime-linux-aarch64-{0}.tgz",
+                ONNX_VERSION
+            ),
+            mirror_urls: vec![
+                format!("https://cdn.npmmirror.com/binaries/onnxruntime/v{0}/onnxruntime-linux-aarch64-{0}.tgz", ONNX_VERSION),
+            ],
+            extra_files: vec![],
+            sha256: None,
+            size_bytes: 80_000_000,
+            description: "ONNX Runtime for model inference (ARM64 Linux)".into(),
+        },
+    ];
+    // Git is SystemProvided on all Linux variants
+    rt.push(Asset {
+        key: "git".into(),
+        kind: AssetKind::SystemProvided,
+        version: "system".into(),
+        primary_url: String::new(),
+        mirror_urls: vec![],
+        extra_files: vec![],
+        sha256: None,
+        size_bytes: 0,
+        description: "Git (system-provided via apt/dnf)".into(),
+    });
+    rt
+}
+
+// ── Target → assets mapping ────────────────────────────────────────────
+
+/// Maps Rust target triples to their complete asset list (runtimes + models).
+static PLATFORM_ASSETS: LazyLock<HashMap<&str, Vec<Asset>>> = LazyLock::new(|| {
+    let mut map = HashMap::new();
+
+    // ── Windows x64 ────────────────────────────────────────────────
+    let mut win = win_runtimes();
+    win.extend(shared_models());
+    map.insert("x86_64-pc-windows-msvc", win);
+
+    // ── macOS ARM64 ────────────────────────────────────────────────
+    let mut mac_arm = unix_runtimes("aarch64-apple-darwin");
+    mac_arm.push(system_git());
+    mac_arm.extend(shared_models());
+    map.insert("aarch64-apple-darwin", mac_arm);
+
+    // ── macOS x64 ──────────────────────────────────────────────────
+    let mut mac_x64 = mac_runtimes();
+    mac_x64.extend(shared_models());
+    map.insert("x86_64-apple-darwin", mac_x64);
+
+    // ── Linux x64 ──────────────────────────────────────────────────
+    let mut linux = linux_runtimes();
+    linux.extend(shared_models());
+    map.insert("x86_64-unknown-linux-gnu", linux);
+
+    // ── Linux ARM64 ────────────────────────────────────────────────
+    let mut linux_arm = unix_runtimes("aarch64-unknown-linux-gnu");
+    linux_arm.push(system_git());
+    linux_arm.extend(shared_models());
+    map.insert("aarch64-unknown-linux-gnu", linux_arm);
+
+    map
 });
+
+/// Return the full asset list for a given Rust target triple.
+///
+/// Falls back to Windows assets for unknown triples (the most tested path).
+pub fn assets_for_target(target: &str) -> &[Asset] {
+    PLATFORM_ASSETS
+        .get(target)
+        .map(|v| v.as_slice())
+        .unwrap_or_else(|| {
+            // Default to Windows (primary dev platform)
+            PLATFORM_ASSETS
+                .get("x86_64-pc-windows-msvc")
+                .map(|v| v.as_slice())
+                .unwrap_or(&[])
+        })
+}
+
+/// Detect the current host target triple at runtime.
+#[allow(clippy::disallowed_methods)]
+pub fn detect_target() -> String {
+    // rustc -vV prints "host: x86_64-pc-windows-msvc"
+    if let Ok(output) = std::process::Command::new("rustc").arg("-vV").output() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if let Some(triple) = line.strip_prefix("host: ") {
+                return triple.trim().to_string();
+            }
+        }
+    }
+    // Fallback: cfg-based detection (when rustc is not available)
+    if cfg!(target_os = "windows") {
+        "x86_64-pc-windows-msvc"
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "aarch64-apple-darwin"
+    } else if cfg!(target_os = "macos") {
+        "x86_64-apple-darwin"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64-unknown-linux-gnu"
+    } else if cfg!(target_arch = "x86_64") {
+        "x86_64-unknown-linux-gnu"
+    } else {
+        // Generic fallback for unknown Linux targets
+        "x86_64-unknown-linux-gnu"
+    }
+    .to_string()
+}
+
+/// Legacy Windows-only statics — kept for backward compatibility in tests
+/// and for code that hasn't been updated to use `assets_for_target()`.
+#[allow(dead_code)]
+static RUNTIMES: LazyLock<Vec<Asset>> = LazyLock::new(win_runtimes);
+#[allow(dead_code)]
+static MODELS: LazyLock<Vec<Asset>> = LazyLock::new(shared_models);
 
 // ── Errors ──────────────────────────────────────────────────────────────
 

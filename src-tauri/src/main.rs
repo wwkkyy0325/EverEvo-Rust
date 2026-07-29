@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::sync::OnceLock;
+use tauri::Manager;
 
 static SERVER_PORT: OnceLock<u16> = OnceLock::new();
 
@@ -60,7 +61,21 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![server_url])
-        .setup(|_app| {
+        .setup(|app| {
+            // Resolve bundled resource directory for offline asset extraction.
+            // Falls back to empty if no resources were bundled (dev mode).
+            if let Ok(resource_dir) = app.path().resource_dir() {
+                let bundled = resource_dir.join("bundled");
+                if bundled.exists() {
+                    std::env::set_var("EVEREVO_RESOURCE_DIR", &bundled);
+                    eprintln!("[everevo] Bundled resources at {}", bundled.display());
+                } else {
+                    std::env::set_var("EVEREVO_RESOURCE_DIR", "");
+                }
+            } else {
+                std::env::set_var("EVEREVO_RESOURCE_DIR", "");
+            }
+
             // Start Axum backend in background
             std::thread::spawn(|| {
                 let rt = tokio::runtime::Runtime::new().unwrap();

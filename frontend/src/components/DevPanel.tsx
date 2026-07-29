@@ -3,7 +3,7 @@
 // This page is independent of the rest of the UI — add/remove anything without risk.
 
 import { useCallback, useEffect, useState } from 'react';
-import { useStore } from '../store';
+import { useStore, type StageSnapshot } from '../store';
 
 export default function DevPanel() {
   const tools = useStore((s) => s.tools);
@@ -29,7 +29,8 @@ export default function DevPanel() {
   const featureKeys = Object.keys(features).sort();
 
   return (
-    <div className="flex-1 flex flex-col min-h-0 min-w-0 overflow-y-auto scrollbar-none p-6 gap-6">
+    <div className="flex-1 flex flex-col min-h-0 min-w-0 overflow-y-auto p-6 gap-6"
+         style={{scrollbarWidth:'thin',scrollbarColor:'oklch(0.35 0.01 140) transparent'}}>
       {/* ── Header ─────────────────────────────────────────────────── */}
       <div className="flex items-center justify-between">
         <div>
@@ -61,8 +62,15 @@ export default function DevPanel() {
         <StatCard label="Sandbox" value={`${sandboxShell} (${sandboxLevel})`} icon="🛡️" />
       </div>
 
+      {/* ── Startup Check ────────────────────────────────────────────── */}
+      <StartupCheckSection />
+      {/* ── Models ────────────────────────────────────────────────── */}
+      <ModelsSection />
       {/* ── Memory ─────────────────────────────────────────────────── */}
       <MemorySection />
+
+      {/* ── Context Inspector ────────────────────────────────────────── */}
+      <ContextInspector />
 
       {/* ── MCP Servers ─────────────────────────────────────────────── */}
       <Section title="🔌 MCP Servers" count={mcpServers.length}>
@@ -208,6 +216,74 @@ function Empty({ text }: { text: string }) {
   return <p className="text-xs text-muted-foreground italic">{text}</p>;
 }
 
+function ModelsSection() {
+  const [models, setModels] = useState<any>(null);
+  const [reindexMsg, setReindexMsg] = useState('');
+
+  const fetchModels = useCallback(async () => {
+    try {
+      const res = await fetch('/api/models');
+      setModels(await res.json());
+    } catch { /* ignore */ }
+  }, []);
+
+  useEffect(() => { fetchModels(); }, [fetchModels]);
+
+  const activateModel = async (name: string) => {
+    try {
+      await fetch('/api/models/activate', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: name }),
+      });
+      setTimeout(fetchModels, 1000);
+    } catch { /* ignore */ }
+  };
+
+  const triggerReindex = async () => {
+    setReindexMsg('Reindexing...');
+    try {
+      const res = await fetch('/api/vector/reindex', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ collection: 'memory' }),
+      });
+      const data = await res.json();
+      setReindexMsg(`Done: ${data.processed} facts in ${data.duration_ms}ms`);
+      setTimeout(() => setReindexMsg(''), 5000);
+    } catch { setReindexMsg('Failed'); }
+  };
+
+  if (!models) return null;
+
+  return (
+    <Section title="🧠 Embedding Models" count={models.models?.length || 0}>
+      <div className="grid grid-cols-1 gap-2 mb-3">
+        {models.models?.map((m: any) => (
+          <div key={m.name} className={`flex items-center justify-between px-3 py-2 rounded border ${m.active ? 'border-primary/50 bg-primary/5' : 'border-border bg-secondary/30'}`}>
+            <div>
+              <span className="text-sm font-medium">{m.display_name}</span>
+              <span className="text-xs text-muted-foreground ml-2">{m.dim}d</span>
+              {m.active && <span className="text-[10px] ml-2 px-1 py-0.5 rounded bg-primary/20 text-primary">active</span>}
+            </div>
+            {!m.active && (
+              <button onClick={() => activateModel(m.name)}
+                className="text-[10px] px-2 py-1 rounded bg-secondary hover:bg-secondary/80">
+                Switch
+              </button>
+            )}
+          </div>
+        ))}
+      </div>
+      <div className="flex items-center gap-2">
+        <button onClick={triggerReindex}
+          className="text-[10px] px-2 py-1 rounded bg-accent/20 hover:bg-accent/30">
+          🔄 Reindex (current model)
+        </button>
+        {reindexMsg && <span className="text-[10px] text-muted-foreground">{reindexMsg}</span>}
+      </div>
+    </Section>
+  );
+}
+
 function MemorySection() {
   const [memStatus, setMemStatus] = useState<any>(null);
   const [loading, setLoading] = useState(false);
@@ -264,6 +340,206 @@ function MemorySection() {
           🔄 Refresh
         </button>
       </div>
+    </Section>
+  );
+}
+
+function StartupCheckSection() {
+  const report = useStore((s) => s.startupReport);
+  if (!report) return null;
+
+  const icon = (s: string) => s === 'pass' ? '✅' : s === 'warn' ? '⚠️' : '❌';
+  const color = (s: string) => s === 'pass' ? 'text-success' : s === 'warn' ? 'text-warning' : 'text-destructive';
+
+  return (
+    <Section title="🩺 Startup Check" count={report.checks?.length || 0}>
+      <div className="grid grid-cols-4 gap-2 mb-3">
+        <StatCard label="Pass" value={String(report.pass)} icon="✅" ok={true} />
+        <StatCard label="Warn" value={String(report.warn)} icon="⚠️" ok={report.warn === 0} />
+        <StatCard label="Fail" value={String(report.fail)} icon="❌" ok={report.fail === 0} />
+        <StatCard label="Total" value={`${report.total_ms}ms`} icon="⏱️" />
+      </div>
+      <div className="text-xs space-y-1 max-h-64 overflow-y-auto">
+        {report.checks?.map((c: any, i: number) => (
+          <div key={i} className={`flex items-center gap-2 px-2 py-1 rounded ${c.status === 'fail' ? 'bg-destructive/10' : c.status === 'warn' ? 'bg-warning/5' : 'bg-secondary/30'}`}>
+            <span className="shrink-0">{icon(c.status)}</span>
+            <span className={`font-medium ${color(c.status)}`}>{c.name}</span>
+            <span className="text-muted-foreground flex-1 truncate">{c.detail}</span>
+            <span className="text-[10px] text-muted-foreground shrink-0">{c.latency_ms}ms</span>
+          </div>
+        ))}
+      </div>
+      {report.actual_port && (
+        <div className="text-[10px] text-muted-foreground mt-2">
+          Server port: {report.actual_port}
+        </div>
+      )}
+    </Section>
+  );
+}
+
+// ── Context Inspector ───────────────────────────────────────────────────────
+
+function ContextInspector() {
+  const snapshot = useStore((s) => s.contextSnapshot);
+  const loading = useStore((s) => s.contextSnapshotLoading);
+  const loadContextSnapshot = useStore((s) => s.loadContextSnapshot);
+  const activeSessionId = useStore((s) => s.activeSessionId);
+
+  const [expandedStages, setExpandedStages] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    if (activeSessionId) loadContextSnapshot();
+  }, [activeSessionId]);
+
+  const toggleExpand = (name: string) => {
+    setExpandedStages(prev => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  };
+
+  if (!snapshot) {
+    return (
+      <Section title="🔍 Context Inspector" count={0}>
+        <Empty text={activeSessionId
+          ? "No context snapshot yet — send a message first"
+          : "Select a session to inspect context"
+        } />
+        {activeSessionId && (
+          <button
+            onClick={loadContextSnapshot}
+            className="mt-2 text-[10px] px-2 py-1 rounded bg-secondary hover:bg-secondary/80 transition-colors"
+          >
+            {loading ? 'Loading...' : '🔄 Fetch'}
+          </button>
+        )}
+      </Section>
+    );
+  }
+
+  const sortedStages = [...snapshot.stages].sort((a, b) => a.priority - b.priority);
+  const budgetPct = Math.min(snapshot.budget_used_pct, 100);
+  const gaugeColor = budgetPct > 100 ? 'bg-destructive'
+    : budgetPct > 80 ? 'bg-warning'
+    : 'bg-success';
+
+  return (
+    <Section title="🔍 Context Inspector" count={snapshot.stages.length}>
+      {/* Budget gauge */}
+      <div className="mb-3">
+        <div className="flex justify-between text-xs mb-1">
+          <span className="text-muted-foreground">Context Budget</span>
+          <span className="font-medium">
+            ~{snapshot.total_estimated_tokens.toLocaleString()} / {snapshot.max_context_tokens.toLocaleString()} tokens
+          </span>
+        </div>
+        <div className="w-full h-2 bg-secondary rounded overflow-hidden">
+          <div
+            className={`h-full ${gaugeColor} transition-all duration-300`}
+            style={{ width: `${budgetPct}%` }}
+          />
+        </div>
+        <div className="text-[10px] text-muted-foreground mt-0.5">
+          Turn #{snapshot.turn_number} • {snapshot.captured_at}
+        </div>
+      </div>
+
+      {/* Flags */}
+      {snapshot.flags.length > 0 && (
+        <div className="mb-3 p-2 bg-destructive/10 border border-destructive/30 rounded">
+          <div className="text-xs font-medium text-destructive mb-1">⚠ Detected Issues</div>
+          {snapshot.flags.map((f, i) => (
+            <div key={i} className="text-[11px] text-muted-foreground leading-relaxed">• {f}</div>
+          ))}
+        </div>
+      )}
+
+      {/* Per-stage rows */}
+      <div className="space-y-1">
+        {sortedStages.map((stage: StageSnapshot) => {
+          const pct = snapshot.max_context_tokens > 0
+            ? (stage.estimated_tokens / snapshot.max_context_tokens) * 100
+            : 0;
+          const barColor = stage.status === 'missing' ? 'bg-destructive'
+            : stage.status === 'oversized' || stage.status === 'warn' ? 'bg-warning'
+            : 'bg-success';
+          const rowBg = stage.status === 'missing' ? 'bg-destructive/10'
+            : stage.status === 'oversized' ? 'bg-warning/5'
+            : stage.status === 'warn' ? 'bg-warning/5'
+            : 'bg-secondary/30';
+          const isExpanded = expandedStages.has(stage.stage_name);
+
+          return (
+            <div key={stage.stage_name} className={`rounded px-2 py-1.5 ${rowBg}`}>
+              {/* Row header */}
+              <div
+                className="flex items-center gap-2 cursor-pointer"
+                onClick={() => stage.content_preview && toggleExpand(stage.stage_name)}
+              >
+                <span className="shrink-0 text-xs">
+                  {stage.status === 'missing' ? '❌'
+                    : stage.status === 'oversized' ? '⚠️'
+                    : stage.status === 'warn' ? '⚠️'
+                    : '✅'}
+                </span>
+                <div className="flex-1 min-w-0">
+                  <div className="text-xs font-medium truncate">
+                    {stage.stage_name}
+                    {stage.label && <span className="text-muted-foreground ml-1">{stage.label}</span>}
+                  </div>
+                </div>
+                <span className="text-[10px] text-muted-foreground shrink-0">
+                  ~{stage.estimated_tokens} tok • P{stage.priority}
+                </span>
+              </div>
+
+              {/* Percentage bar */}
+              {stage.contributed && pct > 0 && (
+                <div className="w-full h-1 bg-secondary rounded overflow-hidden mt-1">
+                  <div
+                    className={`h-full ${barColor} transition-all`}
+                    style={{ width: `${Math.min(pct, 100)}%` }}
+                  />
+                </div>
+              )}
+
+              {/* Status text */}
+              <div className="text-[10px] mt-0.5">
+                {!stage.contributed && (
+                  <span className="text-warning">Skipped — stage returned no content</span>
+                )}
+                {stage.contributed && (
+                  <span className={stage.status === 'ok' ? 'text-success' : stage.status === 'oversized' ? 'text-warning' : 'text-muted-foreground'}>
+                    {stage.message_count} message{stage.message_count !== 1 ? 's' : ''}
+                    {stage.status === 'oversized' && ` • ${pct.toFixed(0)}% of budget`}
+                  </span>
+                )}
+              </div>
+
+              {/* Expandable content preview */}
+              {isExpanded && stage.content_preview && (
+                <div className="mt-1 p-2 bg-background/50 rounded border border-border/50">
+                  <pre className="text-[10px] leading-relaxed whitespace-pre-wrap break-all max-h-48 overflow-y-auto text-muted-foreground font-mono">
+                    {stage.content_preview.length > 500
+                      ? stage.content_preview.slice(0, 500) + '\n\n... (truncated for display)'
+                      : stage.content_preview}
+                  </pre>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      <button
+        onClick={loadContextSnapshot}
+        className="mt-3 text-[10px] px-2 py-1 rounded bg-secondary hover:bg-secondary/80 transition-colors"
+      >
+        {loading ? 'Loading...' : '🔄 Refresh'}
+      </button>
     </Section>
   );
 }

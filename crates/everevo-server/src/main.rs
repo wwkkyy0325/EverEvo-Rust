@@ -399,10 +399,14 @@ async fn cmd_bootstrap(config: &everevo_core::AppConfig, check_only: bool) {
                         }
                     };
                     let bs = std::sync::Arc::new(bootstrap);
+                    let resource_dir = std::env::var("EVEREVO_RESOURCE_DIR")
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_default();
                     let pipeline = everevo_bootstrap::pipeline::InitPipeline::new(
                         config.data_dir.clone(),
                         bs,
                         dl,
+                        resource_dir,
                     );
 
                     let mut events = pipeline.events();

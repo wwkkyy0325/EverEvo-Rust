@@ -3,6 +3,22 @@ import { create } from 'zustand';
 
 // ── Types ───────────────────────────────────────────────────────────────
 
+export interface StartupCheckItem {
+  name: string;
+  status: "pass" | "warn" | "fail";
+  detail: string;
+  latency_ms: number;
+}
+
+export interface StartupCheck {
+  pass: number;
+  warn: number;
+  fail: number;
+  total_ms: number;
+  actual_port: number;
+  checks: StartupCheckItem[];
+}
+
 export interface SessionItem {
   id: string; title: string; created_at: string; updated_at: string;
   message_count: number; last_message: string | null; pinned?: boolean;
@@ -75,6 +91,11 @@ interface ChatState {
   sandboxShell: string; sandboxLevel: string; sandboxPermissionKey: string;
   availableLevels: Array<{ key: string; label: string }>; activeSessions: number;
   toolCount: number;
+  /** Startup check report from last boot (null = not yet run). */
+  startupReport: StartupCheck | null;
+  /** Latest context injection snapshot for the active session. */
+  contextSnapshot: ContextSnapshot | null;
+  contextSnapshotLoading: boolean;
   /** Full tool list from GET /api/tools (built-in + MCP). */
   tools: ToolInfo[];
   mcpServers: McpServerInfo[];
@@ -136,6 +157,32 @@ interface ChatState {
   planTask: string | null;
   /** Enter or exit plan mode. */
   setPlanMode: (active: boolean, task?: string | null) => void;
+  /** Fetch latest context injection snapshot for active session. */
+  loadContextSnapshot: () => Promise<void>;
+}
+
+/** Context injection observability — per-stage snapshot. */
+export interface StageSnapshot {
+  stage_name: string;
+  priority: number;
+  contributed: boolean;
+  label: string | null;
+  message_count: number;
+  content_preview: string | null;
+  estimated_tokens: number;
+  status: string; // "ok" | "warn" | "missing" | "oversized"
+}
+
+/** Complete context snapshot for one turn of assembly. */
+export interface ContextSnapshot {
+  session_id: string;
+  turn_number: number;
+  captured_at: string;
+  stages: StageSnapshot[];
+  total_estimated_tokens: number;
+  max_context_tokens: number;
+  budget_used_pct: number;
+  flags: string[];
 }
 
 // ── Store ───────────────────────────────────────────────────────────────
@@ -150,6 +197,7 @@ export const useStore = create<ChatState>((set, get) => ({
     { key: 'semi_auto', label: '半自动' }, { key: 'fully_auto', label: '全自动' },
   ],
   activeSessions: 0, toolCount: 22, tools: [], mcpServers: [],
+  startupReport: null, contextSnapshot: null, contextSnapshotLoading: false,
   features: {}, llmConfigured: false, llmCount: 0, llmProviderIds: [], serverVersion: '',
   auditRecords: [], auditTotal: 0,
 
@@ -441,6 +489,16 @@ export const useStore = create<ChatState>((set, get) => ({
             return;
           }
 
+          // ── session_cleared → clear local messages (server-side /clear) ──
+          if (currentEvent === 'session_cleared') {
+            set({
+              streaming: false, draftId: null, abortController: null,
+              messages: [],
+            });
+            get().loadSessions();
+            return;
+          }
+
           // ── Legacy thinking / token events ─────────────────────────
           if (currentEvent === 'thinking') {
             const last = lastBlock();
@@ -500,10 +558,26 @@ export const useStore = create<ChatState>((set, get) => ({
         toolCount: tools.count ?? 19,
         tools: tools.tools ?? [],
         mcpServers: health.mcp_servers ?? [],
+        startupReport: health.startup_check ?? null,
         features: health.features ?? {},
         workspacePath: ws.path ?? null,
       });
     } catch { /* ignore */ }
+  },
+
+  // ── Context injection snapshot ──────────────────────────────────────
+  loadContextSnapshot: async () => {
+    const { activeSessionId } = get();
+    if (!activeSessionId) return;
+    set({ contextSnapshotLoading: true });
+    try {
+      const res = await fetch(`/api/sessions/${activeSessionId}/context`);
+      const json = await res.json();
+      if (json.error) { set({ contextSnapshot: null, contextSnapshotLoading: false }); return; }
+      set({ contextSnapshot: json, contextSnapshotLoading: false });
+    } catch {
+      set({ contextSnapshot: null, contextSnapshotLoading: false });
+    }
   },
 
   // ── Session status (mode + state for daemon sessions) ──────────────

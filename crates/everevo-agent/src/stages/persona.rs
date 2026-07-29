@@ -85,20 +85,30 @@ impl ContextStage for PersonaStage {
             ));
         }
 
+        // ── Language directive (bilingual thinking/output separation) ──
+        parts.push(language_directive(&profile));
+
+        // ── Communication + thinking style ──
         parts.push(format!(
-            "Communication: {verbosity} {formality}, {lang}\n\
-             Thinking: {decomp}, {theory}\n\
+            "## Communication Style\n\
+             Verbosity: {verbosity}\n\
+             Formality: {formality}\n\
              Code-first: {code_first}",
             verbosity = profile.communication_style.verbosity,
             formality = profile.communication_style.formality,
-            lang = profile.communication_style.language,
-            decomp = profile.thinking_paradigm.decomposition,
-            theory = profile.thinking_paradigm.theory_vs_practice,
             code_first = if profile.communication_style.code_first {
                 "yes (show code before explanation)"
             } else {
                 "no (explain before code)"
             },
+        ));
+
+        parts.push(format!(
+            "## Thinking Paradigm\n\
+             Decomposition: {decomp}\n\
+             Theory vs Practice: {theory}",
+            decomp = profile.thinking_paradigm.decomposition,
+            theory = profile.thinking_paradigm.theory_vs_practice,
         ));
 
         let content = parts.join("\n\n");
@@ -110,11 +120,58 @@ impl ContextStage for PersonaStage {
     }
 }
 
+// ── Language Directive ────────────────────────────────────────────────────
+
+/// Generate a language behavior directive based on the profile's language.
+///
+/// When the user language is Chinese ("zh-CN"), this injects the bilingual
+/// pattern: reasoning and code in English, conversation in Chinese. This is
+/// the same approach Claude Code uses — pure system prompt engineering,
+/// not an API feature.
+///
+/// For English-only profiles, the directive is a simple all-English instruction.
+fn language_directive(profile: &PersonaProfile) -> String {
+    match profile.communication_style.language.as_str() {
+        "zh-CN" => "\
+## Language\n\n\
+- **Reasoning & thinking:** think through problems in English. Internal reasoning, \
+code analysis, and planning happen in English even when the final reply is in Chinese.\n\
+- **Code & artifacts:** identifiers, comments, commit messages, and all written docs \
+(`design.md`, `changelog.md`, task docs) are in English.\n\
+- **Conversation:** replies and Q&A are in Chinese by default. Follow the user's \
+language if they switch mid-conversation.\n\
+- **Markers:** keep status markers, headings, and structural labels in English \
+regardless of reply language."
+            .to_string(),
+
+        _ => "\
+## Language\n\n\
+- All communication, code, and documentation in English."
+            .to_string(),
+    }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 fn load_profile(path: &Path) -> Option<PersonaProfile> {
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
+    match std::fs::read_to_string(path) {
+        Ok(content) => serde_json::from_str(&content).ok(),
+        Err(_) => {
+            // Auto-create default profile so Persona stage is never silent-missing.
+            let default = PersonaProfile::default();
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(json) = serde_json::to_string_pretty(&default) {
+                let _ = std::fs::write(path, &json);
+                tracing::info!(
+                    path = %path.display(),
+                    "Created default persona profile"
+                );
+            }
+            Some(default)
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -129,6 +186,24 @@ mod tests {
         assert_eq!(p.communication_style.language, "zh-CN");
         assert_eq!(p.communication_style.verbosity, "concise");
         assert_eq!(p.thinking_paradigm.decomposition, "top-down");
+    }
+
+    #[test]
+    fn test_language_directive_zh_cn() {
+        let profile = PersonaProfile::default();
+        let directive = language_directive(&profile);
+        assert!(directive.contains("Reasoning & thinking"));
+        assert!(directive.contains("think through problems in English"));
+        assert!(directive.contains("replies and Q&A are in Chinese"));
+        assert!(directive.contains("identifiers, comments, commit messages"));
+    }
+
+    #[test]
+    fn test_language_directive_en() {
+        let mut profile = PersonaProfile::default();
+        profile.communication_style.language = "en".into();
+        let directive = language_directive(&profile);
+        assert!(directive.contains("All communication, code, and documentation in English"));
     }
 
     #[test]
@@ -167,8 +242,13 @@ mod tests {
     }
 
     #[test]
-    fn test_load_profile_missing_file_returns_none() {
-        assert!(load_profile(Path::new("nonexistent.json")).is_none());
+    fn test_load_profile_missing_file_creates_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profile.json");
+        // File doesn't exist — should auto-create and return defaults.
+        let profile = load_profile(&path).unwrap();
+        assert_eq!(profile.communication_style.language, "zh-CN");
+        assert!(path.exists()); // File was created on disk
     }
 
     #[test]
@@ -200,12 +280,25 @@ mod tests {
         assert_eq!(fragment.label, "Persona Profile");
         assert_eq!(fragment.messages.len(), 1);
         let content = &fragment.messages[0].content;
+
+        // System prompt injection
         assert!(content.contains("Custom prompt here."));
-        assert!(content.contains("concise casual"));
-        assert!(content.contains("zh-CN"));
-        assert!(content.contains("top-down"));
-        assert!(content.contains("practice"));
+
+        // Language directive (zh-CN → bilingual thinking/output)
+        assert!(content.contains("## Language"));
+        assert!(content.contains("Reasoning & thinking"));
+        assert!(content.contains("think through problems in English"));
+
+        // Communication style (new structured format)
+        assert!(content.contains("## Communication Style"));
+        assert!(content.contains("Verbosity: concise"));
+        assert!(content.contains("Formality: casual"));
         assert!(content.contains("Code-first: yes"));
+
+        // Thinking paradigm
+        assert!(content.contains("## Thinking Paradigm"));
+        assert!(content.contains("Decomposition: top-down"));
+        assert!(content.contains("Theory vs Practice: practice"));
     }
 
     #[test]
@@ -237,6 +330,17 @@ mod tests {
         let content = &fragment.messages[0].content;
         // Should NOT contain "User Persona" since system_prompt_injection is empty
         assert!(!content.contains("User Persona"));
-        assert!(content.contains("detailed formal"));
+
+        // Language directive (en → all-English)
+        assert!(content.contains("All communication, code, and documentation in English"));
+
+        // Communication style
+        assert!(content.contains("## Communication Style"));
+        assert!(content.contains("Verbosity: detailed"));
+        assert!(content.contains("Formality: formal"));
+        assert!(content.contains("Code-first: no"));
+
+        // Thinking paradigm
+        assert!(content.contains("Decomposition: bottom-up"));
     }
 }

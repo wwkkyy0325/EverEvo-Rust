@@ -357,7 +357,7 @@ async fn rag_search(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let rag = state.rag_pipeline.as_ref()
         .ok_or_else(|| EverEvoError::Internal("RAG pipeline not initialized".into()))?;
-    let results = rag.search(&query.q, query.top_k)?;
+    let results = rag.search_in("memory", &query.q, query.top_k)?;
     Ok(Json(serde_json::json!({
         "real_embeddings": rag.real_embeddings,
         "results": results.iter().map(|r| serde_json::json!({
@@ -378,8 +378,8 @@ async fn rag_ingest(
     use everevo_vector::ChunkType;
     let rag = state.rag_pipeline.as_ref()
         .ok_or_else(|| EverEvoError::Internal("RAG pipeline not initialized".into()))?;
-    let chunk = make_chunk(body, ChunkType::Fact, vec![]);
-    rag.ingest(vec![chunk])?;
+    let chunk = make_chunk(body, ChunkType::Fact);
+    rag.ingest_into("memory", vec![chunk])?;
     Ok(Json(serde_json::json!({ "ingested": 1 })))
 }
 

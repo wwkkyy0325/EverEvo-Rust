@@ -233,6 +233,9 @@ pub struct InitPipeline {
     marker_path: PathBuf,
     /// Ensures only one pipeline runs at a time (startup + SSE route).
     run_lock: Mutex<()>,
+    /// Directory containing bundled `.tar.zst` assets (Tauri resources).
+    /// Empty = no bundled assets; fall back to download path.
+    resource_dir: PathBuf,
 }
 
 impl InitPipeline {
@@ -240,7 +243,12 @@ impl InitPipeline {
     ///
     /// The broadcast channel uses 256 capacity, matching the downloader's
     /// own event channel.
-    pub fn new(data_dir: PathBuf, bootstrap: Arc<Bootstrap>, downloader: Arc<Downloader>) -> Self {
+    pub fn new(
+        data_dir: PathBuf,
+        bootstrap: Arc<Bootstrap>,
+        downloader: Arc<Downloader>,
+        resource_dir: PathBuf,
+    ) -> Self {
         let runtime_mgr = RuntimeManager::new(&data_dir);
         let marker_path = data_dir.join(".everevo_init");
         let (event_tx, _) = broadcast::channel(256);
@@ -252,6 +260,7 @@ impl InitPipeline {
             event_tx,
             marker_path,
             run_lock: Mutex::new(()),
+            resource_dir,
         }
     }
 
@@ -307,6 +316,35 @@ impl InitPipeline {
                 "Init marker found but assets incomplete — re-provisioning"
             );
             let _ = tokio::fs::remove_file(&self.marker_path).await;
+        }
+
+        // ── Phase 1.5: Try bundled assets first (local extraction, seconds) ──
+        if !self.resource_dir.as_os_str().is_empty() {
+            let extractor =
+                crate::resource_extractor::ResourceExtractor::new(&self.resource_dir, &self.data_dir);
+            if extractor.has_bundled_assets() {
+                tracing::info!(
+                    dir = %self.resource_dir.display(),
+                    "Bundled assets detected — extracting from bundle"
+                );
+                self.emit(InitEvent::Checking);
+                match extractor.extract_all(&self.event_tx).await {
+                    Ok(_) => {
+                        self.write_marker().await?;
+                        self.emit(InitEvent::AllDone);
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Bundle extraction failed — falling back to downloader");
+                        // Fall through to Phase 2 (download path)
+                    }
+                }
+            } else {
+                tracing::info!(
+                    dir = %self.resource_dir.display(),
+                    "No bundled assets found in resource dir — will download"
+                );
+            }
         }
 
         // ── Phase 2: Bootstrap check done, assets missing ───────

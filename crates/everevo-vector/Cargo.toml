@@ -23,6 +23,9 @@ futures.workspace = true
 # InMemory flat search (which didn't scale past 100K vectors).
 hnsw_rs = "0.3"
 
+# bincode — compact binary serialization for UUID mapping files.
+bincode = "1.3"
+
 # Fastembed — local ONNX embedding (uses ort internally)
 # Falls back to DummyEmbedder when feature is off or model missing
 fastembed = { version = "5", optional = true }

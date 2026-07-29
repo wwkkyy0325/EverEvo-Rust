@@ -12,7 +12,7 @@
 //! | 3. Ranking | Identifier-weighted: fn×4 > struct×3.5 > enum×2.5 > mod×2 | GrepRAG identifier-weighted re-rank |
 //! | 4. Progressive Disclosure | Compact (file:line+sig) default; Expanded on request | Claude Code search→read pattern |
 
-use crate::scanner::scan_file;
+use super::scanner::scan_file;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use std::collections::HashMap;

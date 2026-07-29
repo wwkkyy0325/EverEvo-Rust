@@ -28,7 +28,7 @@ use everevo_core::EverEvoError;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use everevo_code_search::{format_search_results, CodeIndex, SearchConfig};
+use crate::code_search::{format_search_results, CodeIndex, SearchConfig};
 
 // ── CodeSearch tool ──────────────────────────────────────────────────────
 

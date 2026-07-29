@@ -13,7 +13,8 @@
 //! | `sandbox` | Thin sandbox re-exports from everevo-sandbox |
 //! | `subagent_context` | Sub-agent context assembly |
 
-pub mod knowledge;
+pub mod code_search;
+pub use everevo_knowledge as knowledge;
 pub mod llm;
 pub mod llmwiki;
 pub mod loop_;
@@ -35,8 +36,7 @@ pub use loop_::{AgentEvent, AgentLoop, EscalationLevel, ProactivityState};
 // LLM providers
 pub use llm::{HttpClient, MockLlmProvider};
 
-// Knowledge layer
-pub use knowledge::graph;
+// Knowledge layer — re-exported from everevo-knowledge crate
 pub use llmwiki::LlmwikiManager;
 pub use rag::{make_chunk, RagPipeline};
 

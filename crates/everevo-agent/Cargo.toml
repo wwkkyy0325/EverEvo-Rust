@@ -22,11 +22,13 @@ everevo-vector = { path = "../everevo-vector" }
 # Workflow engine
 everevo-workflow = { path = "../everevo-workflow" }
 
-# Code search
-everevo-code-search = { path = "../everevo-code-search" }
+# Code search — inline (was everevo-code-search crate)
+sqlx = { workspace = true, features = ["sqlite"] }
+walkdir = "2"
+regex = "1"
 
-# Knowledge graph (Oxigraph — now inline, was everevo-kg crate)
-oxigraph = { version = "0.4", default-features = false }
+# Knowledge layer (extracted from inline — was everevo-kg + everevo-domain crates)
+everevo-knowledge = { path = "../everevo-knowledge" }
 
 tokio = { workspace = true, features = ["process"] }
 serde.workspace = true

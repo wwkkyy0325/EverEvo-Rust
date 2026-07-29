@@ -1,5 +1,6 @@
 import { useRef, useState, useEffect, useCallback, type KeyboardEvent } from 'react';
 import { useStore } from '../../store';
+import CommandPicker from './CommandPicker';
 
 interface ChatInputProps {
   onSend: (text: string) => void;
@@ -8,9 +9,15 @@ interface ChatInputProps {
 
 export default function ChatInput({ onSend, disabled }: ChatInputProps) {
   const [text, setText] = useState('');
+  const [pickerVisible, setPickerVisible] = useState(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const streaming = useStore((s) => s.streaming);
   const abortStream = useStore((s) => s.abortStream);
+
+  // Show picker when text starts with /, hide when it doesn't
+  useEffect(() => {
+    setPickerVisible(text.trimStart().startsWith('/'));
+  }, [text]);
 
   // Auto-height: cap at 25% viewport
   useEffect(() => {
@@ -21,8 +28,36 @@ export default function ChatInput({ onSend, disabled }: ChatInputProps) {
     ta.style.height = Math.min(ta.scrollHeight, maxH) + 'px';
   }, [text]);
 
+  const handleCommandSelect = useCallback(
+    (command: string) => {
+      setText(command + ' ');
+      setPickerVisible(false);
+      taRef.current?.focus();
+    },
+    [],
+  );
+
+  const handleCommandDismiss = useCallback(() => {
+    setPickerVisible(false);
+  }, []);
+
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {
+      // If picker is visible, delegate arrow/enter/escape/tab to it
+      if (pickerVisible) {
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Tab') {
+          return; // let CommandPicker handle via document listener
+        }
+        if (e.key === 'Enter' && !e.shiftKey) {
+          return; // let CommandPicker select
+        }
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          setPickerVisible(false);
+          return;
+        }
+      }
+
       if (e.key === 'Escape' && streaming) {
         e.preventDefault();
         abortStream();
@@ -34,29 +69,40 @@ export default function ChatInput({ onSend, disabled }: ChatInputProps) {
         if (!text.trim() || disabled) return;
         onSend(text.trim());
         setText('');
+        setPickerVisible(false);
         if (taRef.current) taRef.current.style.height = 'auto';
       }
     },
-    [text, disabled, onSend, streaming, abortStream],
+    [text, disabled, onSend, streaming, abortStream, pickerVisible],
   );
 
   const doSend = () => {
     if (!text.trim() || disabled) return;
     onSend(text.trim());
     setText('');
+    setPickerVisible(false);
     if (taRef.current) taRef.current.style.height = 'auto';
   };
 
   return (
     <footer className="p-3 bg-background shrink-0">
-      <div className="max-w-3xl mx-auto flex flex-col gap-2">
+      <div className="max-w-3xl mx-auto flex flex-col gap-2 relative">
+        {/* Command picker — positioned above the textarea */}
+        {pickerVisible && !disabled && (
+          <CommandPicker
+            text={text}
+            onSelect={handleCommandSelect}
+            onDismiss={handleCommandDismiss}
+          />
+        )}
+
         {/* Textarea — full width, no scrollbar */}
         <textarea
           ref={taRef}
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder={disabled ? '回复中...' : '输入消息... (Enter 发送, Shift+Enter 换行)'}
+          placeholder={disabled ? '回复中...' : '输入消息... (Enter 发送, Shift+Enter 换行, / 命令)'}
           disabled={disabled}
           rows={1}
           className="w-full bg-secondary border border-border rounded-lg px-4 py-2.5 text-sm

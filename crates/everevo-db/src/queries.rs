@@ -65,6 +65,17 @@ impl Database {
         Ok(())
     }
 
+    /// Clear all messages in a session without deleting the session itself.
+    /// Used by `/clear` slash command.
+    pub async fn delete_session_messages(&self, id: Uuid) -> Result<(), EverEvoError> {
+        sqlx::query("DELETE FROM messages WHERE session_id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| EverEvoError::Database(format!("Delete messages failed: {e}")))?;
+        Ok(())
+    }
+
     pub async fn update_session_title(&self, id: Uuid, title: &str) -> Result<(), EverEvoError> {
         sqlx::query("UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?")
             .bind(title)

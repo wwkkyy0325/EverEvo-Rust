@@ -64,6 +64,11 @@ pub struct AppConfig {
     /// Each entry: { name, command, args[] }
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
+
+    /// Preferred embedding model name. Must match a subdirectory under
+    /// `data/models/`. If not set, the first discovered model is used.
+    #[serde(default)]
+    pub embedding_model: Option<String>,
 }
 
 /// Configuration for an MCP server connection.
@@ -137,6 +142,7 @@ impl Default for AppConfig {
             default_permission_level: default_permission_level_str(),
             mcp_servers: Vec::new(),
             workspace_dir: None,
+            embedding_model: None,
         }
     }
 }

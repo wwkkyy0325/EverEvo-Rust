@@ -190,6 +190,26 @@ impl RuntimeManager {
         self.add_if_extracted(&mut env, "node", &[&[]]);
         self.add_if_extracted(&mut env, "git", &[&["bin"], &["cmd"], &["mingw64", "bin"]]);
         self.add_if_extracted(&mut env, "onnxruntime", &[&["lib"]]);
+
+        // SystemProvided fallback: on macOS/Linux, check system Git if not bundled
+        #[cfg(not(windows))]
+        if !env.installed.contains(&"git".to_string()) {
+            let git_check = std::process::Command::new("which")
+                .arg("git")
+                .output();
+            if let Ok(out) = git_check {
+                if out.status.success() {
+                    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    tracing::info!(
+                        path = %path,
+                        "System Git detected — using system-provided Git"
+                    );
+                    env.installed.push("git".into());
+                    // Do NOT add to paths — system Git is already on PATH
+                }
+            }
+        }
+
         Ok(env)
     }
 

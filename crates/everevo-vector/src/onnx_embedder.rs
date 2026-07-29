@@ -145,8 +145,6 @@ impl OnnxEmbedder {
         let model_dir = models_dir.join(model_key);
         let data_dir = models_dir
             .parent()
-            .unwrap_or(&models_dir)
-            .parent()
             .unwrap_or(std::path::Path::new("data"));
         let inner = if is_ort_compatible(data_dir) {
             match load_fastembed(model_key, &model_dir) {

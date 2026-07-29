@@ -44,9 +44,29 @@ async fn handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> 
         })
         .collect();
 
+    let startup_check = state.startup_report.read().await;
+    let startup_json = startup_check.as_ref().map(|r| {
+        serde_json::json!({
+            "pass": r.pass,
+            "warn": r.warn,
+            "fail": r.fail,
+            "total_ms": r.total_ms,
+            "actual_port": r.actual_port,
+            "checks": r.items.iter().map(|i| {
+                serde_json::json!({
+                    "name": i.name,
+                    "status": i.status,
+                    "detail": i.detail,
+                    "latency_ms": i.latency_ms,
+                })
+            }).collect::<Vec<_>>(),
+        })
+    });
+
     Json(serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
+        "startup_check": startup_json,
         "llm": {
             "configured": llm_count,
             "primary_available": primary_configured,

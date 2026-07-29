@@ -9,6 +9,11 @@
     "beforeDevCommand": "cd frontend && npm run dev",
     "beforeBuildCommand": "cd frontend && npm run build"
   },
+  "bundle": {
+    "resources": {
+      "../resources/bundled/**/*": "bundled/"
+    }
+  },
   "app": {
     "windows": [
       {

@@ -69,6 +69,34 @@ pub struct RawChunk {
     pub chunk_type: ChunkType,
 }
 
+// ── Chunk Constructors ─────────────────────────────────────────────────────
+
+/// Create a `RawChunk` with no source pointers (fresh system-generated data).
+pub fn make_chunk(content: String, chunk_type: ChunkType) -> RawChunk {
+    RawChunk {
+        id: Uuid::new_v4(),
+        content,
+        source_pointers: vec![],
+        projection: ProjectionMetadata::new(env!("CARGO_PKG_VERSION"), "agent", vec![], 0.5),
+        chunk_type,
+    }
+}
+
+/// Create a `RawChunk` with source pointers (traceable to original context).
+pub fn make_chunk_with_sources(
+    content: String,
+    chunk_type: ChunkType,
+    sources: Vec<SourcePointer>,
+) -> RawChunk {
+    RawChunk {
+        id: Uuid::new_v4(),
+        content,
+        source_pointers: sources,
+        projection: ProjectionMetadata::new(env!("CARGO_PKG_VERSION"), "agent", vec![], 0.5),
+        chunk_type,
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

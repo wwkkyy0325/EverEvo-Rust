@@ -191,10 +191,9 @@ impl LlmwikiManager {
             if content.is_empty() {
                 continue;
             }
-            rag.ingest(vec![crate::rag::make_chunk(
+            rag.ingest_into("memory", vec![crate::rag::make_chunk(
                 content,
                 everevo_vector::ChunkType::Fact,
-                vec![],
             )])?;
             count += 1;
         }

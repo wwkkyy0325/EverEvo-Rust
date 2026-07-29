@@ -1,8 +1,20 @@
-//! Memory context stage — injects relevant memory facts via RRF-ranked retrieval.
+//! Memory context stage — injects relevant memory facts via hybrid retrieval.
 //!
-//! Instead of blindly injecting the first N lines of MEMORY.md,
-//! this stage performs a keyword-based relevance match against
-//! the current user message and injects only the most relevant facts.
+//! ## Retrieval Pipeline (4-stage)
+//!
+//! 1. **Keyword RRF** — exact word overlap with user message
+//! 2. **Jaccard RRF** — set overlap between query words and fact text
+//! 3. **Vector RRF** — cosine similarity via HNSW (if RAG available)
+//! 4. **MMR Reranking** — Maximal Marginal Relevance for diversity
+//!
+//! Stages 1-3 are fused via Reciprocal Rank Fusion (k=60). Stage 4 applies
+//! MMR to ensure retrieved facts are diverse (not all about the same topic).
+//!
+//! ## Knowledge Graph Entity Expansion
+//!
+//! Query terms are expanded with matching KG entity labels and their 1-hop
+//! relations (Mem0 entity-centric retrieval pattern). After retrieval,
+//! entity metadata is injected alongside facts.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -15,6 +27,7 @@ use uuid::Uuid;
 
 use crate::knowledge::graph::KnowledgeGraph;
 use crate::memory::facts::FactManager;
+use crate::rag::RagPipeline;
 
 /// Injects relevant memory facts + knowledge graph context into the LLM context pipeline.
 ///
@@ -29,6 +42,8 @@ pub struct MemoryStage {
     trace_id: Option<Uuid>,
     /// Optional knowledge graph for entity/relation context injection.
     knowledge_graph: Option<Arc<std::sync::RwLock<KnowledgeGraph>>>,
+    /// Optional RAG pipeline for vector similarity search.
+    rag_pipeline: Option<Arc<RagPipeline>>,
 }
 
 impl MemoryStage {
@@ -39,6 +54,7 @@ impl MemoryStage {
             telemetry: None,
             trace_id: None,
             knowledge_graph: None,
+            rag_pipeline: None,
         }
     }
 
@@ -59,7 +75,21 @@ impl MemoryStage {
         self
     }
 
-    /// Find facts relevant to the user's current message via RRF fusion.
+    /// Attach the RAG pipeline for vector similarity search.
+    pub fn with_rag(mut self, rag: Arc<RagPipeline>) -> Self {
+        self.rag_pipeline = Some(rag);
+        self
+    }
+
+    /// Find facts relevant to the user's current message via hybrid RRF fusion.
+    ///
+    /// Three-layer retrieval:
+    /// 1. Keyword RRF — exact word overlap
+    /// 2. Jaccard RRF — set overlap
+    /// 3. Vector RRF — cosine similarity (if RAG available)
+    ///
+    /// Plus KG entity expansion: query terms are expanded with matching entity
+    /// labels and their related entities (Mem0 entity-centric retrieval pattern).
     fn find_relevant(&self, user_message: &str) -> Vec<MemoryIndexEntry> {
         let start = Instant::now();
 
@@ -71,10 +101,43 @@ impl MemoryStage {
         }
 
         let query_lower = user_message.to_lowercase();
-        let query_words: Vec<&str> = query_lower
+        let mut query_terms: Vec<String> = query_lower
             .split_whitespace()
             .filter(|w| w.len() > 2)
+            .map(|s| s.to_string())
             .collect();
+
+        // ── KG Entity Expansion: enrich query with entity labels ──
+        if let Some(ref kg_lock) = self.knowledge_graph {
+            if let Ok(kg) = kg_lock.read() {
+                let orig_terms = query_terms.clone();
+                for term in &orig_terms {
+                    let entities = kg.search(term);
+                    for entity in entities.iter().take(3) {
+                        for label_word in entity.label.split_whitespace() {
+                            if label_word.len() > 2 {
+                                query_terms.push(label_word.to_lowercase());
+                            }
+                        }
+                        // 1-hop expansion: related entity labels
+                        for rel in kg.outgoing(&entity.id).iter().take(2) {
+                            let related = kg.search(&rel.to);
+                            for r in related.iter().take(1) {
+                                for rw in r.label.split_whitespace() {
+                                    if rw.len() > 2 {
+                                        query_terms.push(rw.to_lowercase());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                query_terms.sort_unstable();
+                query_terms.dedup();
+            }
+        }
+
+        let query_words: Vec<&str> = query_terms.iter().map(|s| s.as_str()).collect();
 
         let mut keyword_scores: Vec<(usize, f32)> = Vec::new();
         let mut content_scores: Vec<(usize, f32)> = Vec::new();
@@ -109,6 +172,28 @@ impl MemoryStage {
         keyword_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         content_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
+        // ── Vector similarity (3rd RRF layer) ──
+        let vector_scores: Vec<(usize, f32)> = if let Some(ref rag) = self.rag_pipeline {
+            if let Ok(results) = rag.search_in("memory", user_message, self.max_facts * 2) {
+                results
+                    .iter()
+                    .filter_map(|sc| {
+                        // Match vector result back to fact by content prefix
+                        let fact_idx = all_facts.iter().position(|f| {
+                            let chunk_content = format!("{}: {}", f.name, f.content);
+                            sc.chunk.content.starts_with(&f.name)
+                                || sc.chunk.content == chunk_content
+                        });
+                        fact_idx.map(|i| (i, sc.score))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
         let k: f32 = 60.0;
         let mut fused: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
         for (rank, (i, _)) in keyword_scores.iter().enumerate() {
@@ -117,10 +202,24 @@ impl MemoryStage {
         for (rank, (i, _)) in content_scores.iter().enumerate() {
             *fused.entry(*i).or_default() += 1.0 / (k + (rank + 1) as f32);
         }
+        for (rank, (i, score)) in vector_scores.iter().enumerate() {
+            // Use both rank position AND raw similarity score in RRF
+            *fused.entry(*i).or_default() += 1.0 / (k + (rank + 1) as f32) + (*score * 0.1);
+        }
 
         let mut ranked: Vec<(usize, f32)> = fused.into_iter().collect();
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        ranked.truncate(self.max_facts);
+
+        // ── MMR Reranking: diversity-aware selection ──
+        // Retrieve top-20, then select top-k with MMR to ensure diverse results.
+        let recall_pool = ranked.iter().take(self.max_facts * 4).map(|(i, _)| *i).collect::<Vec<_>>();
+        let mmr_selected = mmr_rerank(
+            &recall_pool,
+            &ranked,
+            &all_facts,
+            self.max_facts,
+        );
+        ranked = mmr_selected;
 
         let results: Vec<MemoryIndexEntry> = ranked
             .into_iter()
@@ -297,4 +396,87 @@ impl ContextStage for MemoryStage {
             messages: vec![LlmMessage::user(&content)],
         })
     }
+}
+
+// ── MMR Reranker ────────────────────────────────────────────────────────
+
+/// Maximal Marginal Relevance — diversity-aware result selection.
+///
+/// Balances relevance (from RRF score) with novelty (inverse similarity to
+/// already-selected results). Prevents the "all results are about the same
+/// topic" failure mode of pure relevance ranking.
+///
+/// λ=0.7 → 70% relevance, 30% diversity. Industry standard (LangChain default).
+///
+/// Since we don't have full-text vectors for all facts in MemoryStage, we use
+/// Jaccard similarity over fact content as a lightweight diversity proxy.
+/// This is O(k × N) where k = target count, N = pool size — negligible for k=5, N=20.
+fn mmr_rerank(
+    pool: &[usize],
+    scored: &[(usize, f32)],
+    all_facts: &[everevo_core::memory::MemoryFact],
+    k: usize,
+) -> Vec<(usize, f32)> {
+    if pool.is_empty() || k == 0 {
+        return vec![];
+    }
+
+    // Build lookup: fact_index → RRF score
+    let score_map: std::collections::HashMap<usize, f32> = scored.iter().cloned().collect();
+
+    let lambda: f32 = 0.7;
+
+    // Pre-compute fact text for Jaccard similarity.
+    let fact_texts: Vec<String> = pool.iter().filter_map(|&i| {
+        all_facts.get(i).map(|f| format!("{} {}", f.name, f.content).to_lowercase())
+    }).collect();
+
+    let mut selected: Vec<usize> = Vec::new();
+    let mut remaining: Vec<usize> = pool.to_vec();
+
+    // First pick: highest RRF score.
+    if let Some(&best) = remaining.first() {
+        selected.push(best);
+        remaining.retain(|&i| i != best);
+    }
+
+    while selected.len() < k && !remaining.is_empty() {
+        let mut best_idx = 0usize;
+        let mut best_mmr = f32::NEG_INFINITY;
+
+        for (j, &cand) in remaining.iter().enumerate() {
+            let relevance = score_map.get(&cand).copied().unwrap_or(0.0);
+            let novelty: f32 = if selected.is_empty() {
+                1.0
+            } else {
+                let cand_text = fact_texts.get(pool.iter().position(|&i| i == cand).unwrap_or(0));
+                let max_sim = selected.iter().filter_map(|&s| {
+                    let sel_pos = pool.iter().position(|&i| i == s)?;
+                    let sel_text = fact_texts.get(sel_pos)?;
+                    let c_text = cand_text?;
+                    Some(jaccard_similarity(c_text, sel_text))
+                }).fold(0.0f32, f32::max);
+                1.0 - max_sim
+            };
+            let mmr = lambda * relevance + (1.0 - lambda) * novelty;
+            if mmr > best_mmr {
+                best_mmr = mmr;
+                best_idx = j;
+            }
+        }
+
+        let chosen = remaining.remove(best_idx);
+        selected.push(chosen);
+    }
+
+    selected.into_iter().map(|i| (i, score_map.get(&i).copied().unwrap_or(0.0))).collect()
+}
+
+/// Jaccard similarity between two texts (word-level set overlap).
+fn jaccard_similarity(a: &str, b: &str) -> f32 {
+    let words_a: std::collections::HashSet<&str> = a.split_whitespace().filter(|w| w.len() > 2).collect();
+    let words_b: std::collections::HashSet<&str> = b.split_whitespace().filter(|w| w.len() > 2).collect();
+    let intersection = words_a.intersection(&words_b).count();
+    let union = words_a.len() + words_b.len() - intersection;
+    if union == 0 { 0.0 } else { intersection as f32 / union as f32 }
 }

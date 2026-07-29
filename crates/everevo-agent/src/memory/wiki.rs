@@ -15,6 +15,7 @@ use everevo_core::llm::{LlmMessage, LlmProvider};
 use everevo_core::memory::MemoryFact;
 use everevo_core::EverEvoError;
 
+use crate::rag::RagPipeline;
 use crate::HttpClient;
 
 use super::facts::FactManager;
@@ -24,6 +25,8 @@ pub struct WikiGenerator {
     wiki_dir: PathBuf,
     /// Optional LLM for content generation. Falls back to template-based generation.
     llm: Option<Arc<HttpClient>>,
+    /// Optional RAG pipeline for vectorizing generated wiki pages.
+    rag: std::sync::Mutex<Option<Arc<RagPipeline>>>,
 }
 
 impl WikiGenerator {
@@ -35,6 +38,7 @@ impl WikiGenerator {
         Ok(Self {
             wiki_dir,
             llm: None,
+            rag: std::sync::Mutex::new(None),
         })
     }
 
@@ -42,6 +46,11 @@ impl WikiGenerator {
     pub fn with_llm(mut self, llm: Arc<HttpClient>) -> Self {
         self.llm = Some(llm);
         self
+    }
+
+    /// Set the RAG pipeline after construction (thread-safe, for post-init wiring).
+    pub fn set_rag(&self, rag: Arc<RagPipeline>) {
+        *self.rag.lock().unwrap_or_else(|e| e.into_inner()) = Some(rag);
     }
 
     /// Generate wiki pages from all facts, using the full pipeline.
@@ -135,6 +144,19 @@ impl WikiGenerator {
 
         std::fs::write(&path, &content)
             .map_err(|e| EverEvoError::Internal(format!("Create wiki page {filename}: {e}")))?;
+
+        // Vectorize into wiki namespace for semantic search.
+        if let Ok(guard) = self.rag.lock() {
+            if let Some(ref rag) = *guard {
+                let chunk = crate::rag::make_chunk(
+                    format!("{}: {}", fact.name, content),
+                    everevo_vector::ChunkType::Fact,
+                );
+                if let Err(e) = rag.ingest_into("wiki", vec![chunk]) {
+                    tracing::warn!(error = %e, "Wiki vector indexing failed (non-fatal)");
+                }
+            }
+        }
 
         tracing::info!(page = %filename, fact = %fact.name, "Wiki page created");
         Ok(())

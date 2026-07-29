@@ -63,34 +63,169 @@ async fn handle_chat(
             .await
             .map_err(|e| e.message)?;
 
-    // ── 1.5. /plan command — user-initiated plan mode ───────────────
-    let effective_message = if let Some(plan_task) = req.message.strip_prefix("/plan") {
-        let plan_task = plan_task.trim();
-        if plan_task == "cancel" || plan_task == "exit" {
-            state.plan_mode_sessions.write().await.remove(&session_id);
-            let _ = tx.send(Ok(Event::default()
-                .event("plan_mode_exited")
-                .json_data(serde_json::json!({"session_id": session_id.to_string()}))
-                .unwrap_or_else(|_| Event::default().event("error")))).await;
-            tracing::info!(%session_id, "Plan mode cancelled by user");
-            "Plan mode cancelled. Normal operations resumed.".to_string()
-        } else {
-            state.plan_mode_sessions.write().await.insert(session_id, "semi_auto".to_string());
-            let _ = tx.send(Ok(Event::default()
-                .event("plan_mode_entered")
-                .json_data(serde_json::json!({"session_id": session_id.to_string(), "task": plan_task}))
-                .unwrap_or_else(|_| Event::default().event("error")))).await;
-            tracing::info!(%session_id, task = plan_task, "Plan mode entered via /plan command");
-            if plan_task.is_empty() {
-                "Plan mode entered via /plan. Explore the codebase, design an approach, \
-                 and write a plan. Write tools are blocked until the user approves.".to_string()
-            } else {
+    // ── 1.5. Slash command dispatch ──────────────────────────────────
+    let effective_message = if let Some((cmd, args)) = state.commands.parse(&req.message) {
+        match cmd {
+            "help" => {
+                let help_text = state.commands.help_text();
+                let _ = tx.send(Ok(Event::default()
+                    .event("slash_command")
+                    .json_data(serde_json::json!({"command": "help"}))
+                    .unwrap_or_else(|_| Event::default().event("error")))).await;
+                help_text
+            }
+            "clear" => {
+                // Delete all messages in this session and start fresh.
+                if let Err(e) = state.db.delete_session_messages(session_id).await {
+                    tracing::warn!(%session_id, error = %e, "Failed to clear session messages");
+                }
+                let _ = tx.send(Ok(Event::default()
+                    .event("session_cleared")
+                    .json_data(serde_json::json!({"session_id": session_id.to_string()}))
+                    .unwrap_or_else(|_| Event::default().event("error")))).await;
+                tracing::info!(%session_id, "Session cleared via /clear");
+                "Conversation history cleared. Starting fresh.".to_string()
+            }
+            "compact" => {
+                let topic = if args.is_empty() { "recent discussion" } else { args };
+                let _ = tx.send(Ok(Event::default()
+                    .event("slash_command")
+                    .json_data(serde_json::json!({"command": "compact", "topic": topic}))
+                    .unwrap_or_else(|_| Event::default().event("error")))).await;
                 format!(
-                    "Plan mode entered for: {plan_task}\n\n\
-                     Explore the codebase, design an approach, and write a plan. \
-                     Write tools (shell, write_file, download) are blocked until approval."
+                    "Summarize and compact the conversation history, preserving key context. \
+                     Focus on: {topic}.\n\n\
+                     Generate a structured summary covering decisions, code changes, \
+                     and open issues. The compacted summary will replace the full history."
                 )
             }
+            "memory" => {
+                let _ = tx.send(Ok(Event::default()
+                    .event("slash_command")
+                    .json_data(serde_json::json!({"command": "memory", "query": args}))
+                    .unwrap_or_else(|_| Event::default().event("error")))).await;
+                if args.is_empty() {
+                    "Search my persistent memory for relevant facts, preferences, \
+                     and past decisions. List the most relevant findings."
+                        .to_string()
+                } else {
+                    format!(
+                        "Search my persistent memory for: {args}\n\n\
+                         Find relevant facts, preferences, and past decisions. \
+                         Report findings with their sources."
+                    )
+                }
+            }
+            "config" => {
+                let status = state
+                    .startup_report
+                    .read()
+                    .await
+                    .as_ref()
+                    .map(|r| {
+                        format!(
+                            "Port: {}\nChecks: {} pass / {} warn / {} fail\nData: {}\nONNX: loaded\nLLM: configured",
+                            r.actual_port, r.pass, r.warn, r.fail,
+                            state.config.data_dir.display()
+                        )
+                    })
+                    .unwrap_or_else(|| "Config not yet loaded".to_string());
+                let _ = tx.send(Ok(Event::default()
+                    .event("slash_command")
+                    .json_data(serde_json::json!({"command": "config"}))
+                    .unwrap_or_else(|_| Event::default().event("error")))).await;
+                format!("## Current Configuration\n\n{status}")
+            }
+            "plan" => {
+                let plan_task = args;
+                if plan_task == "cancel" || plan_task == "exit" {
+                    state.plan_mode_sessions.write().await.remove(&session_id);
+                    let _ = tx.send(Ok(Event::default()
+                        .event("plan_mode_exited")
+                        .json_data(serde_json::json!({"session_id": session_id.to_string()}))
+                        .unwrap_or_else(|_| Event::default().event("error")))).await;
+                    tracing::info!(%session_id, "Plan mode cancelled by user");
+                    "Plan mode cancelled. Normal operations resumed.".to_string()
+                } else {
+                    state.plan_mode_sessions.write().await.insert(session_id, "semi_auto".to_string());
+                    let _ = tx.send(Ok(Event::default()
+                        .event("plan_mode_entered")
+                        .json_data(serde_json::json!({"session_id": session_id.to_string(), "task": plan_task}))
+                        .unwrap_or_else(|_| Event::default().event("error")))).await;
+                    tracing::info!(%session_id, task = plan_task, "Plan mode entered via /plan command");
+                    if plan_task.is_empty() {
+                        "Plan mode entered via /plan. Explore the codebase, design an approach, \
+                         and write a plan. Write tools are blocked until the user approves.".to_string()
+                    } else {
+                        format!(
+                            "Plan mode entered for: {plan_task}\n\n\
+                             Explore the codebase, design an approach, and write a plan. \
+                             Write tools (shell, write_file, download) are blocked until approval."
+                        )
+                    }
+                }
+            }
+            "tasks" => {
+                let todos = state.todo_store.read().await;
+                let items = todos.get(&session_id);
+                let summary = if let Some(items) = items {
+                    if items.is_empty() {
+                        "No active tasks. Use TodoWrite to create a task list.".to_string()
+                    } else {
+                        let lines: Vec<String> = items
+                            .iter()
+                            .map(|t| {
+                                let icon = match t.status.as_str() {
+                                    "completed" => "✅",
+                                    "in_progress" => "🔄",
+                                    _ => "⏳",
+                                };
+                                format!("{icon} **{}** — {}", t.content, t.status)
+                            })
+                            .collect();
+                        format!("## Current Tasks\n\n{}\n\nUse TodoWrite to manage.", lines.join("\n"))
+                    }
+                } else {
+                    "No task list found. Use TodoWrite to create one.".to_string()
+                };
+                let _ = tx.send(Ok(Event::default()
+                    .event("slash_command")
+                    .json_data(serde_json::json!({"command": "tasks"}))
+                    .unwrap_or_else(|_| Event::default().event("error")))).await;
+                summary
+            }
+            "doctor" => {
+                let report = state.startup_report.read().await;
+                let status = if let Some(ref r) = *report {
+                    let checks: Vec<String> = r
+                        .items
+                        .iter()
+                        .map(|c| {
+                            let icon = match c.status {
+                                crate::startup_check::CheckStatus::Pass => "✅",
+                                crate::startup_check::CheckStatus::Warn => "⚠️",
+                                _ => "❌",
+                            };
+                            format!("{icon} **{}**: {} ({}ms)", c.name, c.detail, c.latency_ms)
+                        })
+                        .collect();
+                    format!(
+                        "## System Health\n\nPort: {}\nLLM: {} provider(s)\nRAG: active\nMemory: facts loaded\n\n### Checks\n\n{}\n\n**{} pass / {} warn / {} fail**",
+                        r.actual_port,
+                        state.llm.read().await.len(),
+                        checks.join("\n"),
+                        r.pass, r.warn, r.fail,
+                    )
+                } else {
+                    "System health report not yet available. Try again after startup completes.".to_string()
+                };
+                let _ = tx.send(Ok(Event::default()
+                    .event("slash_command")
+                    .json_data(serde_json::json!({"command": "doctor"}))
+                    .unwrap_or_else(|_| Event::default().event("error")))).await;
+                status
+            }
+            _ => req.message.clone(),
         }
     } else {
         req.message.clone()
@@ -193,8 +328,11 @@ async fn handle_chat(
         .join("persona")
         .join("profile.json");
     let memory_stage = {
-        let stage = everevo_agent::MemoryStage::new(state.fact_manager.clone())
+        let mut stage = everevo_agent::MemoryStage::new(state.fact_manager.clone())
             .with_knowledge_graph(state.knowledge_graph.clone());
+        if let Some(ref rag) = state.rag_pipeline {
+            stage = stage.with_rag(Arc::clone(rag));
+        }
         if let Some(tid) = trace_id {
             stage.with_telemetry(state.telemetry.clone(), tid)
         } else {
@@ -251,7 +389,17 @@ async fn handle_chat(
         .with_stage(everevo_agent::SkillStage::new(state.skill_registry.clone()))
         .with_stage(memory_stage)
         .with_stage(domain_stage);
-    let messages = pipeline.assemble(&ctx);
+
+    // Determine turn number (user+assistant pairs → turns)
+    let turn_number = ctx.history.len() / 2 + 1;
+    let (messages, snapshot) =
+        pipeline.assemble_with_snapshot(&ctx, session_id, turn_number);
+
+    // Store snapshot for observability dashboard (fire-and-forget)
+    let snapshots_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        snapshots_state.record_context_snapshot(snapshot).await;
+    });
 
     // ── 4. Persist user message ──────────────────────────────────────
     let user_msg = MessageRow::new(session_id, "user", req.message.clone(), None, None, None);

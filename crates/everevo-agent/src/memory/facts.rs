@@ -141,12 +141,12 @@ impl FactManager {
         // Real-time vector indexing
         if let Ok(guard) = self.rag.lock() {
             if let Some(ref rag) = *guard {
-                let chunk = crate::rag::make_chunk(
+                let chunk = crate::rag::make_chunk_with_sources(
                     format!("{}: {}", fact.name, fact.content),
                     everevo_vector::ChunkType::Fact,
                     fact.projection.source_pointers.clone(),
                 );
-                if let Err(e) = rag.ingest(vec![chunk]) {
+                if let Err(e) = rag.ingest_into("memory", vec![chunk]) {
                     tracing::warn!(error = %e, "Fact vector indexing failed");
                 }
             }
@@ -286,12 +286,12 @@ impl FactManager {
         let facts = self.load_all()?;
         let mut count = 0usize;
         for fact in &facts {
-            let chunk = crate::rag::make_chunk(
+            let chunk = crate::rag::make_chunk_with_sources(
                 format!("{}: {}", fact.name, fact.content),
                 everevo_vector::ChunkType::Fact,
                 fact.projection.source_pointers.clone(),
             );
-            rag.ingest(vec![chunk])?;
+            rag.ingest_into("memory", vec![chunk])?;
             count += 1;
         }
         tracing::info!(count, "Memory facts indexed into RAG");

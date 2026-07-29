@@ -37,6 +37,8 @@ impl Database {
                 .filename(path)
                 .create_if_missing(true)
                 .foreign_keys(true)
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+                .busy_timeout(std::time::Duration::from_secs(5))
         };
 
         let pool = SqlitePool::connect_with(options)

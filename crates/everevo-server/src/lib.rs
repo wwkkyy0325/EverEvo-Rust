@@ -54,7 +54,10 @@ pub async fn build_app(
         .merge(routes::tools_routes::router())
         .merge(routes::workspace_routes::router())
         .merge(routes::diary_routes::router())
-        .merge(routes::memory_routes::router());
+        .merge(routes::memory_routes::router())
+        .merge(routes::context_routes::router())
+        .merge(routes::command_routes::routes())
+        .merge(routes::model_routes::routes());
 
     // Serve frontend static files + SPA fallback if built
     let dist = std::path::Path::new("frontend/dist");

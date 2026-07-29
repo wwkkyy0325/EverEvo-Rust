@@ -24,10 +24,25 @@ pub async fn run_init_llm_phase(state: &Arc<AppState>, data_dir: &std::path::Pat
     // ── Run startup self-checks ────────────────────────────────────
     println!("[init] Running startup checks (phase → Checking)");
     *state.init_phase.write().await = InitPhase::Checking;
-    let report = crate::startup_check::run_startup_check(data_dir).await;
+    let report = crate::startup_check::run_startup_check(
+        data_dir,
+        state.config.server_port,
+    )
+    .await;
     if report.fail > 0 {
         tracing::error!(fail = report.fail, "Startup check found critical issues");
     }
+    // If port changed, update config so axum binds to the new port
+    if report.actual_port != state.config.server_port {
+        tracing::warn!(
+            requested = state.config.server_port,
+            actual = report.actual_port,
+            "Port changed — server will listen on actual port"
+        );
+    }
+    // Cache report for health API
+    *state.startup_report.write().await = Some(report);
+
     tracing::info!("Init complete — all systems ready");
 
     println!("[init] Init complete (phase → Ready)");

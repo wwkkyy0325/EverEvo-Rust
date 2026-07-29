@@ -14,10 +14,13 @@ use everevo_agent::memory::scheduler::{DreamingScheduler, SchedulerConfig};
 use everevo_agent::memory::wiki::WikiGenerator;
 use everevo_agent::memory::DreamingEngine;
 use everevo_agent::rag::RagPipeline;
+use everevo_vector::{ModelRegistry, MultiCollectionStore};
 use everevo_agent::skill::SkillRegistry;
 use everevo_agent::tools::builtins::{SubAgentHandle, SubAgentStatus};
 use everevo_bootstrap::pipeline::InitPipeline;
 use everevo_bootstrap::Bootstrap;
+use everevo_core::context::ContextSnapshot;
+use everevo_core::slash_command::SlashCommandRegistry;
 use everevo_core::{AppConfig, EverEvoError};
 use everevo_core::{Telemetry, TelemetryConfig};
 use everevo_db::Database;
@@ -105,6 +108,8 @@ pub struct AppState {
     pub telemetry: Arc<Telemetry>,
     /// Skill registry — scans data/skills/ for SKILL.md files.
     pub skill_registry: Arc<SkillRegistry>,
+    /// Slash command registry — built-in + plugin slash commands for chat input.
+    pub commands: Arc<SlashCommandRegistry>,
     /// Cached runtime environment — computed once at startup, reused for every
     /// sandbox creation to avoid repeated filesystem scans of .extracted sentinels.
     pub runtime_env: everevo_bootstrap::runtime::RuntimeEnv,
@@ -129,20 +134,35 @@ pub struct AppState {
     /// permission level for restoration on exit.
     /// Arc-wrapped so it can be shared with plan mode tools.
     pub plan_mode_sessions: Arc<RwLock<HashMap<uuid::Uuid, String>>>,
-    /// RAG pipeline — ONNX embeddings + LanceDB vector store for semantic search.
-    /// Created in a background thread to avoid LanceDB's nested-runtime conflict.
+    /// Context injection observability — per-session ring buffers of recent
+    /// context snapshots (max 5 entries per session).
+    pub context_snapshots: RwLock<HashMap<uuid::Uuid, Vec<ContextSnapshot>>>,
+    /// Cached startup check report — run once after init, served via health API.
+    pub startup_report: Arc<tokio::sync::RwLock<Option<crate::startup_check::StartupReport>>>,
+    /// Model registry — auto-discovers ONNX embedding models.
+    pub model_registry: Arc<std::sync::RwLock<ModelRegistry>>,
+    /// RAG pipeline — ONNX embeddings + HNSW vector store for semantic search.
     /// None if ONNX models are unavailable (falls back to keyword-only search).
     pub rag_pipeline: Option<Arc<RagPipeline>>,
+    /// Per-project vector store at `{workspace}/.everevo/vector/`.
+    /// Holds `code` and `domain` namespaces — isolated from global `data/vector/`
+    /// (memory + wiki). Created lazily; None if no workspace is set or if the
+    /// .everevo directory doesn't exist.
+    pub project_vector_store: Option<Arc<MultiCollectionStore>>,
 }
 
 impl AppState {
     pub async fn new(config: AppConfig, db: Database) -> Result<Arc<Self>, EverEvoError> {
         let bootstrap = Arc::new(Bootstrap::new(config.data_dir.clone()));
         let downloader = Self::init_downloader()?;
+        let resource_dir = std::env::var("EVEREVO_RESOURCE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_default();
         let init_pipeline = Arc::new(InitPipeline::new(
             config.data_dir.clone(),
             Arc::clone(&bootstrap),
             Arc::clone(&downloader),
+            resource_dir,
         ));
         let llm = Self::load_llm_from_file(&config).await;
         std::fs::create_dir_all(config.data_dir.join("sandbox")).ok();
@@ -165,14 +185,29 @@ impl AppState {
         // Wire SQLite FTS5 for fact keyword search (triple-write: MD + SQLite + Vector)
         fact_manager.set_db(Arc::new(db.clone()));
 
+        // Model registry — auto-discovers ONNX models under data/models/.
+        let model_registry = {
+            let models_dir = config.data_dir.join("models");
+            let preferred = config.embedding_model.as_deref();
+            Arc::new(std::sync::RwLock::new(
+                ModelRegistry::discover(models_dir, preferred).unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "Model registry init failed — RAG disabled");
+                    // Return a dummy? No — ModelRegistry::discover fails if no models.
+                    // This should never happen in production (models bundled).
+                    panic!("No embedding models found — cannot start");
+                })
+            ))
+        };
+
         // Wire RAG pipeline for vector search (triple-write: MD + SQLite + Vector).
-        // Created in std::thread::spawn to isolate LanceDB's internal tokio runtime
-        // from the server's #[tokio::main] runtime — avoids nested-runtime panic.
-        let rag_pipeline = Self::init_rag(&config).await;
+        let rag_pipeline = {
+            let reg = model_registry.read().unwrap_or_else(|e| e.into_inner());
+            Self::init_rag(&config, &reg)
+        };
         if let Some(ref rag) = rag_pipeline {
             fact_manager.set_rag(Arc::clone(rag));
+            wiki_generator.set_rag(Arc::clone(rag));
             // Backfill: index existing facts (created before RAG was wired) into vectors.
-            // Fire-and-forget — non-blocking, non-fatal on failure.
             let fm = Arc::clone(&fact_manager);
             let r = Arc::clone(rag);
             tokio::spawn(async move {
@@ -186,6 +221,7 @@ impl AppState {
         let telemetry = Self::init_telemetry(&config);
         let domain_registry = Self::init_domain(&config);
         let skill_registry = Self::init_skills(&config);
+        let commands = Self::init_commands();
         // Pre-compute runtime env once — avoids repeated filesystem scans
         // on every session creation (hot path).
         let runtime_env = bootstrap.build_runtime_env().await;
@@ -194,6 +230,25 @@ impl AppState {
         let workspace_dir = load_workspace_config(&config)
             .or_else(|| config.workspace_dir.clone())
             .or_else(|| std::env::current_dir().ok());
+
+        // Per-project vector store at {workspace}/.everevo/vector/
+        let project_vector_store = workspace_dir.as_ref().and_then(|ws| {
+            let everevo_dir = ws.join(".everevo");
+            if everevo_dir.exists() {
+                match MultiCollectionStore::open(everevo_dir.join("vector"), 384, None) {
+                    Ok(store) => {
+                        tracing::info!(path = %everevo_dir.display(), "Project vector store opened");
+                        Some(Arc::new(store))
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Project vector store init failed (non-fatal)");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        });
 
         // Todo store with disk persistence — survives server restarts
         let todo_store = everevo_agent::tools::builtins::new_todo_store();
@@ -211,6 +266,7 @@ impl AppState {
             downloader,
             init_pipeline,
             todo_store,
+            startup_report: Arc::new(tokio::sync::RwLock::new(None)),
             init_phase: RwLock::new(InitPhase::Provisioning),
             llm_notify: Notify::new(),
             sandboxes: RwLock::new(HashMap::new()),
@@ -224,6 +280,7 @@ impl AppState {
             domain_registry,
             telemetry,
             skill_registry,
+            commands,
             runtime_env,
             session_actors: RwLock::new(HashMap::new()),
             subagent_handles: RwLock::new(HashMap::new()),
@@ -232,7 +289,10 @@ impl AppState {
             bg_sessions: RwLock::new(HashMap::new()),
             workspace_dir: Arc::new(RwLock::new(workspace_dir)),
             plan_mode_sessions: Arc::new(RwLock::new(HashMap::new())),
+            context_snapshots: RwLock::new(HashMap::new()),
+            model_registry,
             rag_pipeline,
+            project_vector_store,
         });
         // Connect to configured MCP servers (non-blocking, best-effort)
         Self::connect_mcp_servers(&state).await;
@@ -427,29 +487,21 @@ impl AppState {
         Ok((fm, dm, sched, engine, wiki))
     }
 
-    /// Initialize the RAG pipeline on a blocking thread.
-    ///
-    /// `HnswStore::open()` is pure Rust (no FFI, no tokio) but does file I/O
-    /// and CPU work for index loading. We run it in `spawn_blocking` to avoid
-    /// blocking a tokio worker.
-    async fn init_rag(config: &AppConfig) -> Option<Arc<RagPipeline>> {
-        let data_dir = config.data_dir.clone();
-        let result = tokio::task::spawn_blocking(move || RagPipeline::new(&data_dir)).await;
-        match result {
-            Ok(Ok(rag)) => {
+    /// Initialize the RAG pipeline using the active model from registry.
+    fn init_rag(config: &AppConfig, registry: &ModelRegistry) -> Option<Arc<RagPipeline>> {
+        match RagPipeline::new(&config.data_dir, registry) {
+            Ok(rag) => {
                 tracing::info!(
+                    model = %rag.model_name,
+                    dim = rag.dim,
                     real_embeddings = rag.real_embeddings,
-                    chunk_count = rag.count(),
+                    chunk_count = rag.total_count(),
                     "RAG pipeline initialized"
                 );
                 Some(Arc::new(rag))
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 tracing::warn!(error = %e, "RAG pipeline init failed (non-fatal)");
-                None
-            }
-            Err(join_err) => {
-                tracing::warn!(error = %join_err, "RAG pipeline init panicked (non-fatal)");
                 None
             }
         }
@@ -494,6 +546,20 @@ impl AppState {
         // with the same name take precedence (they were loaded first; builtins
         // skip duplicates).
         Arc::new(registry.with_builtins())
+    }
+
+    fn init_commands() -> Arc<SlashCommandRegistry> {
+        use everevo_core::slash_command::SlashCommand;
+        let mut reg = SlashCommandRegistry::new();
+        reg.register(SlashCommand::new("help", "List all available commands"));
+        reg.register(SlashCommand::new("clear", "Clear current session history"));
+        reg.register(SlashCommand::new("compact", "Trigger context compaction").with_args("topic"));
+        reg.register(SlashCommand::new("plan", "Enter plan mode for task planning; /plan cancel to exit").with_args("task"));
+        reg.register(SlashCommand::new("memory", "Search persistent memory").with_args("query"));
+        reg.register(SlashCommand::new("config", "Show current configuration status"));
+        reg.register(SlashCommand::new("tasks", "Show current task list status"));
+        reg.register(SlashCommand::new("doctor", "Run system diagnostics and show health report"));
+        Arc::new(reg)
     }
 
     /// Create a sandbox for a session. Default level is SemiAuto.
@@ -549,6 +615,18 @@ impl AppState {
                 tracing::warn!(%session_id, error = %e, "Failed to clean up sandbox");
             }
         }
+    }
+
+    /// Store a context snapshot for a session, evicting the oldest entry
+    /// if the ring buffer is full (max 5 entries).
+    pub async fn record_context_snapshot(&self, snapshot: ContextSnapshot) {
+        const MAX_SNAPSHOTS: usize = 5;
+        let mut map = self.context_snapshots.write().await;
+        let entries = map.entry(snapshot.session_id).or_default();
+        if entries.len() >= MAX_SNAPSHOTS {
+            entries.remove(0); // evict oldest
+        }
+        entries.push(snapshot);
     }
 }
 

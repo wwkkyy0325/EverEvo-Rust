@@ -13,6 +13,7 @@ pub mod memory;
 pub mod provider;
 pub mod retrieval;
 pub mod sandbox;
+pub mod slash_command;
 pub mod telemetry;
 pub mod tool;
 pub mod types;
