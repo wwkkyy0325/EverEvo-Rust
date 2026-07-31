@@ -446,7 +446,21 @@ impl AgentLoop {
             let mut pending_tool: Option<(String, String, String)> = None;
 
             let mut rx = token_rx;
-            while let Some(event) = rx.recv().await {
+            loop {
+                let event = tokio::time::timeout(
+                    std::time::Duration::from_secs(120),
+                    rx.recv(),
+                )
+                .await;
+                let event = match event {
+                    Ok(Some(e)) => e,
+                    Ok(None) => break, // channel closed
+                    Err(_elapsed) => {
+                        return format!(
+                            "{text}{turn_text}\nError: LLM stream stalled (no events for 120s)"
+                        );
+                    }
+                };
                 if cancel.is_cancelled() {
                     return format!("{text}{turn_text}\n[Cancelled]");
                 }
@@ -482,8 +496,20 @@ impl AgentLoop {
                 }
             }
 
-            // No tool calls → done
+            // No tool calls → check for pending sub-agents before declaring Done
             if tool_calls.is_empty() {
+                let pending = self
+                    .pending_subagents
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                if pending > 0 {
+                    // Sub-agents still running — inject reminder and continue
+                    messages.push(LlmMessage::user(format!(
+                        "You have {} sub-agent(s) still running. Wait for their results \
+                         before providing a final answer. Do NOT call Done yet.",
+                        pending
+                    )));
+                    continue;
+                }
                 text.push_str(&turn_text);
                 break;
             }

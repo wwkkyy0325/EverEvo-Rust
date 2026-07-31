@@ -466,6 +466,21 @@ async fn handle_chat(
 
     // Build sub-agent context BEFORE the pipeline consumes domain_stage.
     let shell = shell_name.clone();
+    // Gather skill list for sub-agent context
+    let skill_list = {
+        let skills = state.skill_registry.list_metadata();
+        if skills.is_empty() {
+            None
+        } else {
+            Some(
+                skills
+                    .iter()
+                    .map(|(name, desc)| format!("- **{name}**: {desc}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        }
+    };
     let mut sub_ctx = everevo_agent::subagent_context::assemble_subagent_context(
         &effective_message,
         None,
@@ -475,6 +490,7 @@ async fn handle_chat(
         &shell,
         &["shell".into(), "memory".into()],
         Some(todo_summary.clone()),
+        skill_list,
     )
     .await;
     // Inherit parent session's permission level for sub-agents.
@@ -728,8 +744,11 @@ async fn handle_chat(
 
             // If pending count hasn't changed and no new results, the sub-agents
             // might be stuck — force final synthesis instead of looping forever.
+            // We require at least one sleep cycle before declaring stall to avoid
+            // a race where pending was just set but results haven't arrived yet
+            // (common with fast parallel_agents/team dispatch).
             if new_results.is_empty() {
-                if pending >= last_pending {
+                if pending >= last_pending && auto_cycles > 1 {
                     tracing::warn!(
                         pending,
                         cycles = auto_cycles,
@@ -888,6 +907,25 @@ async fn handle_chat(
                         &p, &dir, &um, &am,
                     )
                     .await;
+                });
+            }
+            // Persona auto-update: run after every turn (same fire-and-forget
+            // pattern as reflection). Much faster than waiting 24h for the
+            // DEEP scheduler phase. Uses accumulated facts to update
+            // communication style, code-first preference, etc.
+            {
+                let fm = Arc::clone(&fm);
+                let profile_path = state
+                    .config
+                    .data_dir
+                    .join("memory")
+                    .join("persona")
+                    .join("profile.json");
+                tokio::spawn(async move {
+                    let facts = fm.load_all().unwrap_or_default();
+                    everevo_agent::stages::persona::update_persona_from_facts(
+                        &profile_path, &facts,
+                    );
                 });
             }
         }

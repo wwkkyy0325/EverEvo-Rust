@@ -316,14 +316,60 @@ impl<C: WorkflowCallbacks> WorkflowEngine<C> {
 
 // ── Variable resolution ──────────────────────────────────────────────────
 
-/// Resolve `${{step.key}}` references in a string.
+/// Resolve `${{step.key}}` and bare `${{key}}` references in a string.
+///
+/// Variables are stored as `{step_id}.{key}` (e.g. `s1.my_var`).
+/// The canonical form is `${{step_id.key}}`, but bare `${{key}}` also
+/// resolves to the first matching `*.<key>` entry for ergonomics.
 fn resolve_vars(template: &str, vars: &HashMap<String, String>) -> String {
     let mut result = template.to_string();
     for (key, value) in vars {
         let placeholder = format!("${{{{{}}}}}", key);
         result = result.replace(&placeholder, value);
     }
+    // Fallback: bare `${{key}}` → resolve to first `*.key` match.
+    // Handles `set_variable key=my_var` where the user naturally writes
+    // `${{my_var}}` instead of `${{step_id.my_var}}`.
+    if result.contains("${{") {
+        // Find remaining unresolved placeholders
+        let mut remaining = result.clone();
+        while let Some(start) = remaining.find("${{") {
+            let inner_start = start + 3;
+            let end = match remaining[inner_start..].find("}}") {
+                Some(e) => inner_start + e,
+                None => break,
+            };
+            let placeholder_key = &remaining[inner_start..end];
+            // Only try bare-key resolution if the key doesn't contain a dot
+            if !placeholder_key.contains('.') {
+                // Search for any `*.<key>` entry in vars
+                let suffix = format!(".{placeholder_key}");
+                if let Some((_full_key, value)) = vars.iter().find(|(k, _)| k.ends_with(&suffix)) {
+                    let full_placeholder = format!("${{{{{placeholder_key}}}}}");
+                    result = result.replace(&full_placeholder, value);
+                }
+            }
+            remaining = remaining[end + 2..].to_string();
+        }
+    }
     result
+}
+
+/// Resolve a single `${{key}}` reference, with bare-key fallback.
+/// Public for use by workflow runner tool.
+pub fn resolve_single_var(key: &str, vars: &HashMap<String, String>) -> Option<String> {
+    // Exact match first
+    if let Some(v) = vars.get(key) {
+        return Some(v.clone());
+    }
+    // Bare-key fallback: match *.key
+    if !key.contains('.') {
+        let suffix = format!(".{key}");
+        if let Some((_, v)) = vars.iter().find(|(k, _)| k.ends_with(&suffix)) {
+            return Some(v.clone());
+        }
+    }
+    None
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────

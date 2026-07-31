@@ -131,6 +131,8 @@ pub struct AppState {
     /// Global default workspace directory. When set, all new sessions use this
     /// as their primary working directory. Overridable per-session via API.
     pub workspace_dir: Arc<RwLock<Option<PathBuf>>>,
+    /// A2A (Agent-to-Agent) gateway — JSON-RPC 2.0 endpoint for external agents.
+    pub a2a_gateway: Arc<everevo_a2a::A2aGateway>,
     /// Per-session plan mode state. None = normal mode.
     /// When a session is in plan mode, the value stores the pre-plan
     /// permission level for restoration on exit.
@@ -294,6 +296,35 @@ impl AppState {
         let todo_store = everevo_agent::tools::builtins::new_todo_store();
         everevo_agent::tools::builtins::load_persisted_tasks(&todo_store, &config.data_dir).await;
 
+        // ── A2A Gateway ─────────────────────────────────────────────
+        let a2a_gateway = {
+            let base_url = format!(
+                "http://{}:{}",
+                config.server_host,
+                config.server_port
+            );
+            let a2a_config = everevo_a2a::A2aGatewayConfig {
+                base_url,
+                max_turns: 50,
+                enable_auth: false, // dev mode — no auth
+                ..Default::default()
+            };
+            // Use primary LLM if available; A2A tasks get chat capability
+            let primary = llm
+                .get("primary")
+                .and_then(|v| v.clone())
+                .or_else(|| llm.values().find_map(|v| v.clone()));
+            if let Some(llm_client) = primary {
+                let tools = Arc::new(everevo_core::tool::ToolRegistry::new());
+                Arc::new(everevo_a2a::A2aGateway::new(llm_client, tools, a2a_config))
+            } else {
+                tracing::warn!("A2A gateway: no LLM available — gateway created without executor");
+                let _tools = Arc::new(everevo_core::tool::ToolRegistry::new());
+                let executor = Arc::new(everevo_a2a::executor::EchoExecutor);
+                Arc::new(everevo_a2a::A2aGateway::with_executor(executor, a2a_config))
+            }
+        };
+
         let state = Arc::new(Self {
             config,
             db,
@@ -324,6 +355,7 @@ impl AppState {
             mcp_clients: RwLock::new(HashMap::new()),
             bg_sessions: RwLock::new(HashMap::new()),
             workspace_dir: Arc::new(RwLock::new(workspace_dir)),
+            a2a_gateway,
             plan_mode_sessions: Arc::new(RwLock::new(HashMap::new())),
             context_snapshots: RwLock::new(HashMap::new()),
             model_registry,
@@ -332,6 +364,8 @@ impl AppState {
         });
         // Connect to configured MCP servers (non-blocking, best-effort)
         Self::connect_mcp_servers(&state).await;
+        // Start built-in webagent (best-effort, non-blocking)
+        Self::start_webagent(&state).await;
         // Start background MCP health checker
         Self::spawn_mcp_health_checker(&state);
         Ok(state)
@@ -458,6 +492,79 @@ impl AppState {
                 }
             }
         }
+    }
+
+    /// Start the built-in `everevo-webagent` as an MCP stdio child process.
+    ///
+    /// The webagent provides `web_search`, `web_fetch`, and `web_browse` tools
+    /// with anti-detection browser automation. It runs as a separate process
+    /// so search/browser failures never crash the main server.
+    ///
+    /// Binary discovery order:
+    /// 1. `everevo-webagent` / `everevo-webagent.exe` next to the server binary
+    /// 2. Same name in PATH
+    /// 3. `target/debug/everevo-webagent` (dev mode)
+    async fn start_webagent(state: &Arc<Self>) {
+        let binary = Self::find_webagent_binary();
+        tracing::info!(?binary, "Starting built-in webagent");
+
+        let args: &[&str] = &[];
+        let env = state.inject_runtime_path(&HashMap::new());
+        match everevo_mcp::discover_mcp_tools(&binary, args, &env).await {
+            Ok((client, tools)) => {
+                tracing::info!(
+                    tool_count = tools.len(),
+                    "Built-in webagent connected"
+                );
+                state
+                    .mcp_clients
+                    .write()
+                    .await
+                    .insert("everevo-webagent".into(), client);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    binary = %binary,
+                    error = %e,
+                    "Built-in webagent unavailable — web search will use fallback tools. \
+                     Build with: cargo build -p everevo-webagent"
+                );
+            }
+        }
+    }
+
+    /// Find the webagent binary. Checks common locations.
+    fn find_webagent_binary() -> String {
+        let exe_name = if cfg!(windows) {
+            "everevo-webagent.exe"
+        } else {
+            "everevo-webagent"
+        };
+
+        // 1. Next to the server binary (production layout)
+        if let Ok(server_exe) = std::env::current_exe() {
+            if let Some(dir) = server_exe.parent() {
+                let candidate = dir.join(exe_name);
+                if candidate.exists() {
+                    return candidate.display().to_string();
+                }
+            }
+        }
+
+        // 2. Dev mode: target/debug/everevo-webagent
+        let dev_path = std::path::Path::new("target/debug").join(exe_name);
+        if dev_path.exists() {
+            return dev_path.display().to_string();
+        }
+
+        // 3. Dev mode: target/release/everevo-webagent
+        let rel_path = std::path::Path::new("target/release").join(exe_name);
+        if rel_path.exists() {
+            return rel_path.display().to_string();
+        }
+
+        // 5. Fallback: just the name, let the OS try PATH
+        exe_name.to_string()
     }
 
     /// Build the env map for a stdio MCP child process, prepending bootstrapped
@@ -826,6 +933,9 @@ impl AppState {
             None => return HashMap::new(),
         };
 
+        // Auto-detect proxy from env vars + common local proxy ports
+        let proxy = everevo_agent::llm::http::detect_proxy().await;
+
         let mut map = HashMap::new();
         let mut plaintext_keys_found = false;
         for entry in llm_arr {
@@ -843,7 +953,7 @@ impl AppState {
 
             if !key.is_empty() {
                 plaintext_keys_found = true;
-                let client = HttpClient::new(api_fmt, key, url, model);
+                let client = HttpClient::with_proxy(api_fmt, key, url, model, proxy.as_deref());
                 map.insert(id.to_string(), Some(Arc::new(client)));
             }
         }

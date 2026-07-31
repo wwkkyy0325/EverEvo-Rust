@@ -91,20 +91,22 @@ pub fn build_browser_client(
         .redirect(reqwest::redirect::Policy::limited(3))
         .tcp_nodelay(true);
 
-    // Explicit proxy override — forces all traffic through this proxy even when
-    // standard env vars are unset (e.g. a system proxy not exported to the env).
-    if let Ok(proxy_url) = std::env::var("EVEREVO_HTTP_PROXY") {
-        let proxy_url = proxy_url.trim();
-        if !proxy_url.is_empty() {
-            tracing::debug!(proxy = %proxy_url, "Routing web tool traffic through EVEREVO_HTTP_PROXY");
-            let proxy = reqwest::Proxy::all(proxy_url).map_err(|e| {
-                EverEvoError::Network(format!("Invalid EVEREVO_HTTP_PROXY '{proxy_url}': {e}"))
-            })?;
-            builder = builder.proxy(proxy);
-        }
+    // Proxy detection — explicit override, then standard env vars.
+    // Reuse the same detection logic as the LLM client.
+    let proxy_url: Option<String> = if let Ok(val) = std::env::var("EVEREVO_HTTP_PROXY") {
+        let val = val.trim().to_string();
+        if !val.is_empty() { Some(val) } else { None }
+    } else {
+        crate::llm::http::detect_proxy_sync()
+    };
+
+    if let Some(ref proxy_url) = proxy_url {
+        tracing::debug!(proxy = %proxy_url, "Routing web tool traffic through proxy");
+        let proxy = reqwest::Proxy::all(proxy_url).map_err(|e| {
+            EverEvoError::Network(format!("Invalid proxy URL '{proxy_url}': {e}"))
+        })?;
+        builder = builder.proxy(proxy);
     }
-    // When EVEREVO_HTTP_PROXY is unset, reqwest still honors HTTP_PROXY /
-    // HTTPS_PROXY / ALL_PROXY by default — no action needed here.
 
     builder
         .build()

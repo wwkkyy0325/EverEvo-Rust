@@ -539,7 +539,7 @@ fn truncate_at(s: &str, max: usize) -> String {
 
 /// Percent-encode a search query for embedding in a browser URL.
 /// Space → `+` (form-encoded), unreserved chars pass through, all else → `%XX`.
-fn encode_url_query(s: &str) -> String {
+pub fn encode_url_query(s: &str) -> String {
     s.chars()
         .map(|c| match c {
             ' ' => "+".to_string(),
@@ -685,44 +685,59 @@ impl Tool for WebSearchTool {
             }
         }
 
+        // Track the CDP bridge error for diagnostic output.
+        let mut bridge_error: Option<String> = None;
+
+        if results.is_empty() {
+            // ── Tier 2 fallback: CDP browser bridge ────────────────────
+            // Launch the user's real browser (Chrome/Edge) via CDP, navigate
+            // to the search engine, and extract results from the rendered DOM.
+            // The real browser has the user's TLS fingerprint, viewport, and
+            // IP (plus proxy/VPN), so it naturally bypasses anti-bot blocks.
+            match super::browser_bridge::search_via_browser(query, limit).await {
+                Ok(browser_results) if !browser_results.is_empty() => {
+                    results = browser_results
+                        .into_iter()
+                        .map(|r| (r.title, r.url, r.snippet))
+                        .collect();
+                }
+                Ok(_) => {
+                    bridge_error = Some("CDP browser bridge: navigation succeeded but 0 results extracted".into());
+                    tracing::debug!("{}", bridge_error.as_deref().unwrap());
+                }
+                Err(ref e) => {
+                    bridge_error = Some(format!("CDP browser bridge: {e}"));
+                    tracing::warn!(error = %e, "Browser bridge failed");
+                }
+            }
+        }
+
         if results.is_empty() {
             let tried_str = tried.join(", ");
-            // Final fallback: open the user's real default browser. This is the
-            // most reliable path — a real browser carries cookies, a genuine
-            // fingerprint, and honors the user's system proxy/VPN, so it sidesteps
-            // the datacenter-IP block entirely. Override the search engine via
-            // EVEREVO_SEARCH_BROWSER_URL (default: Bing, reachable in mainland China).
+            // ── Tier 3 last resort: open browser for manual review ─────
+            // CDP bridge failed or returned no results. Open the user's
+            // default browser as a final fallback so they can read results
+            // manually. The agent will see the search URL and can suggest
+            // the user paste relevant info back.
             let engine = std::env::var("EVEREVO_SEARCH_BROWSER_URL")
                 .unwrap_or_else(|_| "https://cn.bing.com/search?q=".to_string());
             let browser_url = format!("{}{}", engine, encode_url_query(query));
 
-            if open::that(&browser_url).is_ok() {
-                return Ok(ToolOutput {
-                    content: format!(
-                        "Direct search was blocked by DuckDuckGo (datacenter IP). \
-                         Opened your default browser to:\n{browser_url}\n\n\
-                         A real browser bypasses the block (real fingerprint + system \
-                         proxy/VPN + cookies). Review the results there; if you need \
-                         specific page content in this session, use `web_fetch` on the \
-                         result URL.\n\n\
-                         Diagnostic — tried direct endpoints [{tried_str}], last error: {last_error}"
-                    ),
-                    is_error: false,
-                 ..Default::default() });
-            }
+            let _ = open::that(&browser_url);
 
+            // Build a diagnostic-rich error message.
+            let bridge_detail = bridge_error
+                .as_deref()
+                .unwrap_or("CDP browser bridge: not attempted (HTTP engines returned results but all were empty)");
             return Ok(ToolOutput {
                 content: format!(
-                    "Web search failed — all endpoints unreachable and browser fallback failed.\n\n\
+                    "Web search failed — all endpoints and browser bridge exhausted.\n\n\
                      Tried: {tried_str}\n\
-                     Last error: {last_error}\n\n\
-                     Likely cause: your IP is blocked by DuckDuckGo's anti-bot filter \
-                     (common for datacenter/proxy IPs).\n\
-                     Fixes:\n\
-                     1. Set EVEREVO_HTTP_PROXY=http://your-proxy:port to route through a \
-                     residential/VPN proxy.\n\
-                     2. Ensure HTTPS_PROXY/HTTP_PROXY env vars are exported.\n\
-                     3. For reliable search, configure a Brave/Tavily MCP search server."
+                     {bridge_detail}\n\
+                     Manual fallback: opened {browser_url}\n\
+                     HTTP last error: {last_error}\n\n\
+                     If you see search results in the opened browser tab, \
+                     copy the relevant links and use `web_fetch` to read them."
                 ),
                 is_error: true,
                 ..Default::default()

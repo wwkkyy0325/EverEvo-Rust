@@ -47,6 +47,10 @@ pub struct WorkflowTool {
     /// Pending counter.
     pending: Arc<std::sync::atomic::AtomicUsize>,
     max_concurrent: usize,
+    /// Shared pending counter (from TaskTool) — auto-continue loop watches this.
+    shared_pending: Option<super::delegate::SharedPending>,
+    /// Shared results backlog (from TaskTool) — auto-continue loop drains this.
+    shared_backlog: Option<super::delegate::SharedBacklog>,
 }
 
 impl WorkflowTool {
@@ -60,7 +64,23 @@ impl WorkflowTool {
             statuses: Arc::new(std::sync::Mutex::new(Vec::new())),
             pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_concurrent: 4,
+            shared_pending: None,
+            shared_backlog: None,
         }
+    }
+
+    /// Wire into the shared auto-continue system.
+    /// Results from parallel sub-agents will be pushed to the shared backlog,
+    /// and the shared pending counter is used so the main agent loop knows
+    /// when to wait for completions.
+    pub fn with_shared_counters(
+        mut self,
+        pending: super::delegate::SharedPending,
+        backlog: super::delegate::SharedBacklog,
+    ) -> Self {
+        self.shared_pending = Some(pending);
+        self.shared_backlog = Some(backlog);
+        self
     }
 
     /// Wire up sub-agent execution capability.
@@ -240,6 +260,11 @@ impl Tool for WorkflowTool {
                 });
             self.pending
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Also bump the shared pending counter so the main loop's
+            // auto-continue mechanism knows sub-agents are running.
+            if let Some(ref sp) = self.shared_pending {
+                sp.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
 
             let llm_c = Arc::clone(llm);
             let tools_c = Arc::clone(tools);
@@ -247,6 +272,9 @@ impl Tool for WorkflowTool {
             let results_c = Arc::clone(&self.results);
             let pending_c = Arc::clone(&self.pending);
             let statuses_c = Arc::clone(&self.statuses);
+            let shared_pending = self.shared_pending.clone();
+            let shared_backlog = self.shared_backlog.clone();
+            let task_id_str = task_id.to_string();
 
             tokio::spawn(async move {
                 let _permit = permit; // hold semaphore permit until task completes
@@ -255,8 +283,17 @@ impl Tool for WorkflowTool {
                 results_c
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .push(summary);
+                    .push(summary.clone());
+                // Push into shared backlog so auto-continue can see it
+                if let Some(ref bl) = shared_backlog {
+                    bl.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((task_id_str.clone(), desc.clone(), summary));
+                }
                 pending_c.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                if let Some(ref sp) = shared_pending {
+                    sp.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 if let Ok(mut s) = statuses_c.lock() {
                     if let Some(e) = s.iter_mut().find(|e| e.id == task_id) {
                         e.status = if content.starts_with("Error:") {

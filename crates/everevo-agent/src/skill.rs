@@ -18,6 +18,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
+use std::time::SystemTime;
 
 use everevo_core::EverEvoError;
 
@@ -51,9 +53,16 @@ pub struct Skill {
 // ── SkillRegistry ─────────────────────────────────────────────────────────
 
 /// Scans `data/skills/` for SKILL.md files and builds an in-memory index.
+///
+/// Uses `RwLock<Vec<Skill>>` so `check_rescan()` can hot-reload skills at
+/// runtime without `&mut self` — new skills take effect immediately, no
+/// restart required.
 pub struct SkillRegistry {
-    pub(crate) skills: Vec<Skill>,
+    pub(crate) skills: RwLock<Vec<Skill>>,
     pub(crate) skills_dir: PathBuf,
+    /// Last time `data/skills/` was scanned. Used by `check_rescan()` to
+    /// detect new or modified SKILL.md files.
+    pub(crate) last_scan: RwLock<SystemTime>,
 }
 
 impl SkillRegistry {
@@ -61,8 +70,9 @@ impl SkillRegistry {
     /// all load attempts fail. Skills are non-critical; graceful degradation.
     pub fn empty() -> Self {
         Self {
-            skills: Vec::new(),
+            skills: RwLock::new(Vec::new()),
             skills_dir: PathBuf::new(),
+            last_scan: RwLock::new(SystemTime::UNIX_EPOCH),
         }
     }
 
@@ -72,8 +82,9 @@ impl SkillRegistry {
 
         if !skills_dir.exists() {
             return Ok(Self {
-                skills,
+                skills: RwLock::new(skills),
                 skills_dir: skills_dir.to_path_buf(),
+                last_scan: RwLock::new(SystemTime::now()),
             });
         }
 
@@ -123,9 +134,59 @@ impl SkillRegistry {
         skills.sort_by(|a, b| a.name.cmp(&b.name));
 
         Ok(Self {
-            skills,
+            skills: RwLock::new(skills),
             skills_dir: skills_dir.to_path_buf(),
+            last_scan: RwLock::new(SystemTime::now()),
         })
+    }
+
+    /// Check whether `data/skills/` has changed since the last scan and, if so,
+    /// hot-reload all SKILL.md files. Call this at the start of every request
+    /// so newly promoted skills take effect immediately — no restart needed.
+    pub fn check_rescan(&self) {
+        // If the directory doesn't exist, there's nothing to scan.
+        if !self.skills_dir.exists() {
+            return;
+        }
+        // Quick path: check if the directory itself has changed.
+        if let Ok(meta) = std::fs::metadata(&self.skills_dir) {
+            if let Ok(mtime) = meta.modified() {
+                let last = *self
+                    .last_scan
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner());
+                if mtime <= last {
+                    return; // no changes
+                }
+            }
+        }
+        // Slow path: reload
+        if let Ok(reloaded) = SkillRegistry::load(&self.skills_dir) {
+            let count = reloaded.skills.read().unwrap_or_else(|e| e.into_inner()).len();
+            let mut skills = self.skills.write().unwrap_or_else(|e| e.into_inner());
+            let reloaded_skills = reloaded.skills.into_inner().unwrap_or_default();
+            *skills = reloaded_skills;
+            // Merge builtins again
+            drop(skills);
+            self.merge_builtins();
+            let mut last = self.last_scan.write().unwrap_or_else(|e| e.into_inner());
+            *last = SystemTime::now();
+            tracing::info!(count, "Skill registry hot-reloaded");
+        }
+    }
+
+    /// Merge built-in skills into the current skill list. Called on init and
+    /// after each hot-reload so builtins are never lost.
+    fn merge_builtins(&self) {
+        let mut skills = self.skills.write().unwrap_or_else(|e| e.into_inner());
+        for (dir_name, content) in BUILTIN_SKILLS {
+            let fake_path = PathBuf::from("[builtin]").join(dir_name).join("SKILL.md");
+            if let Ok(skill) = parse_skill_md(content, &fake_path) {
+                skills.retain(|s| s.name != skill.name);
+                skills.push(skill);
+            }
+        }
+        skills.sort_by(|a, b| a.name.cmp(&b.name));
     }
 
     /// Find skills relevant to a user message.
@@ -134,14 +195,14 @@ impl SkillRegistry {
     /// and matches them against the user message using case-insensitive
     /// keyword overlap. Returns skills with at least one keyword match,
     /// sorted by match count.
-    pub fn find_relevant(&self, user_message: &str) -> Vec<&Skill> {
+    pub fn find_relevant(&self, user_message: &str) -> Vec<Skill> {
         if user_message.trim().is_empty() {
             return vec![];
         }
 
+        let guard = self.skills.read().unwrap_or_else(|e| e.into_inner());
         let msg_lower = user_message.to_lowercase();
-        let mut scored: Vec<(usize, &Skill)> = self
-            .skills
+        let mut scored: Vec<(usize, Skill)> = guard
             .iter()
             .filter_map(|s| {
                 let count = s
@@ -150,7 +211,7 @@ impl SkillRegistry {
                     .filter(|trigger| trigger_keyword_match(trigger, &msg_lower))
                     .count();
                 if count > 0 {
-                    Some((count, s))
+                    Some((count, s.clone()))
                 } else {
                     None
                 }
@@ -162,55 +223,36 @@ impl SkillRegistry {
     }
 
     /// Get a skill by name.
-    pub fn get(&self, name: &str) -> Option<&Skill> {
-        self.skills.iter().find(|s| s.name == name)
+    pub fn get(&self, name: &str) -> Option<Skill> {
+        let guard = self.skills.read().unwrap_or_else(|e| e.into_inner());
+        guard.iter().find(|s| s.name == name).cloned()
     }
 
     /// List all skill names + descriptions (for Stage 1 injection).
     pub fn list_metadata(&self) -> Vec<(String, String)> {
-        self.skills
+        let guard = self.skills.read().unwrap_or_else(|e| e.into_inner());
+        guard
             .iter()
             .map(|s| (s.name.clone(), s.description.clone()))
             .collect()
     }
 
     /// Re-scan the skills directory and reload all SKILL.md files.
-    /// Useful when skills are added/removed at runtime without restarting.
-    pub fn rescan(&mut self) -> Result<(), everevo_core::EverEvoError> {
+    /// Uses `&self` (interior mutability) — safe to call through `Arc`.
+    pub fn rescan(&self) -> Result<(), everevo_core::EverEvoError> {
         let reloaded = SkillRegistry::load(&self.skills_dir)?;
-        self.skills = reloaded.skills;
+        let reloaded_skills = reloaded.skills.into_inner().unwrap_or_default();
+        let mut guard = self.skills.write().unwrap_or_else(|e| e.into_inner());
+        *guard = reloaded_skills;
+        drop(guard);
+        self.merge_builtins();
         Ok(())
     }
 
     /// Register built-in skills embedded in the binary at compile time.
-    ///
-    /// These are always available regardless of what's in `data/skills/`.
-    /// Built-in skills are loaded BEFORE user skills; if a user skill has
-    /// the same name, the user version takes precedence (last wins).
-    pub fn with_builtins(mut self) -> Self {
-        for (dir_name, content) in BUILTIN_SKILLS {
-            // Use a synthetic path so parse_skill_md logs are meaningful.
-            let fake_path = PathBuf::from("[builtin]").join(dir_name).join("SKILL.md");
-            match parse_skill_md(content, &fake_path) {
-                Ok(skill) => {
-                    // Remove any existing skill with the same name (user override).
-                    self.skills.retain(|s| s.name != skill.name);
-                    tracing::info!(
-                        name = %skill.name,
-                        "Registered built-in skill"
-                    );
-                    self.skills.push(skill);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        skill = %dir_name,
-                        error = %e,
-                        "Failed to parse built-in skill (skipping)"
-                    );
-                }
-            }
-        }
-        self.skills.sort_by(|a, b| a.name.cmp(&b.name));
+    /// Delegates to `merge_builtins()` — same logic for init and hot-reload.
+    pub fn with_builtins(self) -> Self {
+        self.merge_builtins();
         self
     }
 }
@@ -549,8 +591,9 @@ Body here.";
             },
         ];
         let registry = SkillRegistry {
-            skills,
+            skills: RwLock::new(skills),
             skills_dir: PathBuf::from("test"),
+            last_scan: RwLock::new(SystemTime::UNIX_EPOCH),
         };
 
         let relevant = registry.find_relevant("Please do a code review on my PR");
@@ -604,8 +647,9 @@ Body here.";
             path: PathBuf::from("test"),
         }];
         let registry = SkillRegistry {
-            skills,
+            skills: RwLock::new(skills),
             skills_dir: PathBuf::from("test"),
+            last_scan: RwLock::new(SystemTime::UNIX_EPOCH),
         };
 
         assert!(registry.get("code-review").is_some());
@@ -635,8 +679,9 @@ Body here.";
             },
         ];
         let registry = SkillRegistry {
-            skills,
+            skills: RwLock::new(skills),
             skills_dir: PathBuf::from("test"),
+            last_scan: RwLock::new(SystemTime::UNIX_EPOCH),
         };
         let meta = registry.list_metadata();
         assert_eq!(meta.len(), 2);
@@ -657,9 +702,9 @@ Body here.";
     #[test]
     fn test_builtin_user_override_last_wins() {
         // User directory skill with same name as builtin — user wins
-        let mut registry = SkillRegistry::empty();
+        let registry = SkillRegistry::empty();
         // Manually add a "user" skill with the same name
-        registry.skills.push(Skill {
+        registry.skills.write().unwrap().push(Skill {
             name: "anti-fixation".into(),
             description: "user override version".into(),
             body: "custom".into(),

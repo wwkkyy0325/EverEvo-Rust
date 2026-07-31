@@ -358,6 +358,26 @@ async fn cmd_serve(config: everevo_core::AppConfig, host: &str, port: u16) {
         let _ = open::that(&url);
     }
 
+    // ── A2A Gateway (separate port) ─────────────────────────────
+    let a2a_port = port + 1;
+    let a2a_addr = format!("{host}:{a2a_port}");
+    let a2a_router = state.a2a_gateway.router();
+    let a2a_listener = tokio::net::TcpListener::bind(&a2a_addr)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("A2A gateway: failed to bind {a2a_addr}: {e}");
+            std::process::exit(1);
+        });
+    tracing::info!("A2A gateway → http://{a2a_addr}");
+    let _a2a_handle = tokio::spawn(async move {
+        axum::serve(a2a_listener, a2a_router)
+            .with_graceful_shutdown(async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await
+            .ok();
+    });
+
     // Graceful shutdown on Ctrl+C / SIGTERM
     axum::serve(listener, app)
         .with_graceful_shutdown(async {

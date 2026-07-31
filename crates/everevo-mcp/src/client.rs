@@ -232,8 +232,29 @@ impl McpClient {
             },
             Transport::Http { .. } => {
                 // HTTP is stateless — can't check process liveness.
-                // Use ping() to verify connectivity instead.
+                // Use ping() or is_alive_async() to verify connectivity instead.
                 true
+            }
+        }
+    }
+
+    /// Check HTTP transport liveness by sending a ping RPC.
+    /// For stdio, equivalent to `is_alive()` (checks process exit).
+    pub async fn is_alive_async(&mut self) -> bool {
+        match &mut self.transport {
+            Transport::Stdio { child, .. } => match child.try_wait() {
+                Ok(None) => true,
+                Ok(Some(status)) => {
+                    tracing::warn!(exit = %status, "MCP server process exited");
+                    false
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to check MCP server process");
+                    false
+                }
+            },
+            Transport::Http { .. } => {
+                self.ping().await
             }
         }
     }

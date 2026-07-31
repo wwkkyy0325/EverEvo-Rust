@@ -196,6 +196,10 @@ pub struct TeamTool {
     results: Arc<std::sync::Mutex<HashMap<String, String>>>,
     /// Concurrency cap — prevents overwhelming the LLM API (default 8).
     max_concurrent: usize,
+    /// Shared pending counter (from TaskTool) — auto-continue loop watches this.
+    shared_pending: Option<super::delegate::SharedPending>,
+    /// Shared results backlog (from TaskTool) — auto-continue loop drains this.
+    shared_backlog: Option<super::delegate::SharedBacklog>,
 }
 
 impl TeamTool {
@@ -208,6 +212,8 @@ impl TeamTool {
             statuses: Arc::new(std::sync::Mutex::new(Vec::new())),
             pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             results: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            shared_pending: None,
+            shared_backlog: None,
             max_concurrent: 8,
         }
     }
@@ -224,6 +230,19 @@ impl TeamTool {
 
     pub fn with_sandbox_root(mut self, root: Arc<std::path::PathBuf>) -> Self {
         self.sandbox_root = Some(root);
+        self
+    }
+
+    /// Wire into the shared auto-continue system.
+    /// Team member results are pushed to the shared backlog so the main
+    /// agent loop can see completions and trigger auto-continue.
+    pub fn with_shared_counters(
+        mut self,
+        pending: super::delegate::SharedPending,
+        backlog: super::delegate::SharedBacklog,
+    ) -> Self {
+        self.shared_pending = Some(pending);
+        self.shared_backlog = Some(backlog);
         self
     }
 
@@ -293,10 +312,18 @@ impl TeamTool {
         self.statuses.lock().unwrap().push(status);
         self.pending
             .fetch_add(1, std::sync::atomic::Ordering::Release);
+        // Also bump shared pending for auto-continue
+        if let Some(ref sp) = self.shared_pending {
+            sp.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
 
         let statuses = self.statuses.clone();
         let pending = self.pending.clone();
         let results = self.results.clone();
+        let shared_pending = self.shared_pending.clone();
+        let shared_backlog = self.shared_backlog.clone();
+        let subagent_id_str = subagent_id.to_string();
+        let desc_clone = desc.clone();
 
         tokio::spawn(async move {
             let _permit = _permit; // hold semaphore permit until task completes
@@ -309,11 +336,21 @@ impl TeamTool {
                 .run_subagent(llm, tools, messages, CancellationToken::new())
                 .await;
 
-            // Store result
+            // Store result in team's own map
             results
                 .lock()
                 .unwrap()
-                .insert(subagent_id.to_string(), result_text.clone());
+                .insert(subagent_id_str.clone(), result_text.clone());
+
+            // Push into shared backlog so auto-continue loop can read it
+            if let Some(ref bl) = shared_backlog {
+                bl.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((subagent_id_str.clone(), desc_clone, result_text));
+            }
+            if let Some(ref sp) = shared_pending {
+                sp.fetch_sub(1, std::sync::atomic::Ordering::Release);
+            }
 
             // Update status
             if let Ok(mut s) = statuses.lock() {
@@ -435,17 +472,12 @@ impl Tool for TeamTool {
             dispatched.push(member_ids.last().unwrap().1.clone());
         }
 
-        // Wait for all members to complete (with timeout)
-        let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(300); // 5 min total
-        while self.pending.load(std::sync::atomic::Ordering::Acquire) > 0 {
-            if start.elapsed() > timeout {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
+        // Give sub-agents a brief window to start and return fast results.
+        // No more 5-minute blocking — the main agent's auto-continue loop
+        // will inject results via SSE as they complete.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-        // Collect results
+        // Collect any results that arrived so far
         let results = self.results.lock().unwrap();
         let mut synthesis = format!(
             "## Team Dispatch: {task}\n\n**{count} members dispatched:**\n{members}\n\n---\n\n",

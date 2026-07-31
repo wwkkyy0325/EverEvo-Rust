@@ -125,7 +125,7 @@ interface ChatState {
   showMemory: boolean;
   showAudit: boolean;
 
-  confirmRequest: ConfirmRequest | null;
+  confirmQueue: ConfirmRequest[];
   auditRecords: AuditRecord[]; auditTotal: number;
 
   // ── Actions ──
@@ -206,7 +206,7 @@ export const useStore = create<ChatState>((set, get) => ({
 
   streaming: false, draftId: null, abortController: null,
   todos: [], subagentTasks: [], showMemory: false, showAudit: false,
-  confirmRequest: null, workspacePath: null,
+  confirmQueue: [], workspacePath: null,
   planMode: false, planTask: null,
 
   // ── Session list ──────────────────────────────────────────────────
@@ -305,9 +305,10 @@ export const useStore = create<ChatState>((set, get) => ({
   abortStream: () => { const { abortController } = get(); if (abortController) abortController.abort(); },
 
   confirmCommand: async (approved: boolean) => {
-    const req = get().confirmRequest; if (!req) return;
+    const queue = get().confirmQueue; if (queue.length === 0) return;
+    const req = queue[0];
     try { await fetch(`/api/sandbox/sessions/${req.sessionId}/confirm`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ approved }) }); } catch { /* ignore */ }
-    set({ confirmRequest: null });
+    set({ confirmQueue: queue.slice(1) });
   },
 
   setPermissionLevel: async (level: string) => {
@@ -446,7 +447,8 @@ export const useStore = create<ChatState>((set, get) => ({
           if (currentEvent === 'confirmation_required') {
             try {
               const cr = JSON.parse(data);
-              set({ confirmRequest: { sessionId: cr.session_id as string, command: cr.command as string, reason: cr.reason as string } });
+              const newReq = { sessionId: cr.session_id as string, command: cr.command as string, reason: cr.reason as string };
+              set((s) => ({ confirmQueue: [...s.confirmQueue, newReq] }));
             } catch { /* ignore */ }
             continue;
           }

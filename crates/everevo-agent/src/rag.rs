@@ -1,8 +1,19 @@
 //! RAG pipeline — ONNX embedder + dim-aware multi-collection vector store.
 //!
 //! Uses `ModelRegistry` to auto-detect available embedding models and their
-//! dimensions. Collections are named `{namespace}-{dim}.bin` so switching
-//! models creates new collections without overwriting old data.
+//! dimensions. Collections are named `{namespace}-{dim}.bin`.
+//!
+//! ## Vector storage layout (co-located with source data)
+//!
+//! ```text
+//! data/memory/vector/   ← memory-{dim}.bin, wiki-{dim}.bin, code-{dim}.bin
+//! data/domain/vector/   ← domain-{dim}.bin
+//! ```
+//!
+//! Memory-related vectors live alongside facts/diary/persona under `data/memory/`.
+//! Domain vectors live under `data/domain/` alongside ingested documents.
+//! This follows the industry pattern (ChromaDB, LlamaIndex, Milvus) of co-locating
+//! vector indexes with their source data rather than in a flat `data/vector/` dump.
 
 use std::path::Path;
 
@@ -13,12 +24,19 @@ use everevo_vector::{
     RawChunk, ScoredChunk,
 };
 
+/// Collections that belong under `data/memory/vector/`.
+const MEMORY_COLLECTIONS: &[&str] = &["memory", "wiki", "code"];
+/// Collections that belong under `data/domain/vector/`.
+const DOMAIN_COLLECTIONS: &[&str] = &["domain"];
+
 /// The RAG pipeline — embedder + dim-aware vector collections.
 pub struct RagPipeline {
     /// Text → vector embedding model.
     embedder: Box<dyn EmbeddingModel>,
-    /// Dim-aware namespaced HNSW collections.
-    pub collections: MultiCollectionStore,
+    /// Memory-related collections (facts, wiki, code).
+    pub memory_store: MultiCollectionStore,
+    /// Domain-related collections (ingested documents).
+    pub domain_store: MultiCollectionStore,
     /// Whether real (ONNX) embeddings are in use.
     pub real_embeddings: bool,
     /// Active model name.
@@ -29,12 +47,12 @@ pub struct RagPipeline {
 
 impl RagPipeline {
     /// Create a RAG pipeline using the active model from the registry.
-    ///
-    /// Vectors are stored under `data_dir/vector/{name}-{dim}.bin`.
     pub fn new(data_dir: &Path, registry: &ModelRegistry) -> Result<Self, EverEvoError> {
         let active = registry.active();
-        let vector_dir = data_dir.join("vector");
-        let old_path = data_dir.join("memory").join("vector").join("chunks.json");
+        let memory_vector_dir = data_dir.join("memory").join("vector");
+        let domain_vector_dir = data_dir.join("domain").join("vector");
+        let old_vector_dir = data_dir.join("vector");
+        let old_json = data_dir.join("memory").join("vector").join("chunks.json");
 
         let models_dir = data_dir.join("models");
         let (embedder, real): (Box<dyn EmbeddingModel>, bool) =
@@ -48,25 +66,74 @@ impl RagPipeline {
                 (Box::new(DummyEmbedder::new(active.dim)), false)
             };
 
-        let collections = MultiCollectionStore::open(&vector_dir, active.dim, Some(&old_path))?;
+        // Migrate old `data/vector/*.bin` → new layout on first start
+        Self::migrate_old_vectors(&old_vector_dir, &memory_vector_dir, &domain_vector_dir, active.dim);
+
+        let memory_store = MultiCollectionStore::open(&memory_vector_dir, active.dim, Some(&old_json))?;
+        let domain_store = MultiCollectionStore::open(&domain_vector_dir, active.dim, None)?;
 
         tracing::info!(
             model = %active.name,
             dim = active.dim,
             real_embeddings = real,
+            memory_dir = %memory_vector_dir.display(),
+            domain_dir = %domain_vector_dir.display(),
             "RagPipeline initialized"
         );
 
         Ok(Self {
             embedder,
-            collections,
+            memory_store,
+            domain_store,
             real_embeddings: real,
             model_name: active.name.clone(),
             dim: active.dim,
         })
     }
 
-    /// Re-create the pipeline with a new active model (after registry.activate()).
+    /// Migrate old `data/vector/{name}-{dim}.bin` files to the new co-located
+    /// layout. One-time operation — skips if old dir doesn't exist.
+    fn migrate_old_vectors(
+        old_dir: &Path,
+        memory_dir: &Path,
+        domain_dir: &Path,
+        dim: usize,
+    ) {
+        if !old_dir.exists() {
+            return;
+        }
+        std::fs::create_dir_all(memory_dir).ok();
+        std::fs::create_dir_all(domain_dir).ok();
+
+        let mut moved = 0u32;
+        for &collection in MEMORY_COLLECTIONS {
+            let old_file = old_dir.join(format!("{}-{}.bin", collection, dim));
+            let new_file = memory_dir.join(format!("{}-{}.bin", collection, dim));
+            if old_file.exists() && !new_file.exists()
+                && std::fs::rename(&old_file, &new_file).is_ok()
+            {
+                moved += 1;
+            }
+        }
+        for &collection in DOMAIN_COLLECTIONS {
+            let old_file = old_dir.join(format!("{}-{}.bin", collection, dim));
+            let new_file = domain_dir.join(format!("{}-{}.bin", collection, dim));
+            if old_file.exists() && !new_file.exists()
+                && std::fs::rename(&old_file, &new_file).is_ok()
+            {
+                moved += 1;
+            }
+        }
+        if moved > 0 {
+            tracing::info!(
+                moved,
+                from = %old_dir.display(),
+                "Migrated vector files to new co-located layout"
+            );
+        }
+    }
+
+    /// Re-create the pipeline with a new active model.
     pub fn reload(
         &mut self,
         data_dir: &Path,
@@ -74,7 +141,8 @@ impl RagPipeline {
     ) -> Result<(), EverEvoError> {
         let active = registry.active();
         let models_dir = data_dir.join("models");
-        let vector_dir = data_dir.join("vector");
+        let memory_vector_dir = data_dir.join("memory").join("vector");
+        let domain_vector_dir = data_dir.join("domain").join("vector");
 
         let (embedder, real): (Box<dyn EmbeddingModel>, bool) =
             if let Ok(onnx) = OnnxEmbedder::new(&active.name, &models_dir) {
@@ -87,7 +155,8 @@ impl RagPipeline {
                 (Box::new(DummyEmbedder::new(active.dim)), false)
             };
 
-        self.collections = MultiCollectionStore::open(&vector_dir, active.dim, None)?;
+        self.memory_store = MultiCollectionStore::open(&memory_vector_dir, active.dim, None)?;
+        self.domain_store = MultiCollectionStore::open(&domain_vector_dir, active.dim, None)?;
         self.embedder = embedder;
         self.real_embeddings = real;
         self.model_name = active.name.clone();
@@ -95,6 +164,15 @@ impl RagPipeline {
 
         tracing::info!(model = %active.name, dim = active.dim, "RagPipeline reloaded");
         Ok(())
+    }
+
+    /// Route a collection name to the correct store.
+    fn store_for(&self, collection: &str) -> &MultiCollectionStore {
+        if DOMAIN_COLLECTIONS.contains(&collection) {
+            &self.domain_store
+        } else {
+            &self.memory_store
+        }
     }
 
     /// Embed and ingest into a specific collection.
@@ -115,7 +193,7 @@ impl RagPipeline {
                 retrieval_count: 0,
             })
             .collect();
-        self.collections.insert(collection, memory_chunks)
+        self.store_for(collection).insert(collection, memory_chunks)
     }
 
     /// Semantic search within a single collection.
@@ -126,10 +204,12 @@ impl RagPipeline {
         top_k: usize,
     ) -> Result<Vec<ScoredChunk>, EverEvoError> {
         let query_vector = self.embedder.encode(query)?;
-        self.collections.search(collection, &query_vector, top_k)
+        self.store_for(collection).search(collection, &query_vector, top_k)
     }
 
     /// Cross-collection search with RRF fusion.
+    /// NOTE: Cross-store RRF is not supported; all collections must be in the same store.
+    /// Falls back to searching the memory store (which has most collections).
     pub fn search_multi(
         &self,
         collections: &[&str],
@@ -137,8 +217,36 @@ impl RagPipeline {
         top_k: usize,
     ) -> Result<Vec<ScoredChunk>, EverEvoError> {
         let query_vector = self.embedder.encode(query)?;
-        self.collections
-            .search_multi(collections, &query_vector, top_k)
+        // Search memory store (holds memory + wiki + code)
+        let memory_cols: Vec<&str> = collections
+            .iter()
+            .filter(|c| MEMORY_COLLECTIONS.contains(c))
+            .copied()
+            .collect();
+        let domain_cols: Vec<&str> = collections
+            .iter()
+            .filter(|c| DOMAIN_COLLECTIONS.contains(c))
+            .copied()
+            .collect();
+
+        let mut all_results: Vec<ScoredChunk> = Vec::new();
+        if !memory_cols.is_empty() {
+            if let Ok(r) = self.memory_store.search_multi(&memory_cols, &query_vector, top_k) {
+                all_results.extend(r);
+            }
+        }
+        if !domain_cols.is_empty() {
+            if let Ok(r) = self.domain_store.search_multi(&domain_cols, &query_vector, top_k) {
+                all_results.extend(r);
+            }
+        }
+        if all_results.is_empty() && !collections.is_empty() {
+            // Fallback: single collection search in whichever store
+            return self.search_in(collections[0], query, top_k);
+        }
+        all_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        all_results.truncate(top_k);
+        Ok(all_results)
     }
 
     /// Encode a query to vector for hybrid search RRF.
@@ -146,9 +254,9 @@ impl RagPipeline {
         self.embedder.encode(query)
     }
 
-    /// Total vector count.
+    /// Total vector count across all stores.
     pub fn total_count(&self) -> usize {
-        self.collections.total_count()
+        self.memory_store.total_count() + self.domain_store.total_count()
     }
 }
 

@@ -43,6 +43,7 @@ tracing.workspace = true
 reqwest.workspace = true
 which = "6"
 open = "5"
+tokio-tungstenite = { version = "0.24", features = ["connect"] }
 
 [dev-dependencies]
 tempfile = "3"

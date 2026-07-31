@@ -7,6 +7,7 @@
 //! | `bootstrap` | everevo_bootstrap::Bootstrap | Direct API → Bootstrap::check() |
 
 mod bootstrap;
+mod browser_bridge;
 mod cluster;
 mod code_search;
 mod compact;

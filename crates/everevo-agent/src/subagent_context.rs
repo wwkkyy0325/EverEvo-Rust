@@ -258,6 +258,7 @@ pub async fn assemble_subagent_context(
     shell_name: &str,
     tool_names: &[String],
     todo_summary: Option<String>,
+    skill_list: Option<String>,
 ) -> SubAgentContext {
     let ctx = ContextBuildContext {
         user_message: user_message.to_string(),
@@ -287,6 +288,13 @@ pub async fn assemble_subagent_context(
 
     let mut sub_ctx = SubAgentContext::default();
     sub_ctx.system_info = build_system_info_block(shell_name, tool_names);
+
+    // ── Skill list from registry ──────────────────────────────
+    if let Some(ref skills) = skill_list {
+        if !skills.is_empty() {
+            sub_ctx.skills = skills.clone();
+        }
+    }
 
     // ── Memory ───────────────────────────────────────────────
     if let Some(stage) = memory_stage {

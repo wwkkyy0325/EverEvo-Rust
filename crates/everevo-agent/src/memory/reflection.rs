@@ -24,11 +24,12 @@ pub async fn reflect_on_turn(
     user_msg: &str,
     assistant_msg: &str,
 ) {
+    // Reflexion (Shinn et al. 2023): reflect once per meaningful episode,
+    // analyzing the full trajectory. We model each turn as a mini-episode
+    // and trigger deterministically when the exchange has substance.
+    // Skip trivial turns; the LLM produces `[NO_LESSONS]` for non-actionable
+    // content, so overlarge triggers only waste tokens, not correctness.
     if user_msg.len() < 20 || assistant_msg.len() < 20 {
-        return;
-    }
-    // Probabilistic throttle: ~30% of turns trigger reflection (saves LLM tokens).
-    if !should_run_throttle() {
         return;
     }
 
@@ -93,12 +94,22 @@ pub async fn compose_workflow_if_reusable(
     user_msg: &str,
     assistant_msg: &str,
 ) {
-    // Heuristic gate: only substantial turns are worth composing.
+    // Agent Workflow Memory (Wang et al. 2024, ICML 2025): extract workflows
+    // from successfully completed tasks, not from every turn. We model each
+    // substantial turn as a mini-task and apply:
+    // 1. Success gate — skip if the response looks like an error/failure
+    // 2. Turn counter — only attempt every 5th substantial turn (avoids
+    //    spamming the LLM while still firing ~once per real session)
     if user_msg.len() < 30 || assistant_msg.len() < 200 {
         return;
     }
-    // Probabilistic throttle: ~30% of turns trigger compose (saves LLM tokens).
-    if !should_run_throttle() {
+    // Success gate: skip error/failure turns (AWM extracts from successes)
+    if is_error_response(assistant_msg) {
+        tracing::debug!("Auto-compose: skipped — response looks like an error");
+        return;
+    }
+    // Turn counter: fire every 5th substantial turn
+    if !should_compose_now() {
         return;
     }
     let runner = crate::tools::builtins::WorkflowRunnerTool::new()
@@ -178,15 +189,29 @@ fn build_compose_prompt(user_msg: &str, assistant_msg: &str) -> String {
     )
 }
 
-/// Probabilistic throttle: ~30% of calls return `true`, to spread reflection
-/// and compose LLM calls across turns without burning tokens every round.
-fn should_run_throttle() -> bool {
-    (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as u16)
-        % 10
-        < 3
+/// Turn-counter throttle: returns `true` every 5th call (roughly once per
+/// real session). Uses a static atomic counter rather than probabilistic
+/// sampling so the spacing is deterministic — AWM extracts workflows after
+/// completed tasks, not randomly.
+fn should_compose_now() -> bool {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    COUNTER.fetch_add(1, Ordering::Relaxed) % 5 == 0
+}
+
+/// Quick heuristic: does the assistant response look like an error/failure?
+/// AWM extracts workflows from successful trajectories only.
+fn is_error_response(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("error:")
+        || lower.contains("failed:")
+        || lower.contains("cannot")
+        || lower.contains("unable to")
+        || lower.contains("i couldn't")
+        || lower.contains("blocked")
+        || lower.contains("permission denied")
+        || lower.contains("not available")
+        || lower.len() < 100 // very short = likely truncation/error
 }
 
 fn build_reflection_prompt(user_msg: &str, assistant_msg: &str) -> String {

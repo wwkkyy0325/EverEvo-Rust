@@ -193,11 +193,12 @@ impl Tool for TodoWriteTool {
 
         let mut store = self.store.write().await;
 
-        // If all todos are completed, clear the list (Claude Code behavior)
+        // If all session-scoped todos are completed, clear the list
+        // (Claude Code behavior). Global todos always persist — never auto-delete.
         let all_done = todos.iter().all(|t| t.status == "completed");
-        if all_done {
+        let is_global = session_id == GLOBAL_TASK_KEY;
+        if all_done && !is_global {
             store.remove(&session_id);
-            // Remove persisted file if it exists
             if let Some(ref dir) = self.persist_dir {
                 let path = dir.join(format!("{session_id}.json"));
                 let _ = std::fs::remove_file(&path);

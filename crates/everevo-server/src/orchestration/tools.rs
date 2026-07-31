@@ -380,7 +380,8 @@ pub async fn assemble(
     // ── Task tool (sub-agent delegation) ──
     // Enable recursive delegation for sub-agents within depth limit.
     // base_for_task gets a task tool clone; TaskTool itself gets a copy without it.
-    let task_tool = if sub_ctx.depth < everevo_agent::subagent_context::MAX_RECURSION_DEPTH {
+    let max_depth = state.config.subagent_max_depth;
+    let task_tool = if sub_ctx.depth < max_depth {
         let mut task_registry = ToolRegistry::new();
         for name in &[
             "shell",
@@ -412,7 +413,7 @@ pub async fn assemble(
     } else {
         tracing::info!(
             depth = sub_ctx.depth,
-            max = everevo_agent::subagent_context::MAX_RECURSION_DEPTH,
+            max = max_depth,
             "Task tool disabled for sub-agents — max depth reached"
         );
         everevo_agent::tools::builtins::TaskTool::new(
@@ -484,7 +485,8 @@ pub async fn assemble(
             Arc::clone(client),
             Arc::new(base_for_workflow),
             Arc::new(session_work_dir.unwrap_or_else(|| state.config.data_dir.join("sandbox"))),
-        ),
+        )
+        .with_shared_counters(pending.clone(), task_backlog.clone()),
     ));
 
     // ── Team tool — wired with LLM + tools for real sub-agent dispatch ──
@@ -500,7 +502,8 @@ pub async fn assemble(
         everevo_agent::tools::builtins::TeamTool::new()
             .with_llm(Arc::clone(client))
             .with_base_tools(Arc::new(team_base))
-            .with_sandbox_root(Arc::new(sandbox_root)),
+            .with_sandbox_root(Arc::new(sandbox_root))
+            .with_shared_counters(pending.clone(), task_backlog.clone()),
     ));
 
     // ── Audit hook — logs every tool call ──

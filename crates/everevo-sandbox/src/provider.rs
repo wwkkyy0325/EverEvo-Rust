@@ -152,6 +152,16 @@ impl TieredSandbox {
         if let Ok(token) = std::env::var("GITHUB_TOKEN") {
             cmd.env("GITHUB_TOKEN", &token);
         }
+        // ── HTTP proxy passthrough ────────────────────────────────
+        // Sandbox inherits host proxy settings so git/curl/wget work
+        // behind firewalls/GFW without manual per-tool configuration.
+        for proxy_var in &["HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"] {
+            if let Ok(val) = std::env::var(proxy_var) {
+                if !val.is_empty() {
+                    cmd.env(proxy_var, &val);
+                }
+            }
+        }
         cmd
     }
 

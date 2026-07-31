@@ -1,9 +1,129 @@
 //! HTTP LLM client — Anthropic + OpenAI-compatible streaming.
+//!
+//! ## Proxy detection
+//!
+//! The client reads `HTTPS_PROXY` / `HTTP_PROXY` env vars (and their
+//! lowercase variants) to route through a local proxy. This is essential in
+//! mainland China where direct API access to `api.deepseek.com` or
+//! `api.anthropic.com` may be blocked. Common proxy setups:
+//! - Clash / V2Ray: `http://127.0.0.1:7890`
+//! - System proxy (IE settings): auto-detected via `native-tls`
+//! - Env var: `HTTPS_PROXY=http://your-proxy:port`
 
 use async_trait::async_trait;
 
 use everevo_core::llm::{LlmMessage, LlmProvider, LlmResponse, StreamEvent, ToolSchema};
 use everevo_core::EverEvoError;
+
+// ── Proxy detection ───────────────────────────────────────────────────────
+
+/// Detect proxy URL from environment variables.
+///
+/// Checks in order: `EVEREVO_HTTP_PROXY`, `HTTPS_PROXY`, `https_proxy`,
+/// `HTTP_PROXY`, `http_proxy`, `ALL_PROXY`, `all_proxy`.
+///
+/// Falls back to auto-detecting common local proxy ports (Clash: 7890,
+/// V2Ray: 10808) by attempting a TCP connect. Returns `None` only if
+/// no proxy is configured and no known proxy port responds.
+pub async fn detect_proxy() -> Option<String> {
+    // 1. Explicit override (EverEvo-specific)
+    if let Ok(val) = std::env::var("EVEREVO_HTTP_PROXY") {
+        let val = val.trim().to_string();
+        if !val.is_empty() {
+            tracing::info!(proxy = %val, "Using EVEREVO_HTTP_PROXY");
+            return Some(val);
+        }
+    }
+    // 2. Standard env vars
+    for var in &[
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        if let Ok(val) = std::env::var(var) {
+            let val = val.trim().to_string();
+            if !val.is_empty() {
+                tracing::info!(proxy_var = var, proxy = %val, "Proxy detected from env");
+                return Some(val);
+            }
+        }
+    }
+    // 3. Auto-detect common local proxy ports (Clash / V2Ray / Shadowsocks)
+    // These are the most common in mainland China; a TCP connect to the
+    // proxy port confirms the proxy is running.
+    const CANDIDATE_PORTS: &[u16] = &[7890, 7891, 10808, 10809, 8118, 1080];
+    for &port in CANDIDATE_PORTS {
+        let addr = format!("127.0.0.1:{port}");
+        if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+            // Assume HTTP proxy on this port. SOCKS5 ports (7891, 10809, 1080)
+            // get a socks5h:// prefix; HTTP ports get http://.
+            let scheme = match port {
+                7891 | 10809 | 1080 => "socks5h",
+                _ => "http",
+            };
+            let proxy_url = format!("{scheme}://{addr}");
+            tracing::info!(%proxy_url, "Auto-detected local proxy");
+            return Some(proxy_url);
+        }
+    }
+    None
+}
+
+/// Sync proxy detection from env vars only (no network I/O).
+pub fn detect_proxy_sync() -> Option<String> {
+    if let Ok(val) = std::env::var("EVEREVO_HTTP_PROXY") {
+        let val = val.trim().to_string();
+        if !val.is_empty() {
+            return Some(val);
+        }
+    }
+    for var in &[
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        if let Ok(val) = std::env::var(var) {
+            let val = val.trim().to_string();
+            if !val.is_empty() {
+                return Some(val);
+            }
+        }
+    }
+    None
+}
+
+/// Build a reqwest client with optional proxy.
+pub fn build_llm_http_client(proxy_url: Option<&str>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(600))
+        .user_agent(format!("EverEvo/{}", env!("CARGO_PKG_VERSION")));
+
+    // Apply proxy from env vars (sync)
+    let env_proxy = detect_proxy_sync();
+    let proxy_src = proxy_url.or(env_proxy.as_deref());
+    if let Some(url) = proxy_src {
+        match reqwest::Proxy::all(url) {
+            Ok(proxy) => {
+                builder = builder.proxy(proxy);
+                tracing::info!(%url, "LLM client using proxy");
+            }
+            Err(e) => {
+                tracing::warn!(%url, error = %e, "Invalid proxy URL — proceeding without proxy");
+            }
+        }
+    }
+
+    builder.build().unwrap_or_default()
+}
+
+// ── Client ────────────────────────────────────────────────────────────────
 
 /// LLM provider via HTTP (Anthropic Messages API or OpenAI Chat Completions).
 pub struct HttpClient {
@@ -16,12 +136,18 @@ pub struct HttpClient {
 
 impl HttpClient {
     pub fn new(api_format: &str, api_key: &str, base_url: &str, model: &str) -> Self {
-        let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(15))
-            .timeout(std::time::Duration::from_secs(600))
-            .user_agent(format!("EverEvo/{}", env!("CARGO_PKG_VERSION")))
-            .build()
-            .unwrap_or_default();
+        Self::with_proxy(api_format, api_key, base_url, model, None)
+    }
+
+    /// Create client with an explicit proxy URL (bypasses env-var detection).
+    pub fn with_proxy(
+        api_format: &str,
+        api_key: &str,
+        base_url: &str,
+        model: &str,
+        proxy_url: Option<&str>,
+    ) -> Self {
+        let client = build_llm_http_client(proxy_url);
         Self {
             api_format: api_format.into(),
             api_key: api_key.into(),
@@ -316,13 +442,21 @@ impl LlmProvider for HttpClient {
             let resp = match req.send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    // reqwest errors (timeout, connection reset, DNS) are retryable
                     let msg = format!("{e}");
                     let is_timeout = e.is_timeout() || msg.contains("timeout");
                     let is_connect = e.is_connect() || msg.contains("connect");
                     if is_timeout || is_connect {
+                        let detail = if is_connect {
+                            format!(
+                                "Connection to {} failed. Check network, VPN/proxy, or base_url in config. \
+                                 (Tip: set HTTPS_PROXY=http://127.0.0.1:PORT if using a local proxy.)",
+                                self.endpoint()
+                            )
+                        } else {
+                            format!("Request to {} timed out after 600s.", self.endpoint())
+                        };
                         last_error = Some(EverEvoError::LlmProvider(format!(
-                            "Request failed (attempt {}/{}): {e}",
+                            "{detail} (attempt {}/{}, error: {e})",
                             attempt + 1,
                             HttpClient::MAX_RETRIES + 1
                         )));

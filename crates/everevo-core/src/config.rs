@@ -69,7 +69,15 @@ pub struct AppConfig {
     /// `data/models/`. If not set, the first discovered model is used.
     #[serde(default)]
     pub embedding_model: Option<String>,
+
+    /// Maximum sub-agent recursion depth (default 3).
+    /// Sub-agents deeper than this cannot spawn further sub-agents.
+    /// Prevents infinite recursive delegation.
+    #[serde(default = "default_subagent_max_depth")]
+    pub subagent_max_depth: u32,
 }
+
+fn default_subagent_max_depth() -> u32 { 3 }
 
 /// Configuration for an MCP server connection.
 /// Mirrors Claude Code's `.mcp.json` format with three transport types.
@@ -175,6 +183,7 @@ impl Default for AppConfig {
             mcp_servers: Vec::new(),
             workspace_dir: None,
             embedding_model: None,
+            subagent_max_depth: default_subagent_max_depth(),
         }
     }
 }

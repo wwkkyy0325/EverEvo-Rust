@@ -145,7 +145,7 @@ impl SubAgentPool {
                     description: task.description,
                     status: if content.starts_with("Timeout") {
                         "timeout".into()
-                    } else if content.starts_with("Error:") {
+                    } else if is_error_content(&content) {
                         "failed".into()
                     } else {
                         "completed".into()
@@ -219,6 +219,8 @@ impl SubAgentPool {
                     description: task.description,
                     status: if content.starts_with("Timeout") {
                         "timeout".into()
+                    } else if is_error_content(&content) {
+                        "failed".into()
                     } else {
                         "completed".into()
                     },
@@ -238,6 +240,45 @@ impl SubAgentPool {
     pub fn tools(&self) -> &Arc<ToolRegistry> {
         &self.tools
     }
+}
+
+// ── Error Classification Helper ─────────────────────────────────────────────
+
+/// Classify sub-agent result content as an error.
+///
+/// Matches the error patterns produced by:
+/// - `run_subagent` (`mod.rs`): "Error: {e}", "Error: LLM stream stalled..."
+/// - `HttpClient::stream_chat` (`http.rs`): "Authentication failed (HTTP 401)...",
+///   "Rate limited (HTTP 429)...", "Server error (HTTP 500)...",
+///   "Model overloaded (HTTP 529)...", "Bad request (HTTP 400)...",
+///   "Connection failed: ...", "Network error: ..."
+/// - Cancellation/timeout: "[Cancelled]", "Timeout after..."
+/// - Empty result (channel dropped before any event)
+fn is_error_content(content: &str) -> bool {
+    if content.is_empty() {
+        return true;
+    }
+    if content.starts_with("Error:")
+        || content.starts_with("Timeout")
+        || content.contains("[Cancelled]")
+    {
+        return true;
+    }
+    // Match HTTP-level errors smuggled as StreamEvent::Text
+    if content.starts_with("Authentication failed")
+        || content.starts_with("Rate limited")
+        || content.starts_with("Server error")
+        || content.starts_with("Model overloaded")
+        || content.starts_with("Bad request")
+        || content.starts_with("Connection failed")
+        || content.starts_with("Network error")
+        || content.starts_with("API error")
+        || content.starts_with("Invalid request")
+        || content.starts_with("Failed to read response")
+    {
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]

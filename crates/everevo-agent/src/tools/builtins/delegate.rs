@@ -31,6 +31,15 @@ use crate::subagent_context::SubAgentContext;
 const FALLBACK_SUBAGENT_MAX_TURNS: usize = 100;
 const FALLBACK_SUBAGENT_TIMEOUT_SECS: u64 = 600;
 
+// ── Shared types ─────────────────────────────────────────────────────────
+
+/// Shared sub-agent results backlog — (task_id, description, result_text).
+/// All sub-agent dispatch paths (TaskTool, WorkflowTool, TeamTool) push here
+/// so the auto-continue loop in chat.rs can drain results uniformly.
+pub type SharedBacklog = Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
+/// Shared pending sub-agent counter — auto-continue loop watches this.
+pub type SharedPending = Arc<std::sync::atomic::AtomicUsize>;
+
 // ── Sub-agent Handle & Status ───────────────────────────────────────────
 
 /// Handle to a running sub-agent — enables monitoring and cancellation.
@@ -271,8 +280,17 @@ impl TaskTool {
 
         let handle = tokio::spawn(async move {
             let Some(llm_client) = llm else {
+                let err_msg = format!(
+                    "[SubAgent FAILED] {desc}\nNo LLM configured for sub-agent."
+                );
+                backlog
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((subagent_id.to_string(), desc.to_string(), err_msg.clone()));
+                if let Some(ref t) = tx {
+                    let _ = t.send(err_msg);
+                }
                 pending.fetch_sub(1, Ordering::SeqCst);
-                let _ = tx.map(|t| t.send("SubAgent failed: no LLM configured".into()));
                 return;
             };
 
@@ -624,12 +642,13 @@ async fn spawn_single(
     let mut child_ctx = sub_ctx.clone();
     child_ctx.depth = sub_ctx.depth.saturating_add(1);
 
+    // Pass ALL tools from base_tools — not just shell+memory.
+    // Each delegation level would lose tools otherwise (cascading tool loss).
     let mut sub_tools = everevo_core::tool::ToolRegistry::new();
-    if let Some(shell) = base_tools.get("shell") {
-        sub_tools.register(Arc::clone(shell));
-    }
-    if let Some(memory) = base_tools.get("memory") {
-        sub_tools.register(Arc::clone(memory));
+    for name in base_tools.names() {
+        if let Some(tool) = base_tools.get(name) {
+            sub_tools.register(Arc::clone(tool));
+        }
     }
 
     // Build the full system prompt with type-specific guidance.
@@ -661,26 +680,51 @@ async fn spawn_single(
         .join("telemetry")
         .join("subagent_tasks");
     std::fs::create_dir_all(&persist_dir).ok();
+    let content_len = final_text.len();
+    let meta_note = if content_len == 0 {
+        "empty response — likely channel drop or LLM connection failure"
+    } else if duration_ms < 3000 && final_text.starts_with("Error:") {
+        "fast failure — likely LLM API error"
+    } else {
+        "sub-agent completed"
+    };
     let _ = std::fs::write(
         persist_dir.join(format!("{}.json", sa_id)),
         serde_json::to_string_pretty(&serde_json::json!({
             "id": sa_id.to_string(),
             "task": desc,
-            "success": !final_text.is_empty(),
-            "_note": "turn/tool_call counts not tracked by run_subagent",
+            "success": !final_text.is_empty() && !final_text.starts_with("Error:"),
             "duration_ms": duration_ms,
+            "content_len": content_len,
+            "note": meta_note,
             "content": &final_text[..500.min(final_text.len())],
         }))
         .unwrap_or_default(),
     );
 
-    let is_error = final_text.is_empty();
+    // Detect errors that run_subagent returns as normal text (see mod.rs + http.rs).
+    // HTTP errors come as StreamEvent::Text with patterns like:
+    // "Authentication failed (HTTP 401)...", "Server error (HTTP 500)...", etc.
+    let is_error = final_text.is_empty()
+        || final_text.starts_with("Error:")
+        || final_text.contains("[Cancelled]")
+        || final_text.starts_with("Timeout")
+        || final_text.starts_with("Authentication failed")
+        || final_text.starts_with("Rate limited")
+        || final_text.starts_with("Server error")
+        || final_text.starts_with("Model overloaded")
+        || final_text.starts_with("Bad request")
+        || final_text.starts_with("Connection failed")
+        || final_text.starts_with("Network error")
+        || final_text.starts_with("API error")
+        || final_text.starts_with("Invalid request")
+        || final_text.starts_with("Failed to read response");
     let meta = serde_json::json!({
         "agent_id": sa_id.to_string(),
         "task": desc,
         "status": if is_error { "FAILED" } else { "SUCCESS" },
-        "_note": "turn/tool_call counts not tracked by run_subagent",
         "duration_ms": duration_ms,
+        "content_len": final_text.len(),
         "timestamp": Utc::now().to_rfc3339(),
         "schema_version": "1.0",
     });

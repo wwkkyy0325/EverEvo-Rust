@@ -134,10 +134,12 @@ fn main() {
                     }
 
                     // Start dreaming scheduler in background
+                    let persona_profile = state.config.data_dir.join("memory").join("persona").join("profile.json");
                     let scheduler_handle = state.scheduler.start_background(
                         std::sync::Arc::clone(&state.dreaming_engine),
                         std::sync::Arc::clone(&state.fact_manager),
                         std::sync::Arc::clone(&state.wiki_generator),
+                        Some(persona_profile),
                     );
                     tracing::info!("Dreaming scheduler started");
 

@@ -31,6 +31,10 @@ impl ContextStage for SkillStage {
     }
 
     fn build(&self, _ctx: &ContextBuildContext) -> Option<ContextFragment> {
+        // Hot-reload: re-scan data/skills/ if changed since last check.
+        // New skills take effect immediately — no restart needed.
+        self.registry.check_rescan();
+
         let metadata = self.registry.list_metadata();
         if metadata.is_empty() {
             return None;
@@ -55,6 +59,8 @@ mod tests {
     use super::*;
     use crate::skill::{Skill, SkillRegistry};
     use std::path::PathBuf;
+    use std::sync::RwLock;
+    use std::time::SystemTime;
 
     #[test]
     fn test_skill_stage_builds_context_fragment() {
@@ -68,8 +74,9 @@ mod tests {
             path: PathBuf::from("test"),
         }];
         let registry = Arc::new(SkillRegistry {
-            skills,
+            skills: RwLock::new(skills),
             skills_dir: PathBuf::from("test"),
+            last_scan: RwLock::new(SystemTime::UNIX_EPOCH),
         });
         let stage = SkillStage::new(registry);
         let ctx = ContextBuildContext::default();
@@ -86,8 +93,9 @@ mod tests {
     #[test]
     fn test_skill_stage_empty_registry_returns_none() {
         let registry = Arc::new(SkillRegistry {
-            skills: vec![],
+            skills: RwLock::new(vec![]),
             skills_dir: PathBuf::from("test"),
+            last_scan: RwLock::new(SystemTime::UNIX_EPOCH),
         });
         let stage = SkillStage::new(registry);
         let ctx = ContextBuildContext::default();
