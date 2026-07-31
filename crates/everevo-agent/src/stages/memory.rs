@@ -44,6 +44,9 @@ pub struct MemoryStage {
     knowledge_graph: Option<Arc<std::sync::RwLock<KnowledgeGraph>>>,
     /// Optional RAG pipeline for vector similarity search.
     rag_pipeline: Option<Arc<RagPipeline>>,
+    /// Optional workflow library dir — when set, the stage also surfaces
+    /// reusable workflows matching the query (meta-agent: reuse before re-inventing).
+    workflows_dir: Option<std::path::PathBuf>,
 }
 
 impl MemoryStage {
@@ -55,7 +58,15 @@ impl MemoryStage {
             trace_id: None,
             knowledge_graph: None,
             rag_pipeline: None,
+            workflows_dir: None,
         }
+    }
+
+    /// Point at the workflow library so reusable workflows matching the query
+    /// are surfaced in context (meta-agent: proactively suggest reuse).
+    pub fn with_workflows_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.workflows_dir = Some(dir);
+        self
     }
 
     pub fn with_telemetry(mut self, telemetry: Arc<Telemetry>, trace_id: Uuid) -> Self {
@@ -212,13 +223,12 @@ impl MemoryStage {
 
         // ── MMR Reranking: diversity-aware selection ──
         // Retrieve top-20, then select top-k with MMR to ensure diverse results.
-        let recall_pool = ranked.iter().take(self.max_facts * 4).map(|(i, _)| *i).collect::<Vec<_>>();
-        let mmr_selected = mmr_rerank(
-            &recall_pool,
-            &ranked,
-            &all_facts,
-            self.max_facts,
-        );
+        let recall_pool = ranked
+            .iter()
+            .take(self.max_facts * 4)
+            .map(|(i, _)| *i)
+            .collect::<Vec<_>>();
+        let mmr_selected = mmr_rerank(&recall_pool, &ranked, &all_facts, self.max_facts);
         ranked = mmr_selected;
 
         let results: Vec<MemoryIndexEntry> = ranked
@@ -268,9 +278,11 @@ impl ContextStage for MemoryStage {
             if is_first_turn {
                 if let Ok(t1_facts) = self.fact_manager.load_tier1() {
                     if !t1_facts.is_empty() {
-                        let t1_lines: Vec<String> = t1_facts.iter().take(5).map(|f| {
-                            format!("- {} — {}", f.name, f.description)
-                        }).collect();
+                        let t1_lines: Vec<String> = t1_facts
+                            .iter()
+                            .take(5)
+                            .map(|f| format!("- {} — {}", f.name, f.description))
+                            .collect();
                         let content = format!(
                             "## Memory (T1 — frequently used)\n{}\n",
                             t1_lines.join("\n")
@@ -342,10 +354,7 @@ impl ContextStage for MemoryStage {
                 let mut kg_lines: Vec<String> = Vec::new();
                 for entry in &relevant {
                     // Extract potential entity names from fact slugs (kebab-case → search)
-                    let candidates = vec![
-                        entry.name.clone(),
-                        entry.name.replace('-', " "),
-                    ];
+                    let candidates = vec![entry.name.clone(), entry.name.replace('-', " ")];
                     for candidate in &candidates {
                         let entities = kg.search(candidate);
                         for entity in entities.iter().take(2) {
@@ -391,6 +400,33 @@ impl ContextStage for MemoryStage {
             }
         }
 
+        // Meta-agent: proactively surface reusable workflows matching the query,
+        // so the LLM reuses a saved procedure instead of re-inventing it.
+        if let Some(ref dir) = self.workflows_dir {
+            let q = ctx.user_message.to_lowercase();
+            let runner =
+                crate::tools::builtins::WorkflowRunnerTool::new().with_workflows_dir(dir.clone());
+            let matches: Vec<_> = runner
+                .list_saved()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(_, desc)| {
+                    desc.to_lowercase()
+                        .split_whitespace()
+                        .any(|kw| kw.len() > 3 && q.contains(kw))
+                })
+                .take(3)
+                .collect();
+            if !matches.is_empty() {
+                content.push_str("\n\n## Reusable Workflows (run by name)\n\n");
+                for (name, desc) in &matches {
+                    content.push_str(&format!(
+                        "- `{name}` — {desc} → `workflow_run name={name}`\n"
+                    ));
+                }
+            }
+        }
+
         Some(ContextFragment {
             label: "Relevant Memory".into(),
             messages: vec![LlmMessage::user(&content)],
@@ -427,9 +463,14 @@ fn mmr_rerank(
     let lambda: f32 = 0.7;
 
     // Pre-compute fact text for Jaccard similarity.
-    let fact_texts: Vec<String> = pool.iter().filter_map(|&i| {
-        all_facts.get(i).map(|f| format!("{} {}", f.name, f.content).to_lowercase())
-    }).collect();
+    let fact_texts: Vec<String> = pool
+        .iter()
+        .filter_map(|&i| {
+            all_facts
+                .get(i)
+                .map(|f| format!("{} {}", f.name, f.content).to_lowercase())
+        })
+        .collect();
 
     let mut selected: Vec<usize> = Vec::new();
     let mut remaining: Vec<usize> = pool.to_vec();
@@ -450,12 +491,15 @@ fn mmr_rerank(
                 1.0
             } else {
                 let cand_text = fact_texts.get(pool.iter().position(|&i| i == cand).unwrap_or(0));
-                let max_sim = selected.iter().filter_map(|&s| {
-                    let sel_pos = pool.iter().position(|&i| i == s)?;
-                    let sel_text = fact_texts.get(sel_pos)?;
-                    let c_text = cand_text?;
-                    Some(jaccard_similarity(c_text, sel_text))
-                }).fold(0.0f32, f32::max);
+                let max_sim = selected
+                    .iter()
+                    .filter_map(|&s| {
+                        let sel_pos = pool.iter().position(|&i| i == s)?;
+                        let sel_text = fact_texts.get(sel_pos)?;
+                        let c_text = cand_text?;
+                        Some(jaccard_similarity(c_text, sel_text))
+                    })
+                    .fold(0.0f32, f32::max);
                 1.0 - max_sim
             };
             let mmr = lambda * relevance + (1.0 - lambda) * novelty;
@@ -469,14 +513,23 @@ fn mmr_rerank(
         selected.push(chosen);
     }
 
-    selected.into_iter().map(|i| (i, score_map.get(&i).copied().unwrap_or(0.0))).collect()
+    selected
+        .into_iter()
+        .map(|i| (i, score_map.get(&i).copied().unwrap_or(0.0)))
+        .collect()
 }
 
 /// Jaccard similarity between two texts (word-level set overlap).
 fn jaccard_similarity(a: &str, b: &str) -> f32 {
-    let words_a: std::collections::HashSet<&str> = a.split_whitespace().filter(|w| w.len() > 2).collect();
-    let words_b: std::collections::HashSet<&str> = b.split_whitespace().filter(|w| w.len() > 2).collect();
+    let words_a: std::collections::HashSet<&str> =
+        a.split_whitespace().filter(|w| w.len() > 2).collect();
+    let words_b: std::collections::HashSet<&str> =
+        b.split_whitespace().filter(|w| w.len() > 2).collect();
     let intersection = words_a.intersection(&words_b).count();
     let union = words_a.len() + words_b.len() - intersection;
-    if union == 0 { 0.0 } else { intersection as f32 / union as f32 }
+    if union == 0 {
+        0.0
+    } else {
+        intersection as f32 / union as f32
+    }
 }

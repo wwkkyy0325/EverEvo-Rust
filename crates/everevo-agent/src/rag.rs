@@ -9,8 +9,8 @@ use std::path::Path;
 use everevo_core::EverEvoError;
 #[allow(unused_imports)]
 use everevo_vector::{
-    ChunkType, DummyEmbedder, EmbeddingModel, ModelRegistry, MultiCollectionStore,
-    OnnxEmbedder, RawChunk, ScoredChunk,
+    ChunkType, DummyEmbedder, EmbeddingModel, ModelRegistry, MultiCollectionStore, OnnxEmbedder,
+    RawChunk, ScoredChunk,
 };
 
 /// The RAG pipeline — embedder + dim-aware vector collections.
@@ -67,7 +67,11 @@ impl RagPipeline {
     }
 
     /// Re-create the pipeline with a new active model (after registry.activate()).
-    pub fn reload(&mut self, data_dir: &Path, registry: &ModelRegistry) -> Result<(), EverEvoError> {
+    pub fn reload(
+        &mut self,
+        data_dir: &Path,
+        registry: &ModelRegistry,
+    ) -> Result<(), EverEvoError> {
         let active = registry.active();
         let models_dir = data_dir.join("models");
         let vector_dir = data_dir.join("vector");
@@ -101,25 +105,40 @@ impl RagPipeline {
             .into_iter()
             .zip(vectors)
             .map(|(raw, vector)| everevo_vector::MemoryChunk {
-                id: raw.id, content: raw.content, vector,
+                id: raw.id,
+                content: raw.content,
+                vector,
                 source_pointers: raw.source_pointers,
-                projection: raw.projection, chunk_type: raw.chunk_type,
-                created_at: chrono::Utc::now(), retrieval_count: 0,
+                projection: raw.projection,
+                chunk_type: raw.chunk_type,
+                created_at: chrono::Utc::now(),
+                retrieval_count: 0,
             })
             .collect();
         self.collections.insert(collection, memory_chunks)
     }
 
     /// Semantic search within a single collection.
-    pub fn search_in(&self, collection: &str, query: &str, top_k: usize) -> Result<Vec<ScoredChunk>, EverEvoError> {
+    pub fn search_in(
+        &self,
+        collection: &str,
+        query: &str,
+        top_k: usize,
+    ) -> Result<Vec<ScoredChunk>, EverEvoError> {
         let query_vector = self.embedder.encode(query)?;
         self.collections.search(collection, &query_vector, top_k)
     }
 
     /// Cross-collection search with RRF fusion.
-    pub fn search_multi(&self, collections: &[&str], query: &str, top_k: usize) -> Result<Vec<ScoredChunk>, EverEvoError> {
+    pub fn search_multi(
+        &self,
+        collections: &[&str],
+        query: &str,
+        top_k: usize,
+    ) -> Result<Vec<ScoredChunk>, EverEvoError> {
         let query_vector = self.embedder.encode(query)?;
-        self.collections.search_multi(collections, &query_vector, top_k)
+        self.collections
+            .search_multi(collections, &query_vector, top_k)
     }
 
     /// Encode a query to vector for hybrid search RRF.
@@ -142,14 +161,18 @@ pub use everevo_vector::{make_chunk, make_chunk_with_sources};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     use everevo_vector::ModelRegistry;
+    use tempfile::TempDir;
 
     fn setup_registry(dir: &TempDir) -> ModelRegistry {
         let md = dir.path().join("test-model");
         std::fs::create_dir_all(&md).unwrap();
         std::fs::write(md.join("model_quantized.onnx"), b"fake").unwrap();
-        std::fs::write(md.join("config.json"), r#"{"hidden_size": 384, "_name_or_path": "test"}"#).unwrap();
+        std::fs::write(
+            md.join("config.json"),
+            r#"{"hidden_size": 384, "_name_or_path": "test"}"#,
+        )
+        .unwrap();
         ModelRegistry::discover(dir.path(), None).unwrap()
     }
 

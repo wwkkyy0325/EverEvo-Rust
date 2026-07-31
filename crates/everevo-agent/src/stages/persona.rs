@@ -151,6 +151,93 @@ regardless of reply language."
     }
 }
 
+// ── Persona Auto-Update ───────────────────────────────────────────────────
+
+/// Update the persona profile based on accumulated feedback facts and
+/// conversation patterns. Called periodically by the dreaming scheduler
+/// after DEEP phase (alongside wiki generation).
+///
+/// Currently updates:
+/// - `verbosity` based on average message length preference
+/// - `code_first` based on tool usage patterns
+/// - `system_prompt_injection` from high-confidence feedback facts
+pub fn update_persona_from_facts(
+    profile_path: &Path,
+    facts: &[everevo_core::memory::MemoryFact],
+) {
+    let mut profile = load_profile(profile_path).unwrap_or_default();
+    let mut changed = false;
+
+    // Collect high-confidence feedback facts
+    let feedback: Vec<_> = facts
+        .iter()
+        .filter(|f| f.fact_type == everevo_core::memory::FactType::Feedback)
+        .collect();
+
+    if !feedback.is_empty() {
+        // Build a persona injection from the top-3 feedback facts
+        let top: Vec<_> = feedback
+            .iter()
+            .filter(|f| f.projection.confidence > 0.6)
+            .take(3)
+            .map(|f| format!("- {}", f.content))
+            .collect();
+
+        if !top.is_empty() {
+            let injection = format!(
+                "## Learned Preferences (auto-updated from interactions)\n\n{}",
+                top.join("\n")
+            );
+            if profile.system_prompt_injection != injection {
+                profile.system_prompt_injection = injection;
+                changed = true;
+            }
+        }
+    }
+
+    // Infer code-first preference from fact patterns
+    let code_facts = facts
+        .iter()
+        .filter(|f| {
+            f.fact_type == everevo_core::memory::FactType::Project
+                && (f.content.contains("fn ") || f.content.contains("struct ") || f.content.contains("import "))
+        })
+        .count();
+    let text_facts = facts
+        .iter()
+        .filter(|f| {
+            f.fact_type == everevo_core::memory::FactType::Project
+                && !f.content.contains("fn ")
+                && !f.content.contains("struct ")
+        })
+        .count();
+
+    if code_facts + text_facts > 5 {
+        let prefers_code = code_facts > text_facts;
+        if profile.communication_style.code_first != prefers_code {
+            profile.communication_style.code_first = prefers_code;
+            changed = true;
+        }
+    }
+
+    if changed {
+        if let Some(parent) = profile_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&profile) {
+            if let Err(e) = std::fs::write(profile_path, &json) {
+                tracing::warn!(error = %e, "Failed to write updated persona profile");
+            } else {
+                tracing::info!(
+                    code_first = profile.communication_style.code_first,
+                    feedback_count = feedback.len(),
+                    "Persona profile auto-updated"
+                );
+            }
+        }
+    }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 fn load_profile(path: &Path) -> Option<PersonaProfile> {

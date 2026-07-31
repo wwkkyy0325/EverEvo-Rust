@@ -75,9 +75,7 @@ async fn reconnect_server(
 
     // Re-discover tools with appropriate transport
     let result = match srv.transport.as_str() {
-        "http" | "sse" => {
-            everevo_mcp::discover_mcp_tools_http(&srv.url, &srv.headers).await
-        }
+        "http" | "sse" => everevo_mcp::discover_mcp_tools_http(&srv.url, &srv.headers).await,
         _ => {
             let args: Vec<&str> = srv.args.iter().map(String::as_str).collect();
             everevo_mcp::discover_mcp_tools(&srv.command, &args, &srv.env).await

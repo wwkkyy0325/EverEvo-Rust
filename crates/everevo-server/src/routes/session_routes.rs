@@ -13,7 +13,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    routing::get,
+    routing::{get, put},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -34,6 +34,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/sessions/{id}/messages", get(get_messages))
         // Session status (mode + state for daemon sessions)
         .route("/api/sessions/{id}/status", get(get_session_status))
+        // Per-session workspace binding
+        .route("/api/sessions/{id}/workspace", put(bind_workspace))
 }
 
 // ── DTOs ────────────────────────────────────────────────────────────────
@@ -59,11 +61,20 @@ struct MessagesQuery {
 struct CreateSessionBody {
     #[serde(default = "default_title")]
     title: String,
+    /// Optional workspace directory to bind at creation time.
+    #[serde(default)]
+    workspace_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct UpdateTitleBody {
     title: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetWorkspaceBody {
+    /// Path to mount as workspace for this session. Empty string unsets.
+    path: Option<String>,
 }
 
 fn default_limit_20() -> i64 {
@@ -106,6 +117,9 @@ struct SessionItem {
     /// Session state: "idle", "running", "completed", "failed"
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<String>,
+    /// Per-session workspace directory (null if using sandbox default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_dir: Option<String>,
 }
 
 async fn list_sessions(
@@ -136,6 +150,7 @@ async fn list_sessions(
                 last_message: r.last_content.map(|c| truncate_preview(&c, 120)),
                 mode,
                 state,
+                workspace_dir: r.workspace_dir.clone(),
             }
         })
         .collect();
@@ -270,14 +285,21 @@ async fn create_session(
 ) -> Json<serde_json::Value> {
     match state.db.create_session(&body.title).await {
         Ok(row) => {
+            // Store workspace_dir in DB if provided at creation time
+            if let Some(ref ws) = body.workspace_dir {
+                if !ws.is_empty() {
+                    let _ = state.db.set_session_workspace(row.id, Some(ws)).await;
+                }
+            }
             // Flush any buffered messages from the previous session before starting new one.
-            // Hermes `on_session_end` pattern: prevent memory loss at session boundaries.
             state.dreaming_engine.flush_on_session_end().await;
-            // Initialize per-session sandbox + audit trail
+            // Initialize per-session sandbox — use per-session workspace if set
+            let ws = body.workspace_dir.filter(|w| !w.is_empty());
             let _ = state
                 .create_sandbox(
                     row.id,
                     resolve_permission(&state.config.default_permission_level),
+                    ws,
                 )
                 .await;
             Json(serde_json::json!({
@@ -291,6 +313,41 @@ async fn create_session(
         }
         Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
     }
+}
+
+/// PUT /api/sessions/{id}/workspace — bind or unbind a workspace directory for a session.
+async fn bind_workspace(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SetWorkspaceBody>,
+) -> Json<serde_json::Value> {
+    let ws_path = body.path.as_deref().filter(|p| !p.is_empty());
+    // Validate path exists if setting
+    if let Some(p) = ws_path {
+        if !std::path::Path::new(p).is_dir() {
+            return Json(
+                serde_json::json!({ "error": "Path does not exist or is not a directory" }),
+            );
+        }
+    }
+    // Persist to DB
+    if let Err(e) = state.db.set_session_workspace(id, ws_path).await {
+        return Json(serde_json::json!({ "error": e.to_string() }));
+    }
+    // Recreate sandbox with new workspace binding
+    let _ = state
+        .create_sandbox(
+            id,
+            resolve_permission(&state.config.default_permission_level),
+            ws_path.map(|s| s.to_string()),
+        )
+        .await;
+    Json(serde_json::json!({
+        "data": {
+            "session_id": id.to_string(),
+            "workspace_dir": ws_path,
+        }
+    }))
 }
 
 async fn update_title(
@@ -348,9 +405,11 @@ async fn get_session_status(
 // ── Helpers ────────────────────────────────────────────────────────────
 
 fn parse_metadata(raw: &str) -> (Option<String>, Option<String>) {
-    let meta: everevo_core::types::SessionMeta =
-        serde_json::from_str(raw).unwrap_or_default();
-    (Some(meta.mode.as_str().to_string()), Some(meta.state.as_str().to_string()))
+    let meta: everevo_core::types::SessionMeta = serde_json::from_str(raw).unwrap_or_default();
+    (
+        Some(meta.mode.as_str().to_string()),
+        Some(meta.state.as_str().to_string()),
+    )
 }
 
 fn truncate_preview(text: &str, max_chars: usize) -> String {

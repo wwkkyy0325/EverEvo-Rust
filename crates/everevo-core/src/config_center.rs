@@ -346,6 +346,18 @@ subagent_timeout_secs = 300
 enabled = true
 # Sampling rate: 1.0 = all events, 0.1 = 10%
 sample_rate = 0.1
+
+# ── MCP servers ──────────────────────────────────────────────────────
+# Browser automation via Playwright (recommended). Uncomment to enable
+# real-browser tools: browser_navigate / browser_click / browser_evaluate /
+# browser_snapshot (accessibility tree) / browser_screenshot (vision).
+# Requires: Node.js is auto-bootstrapped. First browser use needs a one-time
+# `npx playwright install chromium` (runnable from EverEvo's shell tool).
+# [[mcp_servers]]
+# name = "playwright"
+# transport = "stdio"
+# command = "npx"
+# args = ["-y", "@playwright/mcp@latest"]
 "#
 }
 

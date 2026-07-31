@@ -125,7 +125,7 @@ impl Tool for DownloadTool {
                 return Ok(ToolOutput {
                     content: format!("Download failed: {e}. The sandbox may not have network access. Try using the shell tool with curl/wget if network is available, or download the file manually."),
                     is_error: true,
-                });
+                 ..Default::default() });
             }
         };
 
@@ -137,15 +137,29 @@ impl Tool for DownloadTool {
                         "Download failed: {e}. Network may be unavailable in sandbox environment."
                     ),
                     is_error: true,
+                    ..Default::default()
                 });
             }
         };
 
         if result.is_success() {
+            // When the server omits Content-Length, the downloader reports 0
+            // bytes even though the file was saved correctly.  Read the real
+            // file size from disk so the LLM sees accurate numbers.
+            let size = if result.size_bytes == 0 {
+                result
+                    .path
+                    .as_ref()
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .map(|m| m.len())
+                    .unwrap_or(0)
+            } else {
+                result.size_bytes
+            };
             Ok(ToolOutput {
                 content: format!(
                     "Downloaded {} bytes to {} in {}ms",
-                    result.size_bytes,
+                    size,
                     result
                         .path
                         .as_ref()
@@ -154,6 +168,7 @@ impl Tool for DownloadTool {
                     result.duration_ms
                 ),
                 is_error: false,
+                ..Default::default()
             })
         } else {
             Ok(ToolOutput {
@@ -162,6 +177,7 @@ impl Tool for DownloadTool {
                     result.error_message().unwrap_or("unknown error")
                 ),
                 is_error: true,
+                ..Default::default()
             })
         }
     }

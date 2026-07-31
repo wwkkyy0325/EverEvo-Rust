@@ -164,18 +164,24 @@ fn group_same_file(results: &mut Vec<SearchResult>) {
     let mut offset = 0usize;
     for (_, _file, rep) in &summaries {
         if offset < results.len() {
-            results.insert(offset, SearchResult {
-                name: format!("{} matches", file_counts.get(&rep.file).map(|v| v.len()).unwrap_or(0)),
-                kind: "file_summary".into(),
-                file: rep.file.clone(),
-                line: rep.line,
-                parent: String::new(),
-                signature: format!(
-                    "{} symbols in this file. Use read_file to explore.",
-                    file_counts.get(&rep.file).map(|v| v.len()).unwrap_or(0)
-                ),
-                rank: rep.rank,
-            });
+            results.insert(
+                offset,
+                SearchResult {
+                    name: format!(
+                        "{} matches",
+                        file_counts.get(&rep.file).map(|v| v.len()).unwrap_or(0)
+                    ),
+                    kind: "file_summary".into(),
+                    file: rep.file.clone(),
+                    line: rep.line,
+                    parent: String::new(),
+                    signature: format!(
+                        "{} symbols in this file. Use read_file to explore.",
+                        file_counts.get(&rep.file).map(|v| v.len()).unwrap_or(0)
+                    ),
+                    rank: rep.rank,
+                },
+            );
             offset += 1;
         }
     }
@@ -239,7 +245,11 @@ pub fn format_search_results(
             output.push_str(&format!(
                 "\n... [truncated: {} more results exceed context budget. \
                  Use a more specific query or read_file for details.]\n",
-                deduped.len() - deduped.iter().position(|x| x.file == r.file && x.line == r.line).unwrap_or(deduped.len())
+                deduped.len()
+                    - deduped
+                        .iter()
+                        .position(|x| x.file == r.file && x.line == r.line)
+                        .unwrap_or(deduped.len())
             ));
             break;
         }
@@ -288,13 +298,18 @@ fn truncate_signature(sig: &str, max_chars: usize) -> String {
 pub struct CodeIndex {
     pool: SqlitePool,
     root: PathBuf,
+    /// Timestamp of the last full or incremental reindex (for polling-based
+    /// staleness detection). `None` until the first index completes.
+    pub last_indexed: Option<std::time::Instant>,
 }
 
 impl CodeIndex {
     /// Open or create the code index at the given db path.
     pub async fn open(db_path: &Path, root: &Path) -> Result<Self, String> {
         let db_dir = db_path.parent().unwrap_or(db_path);
-        tokio::fs::create_dir_all(db_dir).await.map_err(|e| format!("create dir: {e}"))?;
+        tokio::fs::create_dir_all(db_dir)
+            .await
+            .map_err(|e| format!("create dir: {e}"))?;
 
         let opts = SqliteConnectOptions::new()
             .filename(db_path)
@@ -310,20 +325,26 @@ impl CodeIndex {
 
         // WAL mode + synchronous NORMAL for better concurrent performance
         sqlx::query("PRAGMA synchronous=NORMAL")
-            .execute(&pool).await.ok();
+            .execute(&pool)
+            .await
+            .ok();
 
         // Create FTS5 table
         sqlx::query(
             "CREATE VIRTUAL TABLE IF NOT EXISTS code_symbols USING fts5(
                 name, kind, file, line, parent, signature,
                 tokenize='trigram case_sensitive 0'
-            )"
+            )",
         )
         .execute(&pool)
         .await
         .map_err(|e| format!("create FTS5: {e}"))?;
 
-        Ok(Self { pool, root: root.to_path_buf() })
+        Ok(Self {
+            pool,
+            root: root.to_path_buf(),
+            last_indexed: None,
+        })
     }
 
     /// Full re-index: walk the root directory, scan all supported files.
@@ -345,14 +366,18 @@ impl CodeIndex {
             "CREATE VIRTUAL TABLE code_symbols USING fts5(
                 name, kind, file, line, parent, signature,
                 tokenize='trigram case_sensitive 0'
-            )"
+            )",
         )
         .execute(&self.pool)
         .await
         .map_err(|e| format!("create new index: {e}"))?;
 
         // INSERTs in a transaction for batch performance
-        let mut tx = self.pool.begin().await.map_err(|e| format!("begin tx: {e}"))?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| format!("begin tx: {e}"))?;
 
         for entry in walkdir::WalkDir::new(&self.root)
             .into_iter()
@@ -431,7 +456,7 @@ impl CodeIndex {
              FROM code_symbols
              WHERE code_symbols MATCH ?
              ORDER BY rank
-             LIMIT ?"
+             LIMIT ?",
         )
         .bind(query)
         .bind(fetch_limit as i64)
@@ -439,19 +464,27 @@ impl CodeIndex {
         .await
         .map_err(|e| format!("search: {e}"))?;
 
-        Ok(rows.into_iter().map(|r| SearchResult {
-            name: r.name,
-            kind: r.kind,
-            file: r.file,
-            line: r.line as usize,
-            parent: r.parent,
-            signature: r.signature,
-            rank: r.rank,
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| SearchResult {
+                name: r.name,
+                kind: r.kind,
+                file: r.file,
+                line: r.line as usize,
+                parent: r.parent,
+                signature: r.signature,
+                rank: r.rank,
+            })
+            .collect())
     }
 
     /// Search by symbol kind + keyword (e.g., "struct" + "UserStore").
-    pub async fn search_by_kind(&self, kind: &str, query: &str, limit: usize) -> Result<Vec<SearchResult>, String> {
+    pub async fn search_by_kind(
+        &self,
+        kind: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>, String> {
         let fetch_limit = (limit * 3).min(50);
 
         let rows = sqlx::query_as::<_, CodeSymbolRow>(
@@ -459,7 +492,7 @@ impl CodeIndex {
              FROM code_symbols
              WHERE kind = ? AND code_symbols MATCH ?
              ORDER BY rank
-             LIMIT ?"
+             LIMIT ?",
         )
         .bind(kind)
         .bind(query)
@@ -468,15 +501,18 @@ impl CodeIndex {
         .await
         .map_err(|e| format!("search by kind: {e}"))?;
 
-        Ok(rows.into_iter().map(|r| SearchResult {
-            name: r.name,
-            kind: r.kind,
-            file: r.file,
-            line: r.line as usize,
-            parent: r.parent,
-            signature: r.signature,
-            rank: r.rank,
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| SearchResult {
+                name: r.name,
+                kind: r.kind,
+                file: r.file,
+                line: r.line as usize,
+                parent: r.parent,
+                signature: r.signature,
+                rank: r.rank,
+            })
+            .collect())
     }
 
     /// Incremental re-index: update only files changed since last full index.
@@ -487,12 +523,10 @@ impl CodeIndex {
 
         // Get existing files and their modification times from the index
         // Simple approach: re-scan all files, only update changed ones
-        let existing: Vec<(String,)> = sqlx::query_as(
-            "SELECT DISTINCT file FROM code_symbols"
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| format!("list existing: {e}"))?;
+        let existing: Vec<(String,)> = sqlx::query_as("SELECT DISTINCT file FROM code_symbols")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("list existing: {e}"))?;
 
         let existing_set: std::collections::HashSet<String> =
             existing.into_iter().map(|r| r.0).collect();
@@ -506,29 +540,43 @@ impl CodeIndex {
         {
             let path = entry.path();
             let path_str = path.to_string_lossy();
-            if path_str.contains("/.") || path_str.contains("\\.")
-                || path_str.contains("target/") || path_str.contains("node_modules/")
-                || path_str.contains("__pycache__/") || path_str.contains(".git/")
+            if path_str.contains("/.")
+                || path_str.contains("\\.")
+                || path_str.contains("target/")
+                || path_str.contains("node_modules/")
+                || path_str.contains("__pycache__/")
+                || path_str.contains(".git/")
                 || path_str.contains("dist/")
             {
                 continue;
             }
 
-            let rel_path = path.strip_prefix(&self.root).unwrap_or(path)
-                .to_string_lossy().replace('\\', "/");
+            let rel_path = path
+                .strip_prefix(&self.root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
             seen.insert(rel_path.clone());
 
             // Check if file is new or modified
-            let _modified = entry.metadata().ok()
+            let _modified = entry
+                .metadata()
+                .ok()
                 .and_then(|m| m.modified().ok())
-                .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
+                .map(|t| {
+                    t.duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                })
                 .unwrap_or(0);
 
             let needs_update = !existing_set.contains(&rel_path);
 
             if needs_update {
                 let symbols = scan_file(path, &self.root);
-                if symbols.is_empty() { continue; }
+                if symbols.is_empty() {
+                    continue;
+                }
                 files += 1;
 
                 // Delete old entries for this file
@@ -562,8 +610,17 @@ impl CodeIndex {
         }
 
         let elapsed = start.elapsed();
-        tracing::info!(symbols = count, files, elapsed_ms = elapsed.as_millis(), "Code index updated");
-        Ok(IndexStats { symbols: count, files, elapsed_ms: elapsed.as_millis() as u64 })
+        tracing::info!(
+            symbols = count,
+            files,
+            elapsed_ms = elapsed.as_millis(),
+            "Code index updated"
+        );
+        Ok(IndexStats {
+            symbols: count,
+            files,
+            elapsed_ms: elapsed.as_millis() as u64,
+        })
     }
 
     /// Smart reindex: incremental if index exists, full if empty.
@@ -613,12 +670,11 @@ impl CodeIndex {
 
     /// List files in the index.
     pub async fn list_files(&self) -> Result<Vec<String>, String> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT DISTINCT file FROM code_symbols ORDER BY file"
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| format!("list files: {e}"))?;
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT DISTINCT file FROM code_symbols ORDER BY file")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| format!("list files: {e}"))?;
         Ok(rows.into_iter().map(|r| r.0).collect())
     }
 }

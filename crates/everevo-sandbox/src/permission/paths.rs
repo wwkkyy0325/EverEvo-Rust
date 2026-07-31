@@ -44,6 +44,14 @@ pub(crate) fn system_deny_paths() -> Vec<String> {
         "**/.env.*".into(),
         "**/id_rsa".into(),
         "**/id_ed25519".into(),
+        // Project config with secrets — never writeable
+        "**/config.toml".into(),
+        "**/config.json".into(),
+        "**/*.db".into(),
+        "**/*.sqlite".into(),
+        "**/*.sqlite3".into(),
+        "**/.secrets".into(),
+        "**/secrets.*".into(),
     ]
 }
 
@@ -82,6 +90,17 @@ pub(crate) fn has_dangerous_traversal(path: &str) -> bool {
         "id_ed25519",
         ".bash_history",
         ".zsh_history",
+        // Project secrets
+        "config.toml",
+        "config.json",
+        "data/config",
+        "data/db",
+        ".secrets",
+        "secrets.",
+        "credentials",
+        ".db",
+        ".sqlite",
+        ".sqlite3",
     ];
     let sensitive_win = [
         "windows\\",

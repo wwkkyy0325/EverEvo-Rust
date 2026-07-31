@@ -83,6 +83,7 @@ impl everevo_core::tool::Tool for SandboxedShellTool {
                         result.confirmation_reason
                     ),
                     is_error: true,
+                    ..Default::default()
                 });
             }
             let reason = result.confirmation_reason.clone();
@@ -107,6 +108,7 @@ impl everevo_core::tool::Tool for SandboxedShellTool {
                 return Ok(everevo_core::tool::ToolOutput {
                     content: format!("User denied execution: {reason}"),
                     is_error: true,
+                    ..Default::default()
                 });
             }
             let config = everevo_core::sandbox::ExecutionConfig::new(command)
@@ -126,11 +128,13 @@ impl everevo_core::tool::Tool for SandboxedShellTool {
             return Ok(everevo_core::tool::ToolOutput {
                 content: format!("Timeout after {timeout_secs}s"),
                 is_error: true,
+                ..Default::default()
             });
         }
         Ok(everevo_core::tool::ToolOutput {
             content,
             is_error: is_error || result.exit_code == 126,
+            ..Default::default()
         })
     }
 }

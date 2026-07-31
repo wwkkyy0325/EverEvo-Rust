@@ -100,9 +100,10 @@ impl Tool for ClusterTool {
         params: serde_json::Value,
         _cancel: Option<&CancellationToken>,
     ) -> Result<ToolOutput, EverEvoError> {
-        let pool = self.pool.as_ref().ok_or_else(|| {
-            EverEvoError::Internal("ClusterTool: no pool configured".into())
-        })?;
+        let pool = self
+            .pool
+            .as_ref()
+            .ok_or_else(|| EverEvoError::Internal("ClusterTool: no pool configured".into()))?;
 
         let action = params["action"].as_str().unwrap_or("fan_out");
         let prompt = params["prompt"].as_str().unwrap_or("");
@@ -110,13 +111,11 @@ impl Tool for ClusterTool {
             return Ok(ToolOutput {
                 content: "prompt is required".into(),
                 is_error: true,
+                ..Default::default()
             });
         }
 
-        let workers = params["workers"]
-            .as_u64()
-            .unwrap_or(3)
-            .min(10) as usize;
+        let workers = params["workers"].as_u64().unwrap_or(3).min(10) as usize;
 
         match action {
             "fan_out" => execute_fan_out(pool, prompt, workers).await,
@@ -133,6 +132,7 @@ impl Tool for ClusterTool {
                     return Ok(ToolOutput {
                         content: "items array is required for map_reduce".into(),
                         is_error: true,
+                        ..Default::default()
                     });
                 }
                 execute_map_reduce(pool, prompt, &items).await
@@ -154,17 +154,14 @@ impl Tool for ClusterTool {
                             .collect()
                     })
                     .unwrap_or_else(|| {
-                        vec![
-                            "correctness".into(),
-                            "security".into(),
-                            "edge_cases".into(),
-                        ]
+                        vec!["correctness".into(), "security".into(), "edge_cases".into()]
                     });
                 execute_verify(pool, &claims, &perspectives).await
             }
             _ => Ok(ToolOutput {
                 content: format!("Unknown action: {action}. Use fan_out, map_reduce, or verify."),
                 is_error: true,
+                ..Default::default()
             }),
         }
     }
@@ -193,9 +190,7 @@ async fn execute_fan_out(
 
     let results = pool.execute_all(tasks).await;
 
-    let mut output = format!(
-        "## Fan-out: {workers} workers\n\n**Prompt:** {prompt}\n\n---\n\n"
-    );
+    let mut output = format!("## Fan-out: {workers} workers\n\n**Prompt:** {prompt}\n\n---\n\n");
     for r in &results {
         output.push_str(&format!(
             "### {} ({})\n\n{}\n\n---\n\n",
@@ -205,6 +200,7 @@ async fn execute_fan_out(
     Ok(ToolOutput {
         content: output,
         is_error: false,
+        ..Default::default()
     })
 }
 
@@ -268,6 +264,7 @@ async fn execute_map_reduce(
             items.len(),
         ),
         is_error: false,
+        ..Default::default()
     })
 }
 
@@ -343,6 +340,7 @@ async fn execute_verify(
     Ok(ToolOutput {
         content: output,
         is_error: false,
+        ..Default::default()
     })
 }
 

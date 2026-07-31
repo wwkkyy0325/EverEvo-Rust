@@ -63,15 +63,31 @@ impl Tool for McpTool {
     ) -> Result<ToolOutput, EverEvoError> {
         let mut client = self.client.lock().await;
         match client.call_tool(&self.name, params, cancel).await {
-            Ok(text) => Ok(ToolOutput {
-                content: text,
-                is_error: false,
-            }),
+            Ok((text, images)) => {
+                // When images are present (e.g. browser_screenshot), annotate
+                // the text so the LLM knows a screenshot was attached; the
+                // actual image bytes travel via the `images` field to a
+                // vision-capable model.
+                let content = if images.is_empty() {
+                    text
+                } else {
+                    format!(
+                        "{text}\n[{n} image(s) attached — visible to vision models]",
+                        n = images.len()
+                    )
+                };
+                Ok(ToolOutput {
+                    content,
+                    is_error: false,
+                    images,
+                })
+            }
             Err(e) => {
                 // Return error as content so the LLM can see the MCP error
                 Ok(ToolOutput {
                     content: format!("MCP error: {e}"),
                     is_error: true,
+                    ..Default::default()
                 })
             }
         }
@@ -87,7 +103,11 @@ pub async fn discover_mcp_tools(
     let client = McpClient::connect_stdio(command, args, env).await?;
     let _tool_count = client.tools.len();
     let result = finalize_discovery(client).await?;
-    tracing::info!(tool_count = _tool_count, command, "MCP tools discovered (stdio)");
+    tracing::info!(
+        tool_count = _tool_count,
+        command,
+        "MCP tools discovered (stdio)"
+    );
     Ok(result)
 }
 

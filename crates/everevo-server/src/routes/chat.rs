@@ -68,10 +68,12 @@ async fn handle_chat(
         match cmd {
             "help" => {
                 let help_text = state.commands.help_text();
-                let _ = tx.send(Ok(Event::default()
-                    .event("slash_command")
-                    .json_data(serde_json::json!({"command": "help"}))
-                    .unwrap_or_else(|_| Event::default().event("error")))).await;
+                let _ = tx
+                    .send(Ok(Event::default()
+                        .event("slash_command")
+                        .json_data(serde_json::json!({"command": "help"}))
+                        .unwrap_or_else(|_| Event::default().event("error"))))
+                    .await;
                 help_text
             }
             "clear" => {
@@ -79,19 +81,27 @@ async fn handle_chat(
                 if let Err(e) = state.db.delete_session_messages(session_id).await {
                     tracing::warn!(%session_id, error = %e, "Failed to clear session messages");
                 }
-                let _ = tx.send(Ok(Event::default()
-                    .event("session_cleared")
-                    .json_data(serde_json::json!({"session_id": session_id.to_string()}))
-                    .unwrap_or_else(|_| Event::default().event("error")))).await;
+                let _ = tx
+                    .send(Ok(Event::default()
+                        .event("session_cleared")
+                        .json_data(serde_json::json!({"session_id": session_id.to_string()}))
+                        .unwrap_or_else(|_| Event::default().event("error"))))
+                    .await;
                 tracing::info!(%session_id, "Session cleared via /clear");
                 "Conversation history cleared. Starting fresh.".to_string()
             }
             "compact" => {
-                let topic = if args.is_empty() { "recent discussion" } else { args };
-                let _ = tx.send(Ok(Event::default()
-                    .event("slash_command")
-                    .json_data(serde_json::json!({"command": "compact", "topic": topic}))
-                    .unwrap_or_else(|_| Event::default().event("error")))).await;
+                let topic = if args.is_empty() {
+                    "recent discussion"
+                } else {
+                    args
+                };
+                let _ = tx
+                    .send(Ok(Event::default()
+                        .event("slash_command")
+                        .json_data(serde_json::json!({"command": "compact", "topic": topic}))
+                        .unwrap_or_else(|_| Event::default().event("error"))))
+                    .await;
                 format!(
                     "Summarize and compact the conversation history, preserving key context. \
                      Focus on: {topic}.\n\n\
@@ -100,10 +110,12 @@ async fn handle_chat(
                 )
             }
             "memory" => {
-                let _ = tx.send(Ok(Event::default()
-                    .event("slash_command")
-                    .json_data(serde_json::json!({"command": "memory", "query": args}))
-                    .unwrap_or_else(|_| Event::default().event("error")))).await;
+                let _ = tx
+                    .send(Ok(Event::default()
+                        .event("slash_command")
+                        .json_data(serde_json::json!({"command": "memory", "query": args}))
+                        .unwrap_or_else(|_| Event::default().event("error"))))
+                    .await;
                 if args.is_empty() {
                     "Search my persistent memory for relevant facts, preferences, \
                      and past decisions. List the most relevant findings."
@@ -130,24 +142,32 @@ async fn handle_chat(
                         )
                     })
                     .unwrap_or_else(|| "Config not yet loaded".to_string());
-                let _ = tx.send(Ok(Event::default()
-                    .event("slash_command")
-                    .json_data(serde_json::json!({"command": "config"}))
-                    .unwrap_or_else(|_| Event::default().event("error")))).await;
+                let _ = tx
+                    .send(Ok(Event::default()
+                        .event("slash_command")
+                        .json_data(serde_json::json!({"command": "config"}))
+                        .unwrap_or_else(|_| Event::default().event("error"))))
+                    .await;
                 format!("## Current Configuration\n\n{status}")
             }
             "plan" => {
                 let plan_task = args;
                 if plan_task == "cancel" || plan_task == "exit" {
                     state.plan_mode_sessions.write().await.remove(&session_id);
-                    let _ = tx.send(Ok(Event::default()
-                        .event("plan_mode_exited")
-                        .json_data(serde_json::json!({"session_id": session_id.to_string()}))
-                        .unwrap_or_else(|_| Event::default().event("error")))).await;
+                    let _ = tx
+                        .send(Ok(Event::default()
+                            .event("plan_mode_exited")
+                            .json_data(serde_json::json!({"session_id": session_id.to_string()}))
+                            .unwrap_or_else(|_| Event::default().event("error"))))
+                        .await;
                     tracing::info!(%session_id, "Plan mode cancelled by user");
                     "Plan mode cancelled. Normal operations resumed.".to_string()
                 } else {
-                    state.plan_mode_sessions.write().await.insert(session_id, "semi_auto".to_string());
+                    state
+                        .plan_mode_sessions
+                        .write()
+                        .await
+                        .insert(session_id, "semi_auto".to_string());
                     let _ = tx.send(Ok(Event::default()
                         .event("plan_mode_entered")
                         .json_data(serde_json::json!({"session_id": session_id.to_string(), "task": plan_task}))
@@ -155,7 +175,8 @@ async fn handle_chat(
                     tracing::info!(%session_id, task = plan_task, "Plan mode entered via /plan command");
                     if plan_task.is_empty() {
                         "Plan mode entered via /plan. Explore the codebase, design an approach, \
-                         and write a plan. Write tools are blocked until the user approves.".to_string()
+                         and write a plan. Write tools are blocked until the user approves."
+                            .to_string()
                     } else {
                         format!(
                             "Plan mode entered for: {plan_task}\n\n\
@@ -183,15 +204,20 @@ async fn handle_chat(
                                 format!("{icon} **{}** — {}", t.content, t.status)
                             })
                             .collect();
-                        format!("## Current Tasks\n\n{}\n\nUse TodoWrite to manage.", lines.join("\n"))
+                        format!(
+                            "## Current Tasks\n\n{}\n\nUse TodoWrite to manage.",
+                            lines.join("\n")
+                        )
                     }
                 } else {
                     "No task list found. Use TodoWrite to create one.".to_string()
                 };
-                let _ = tx.send(Ok(Event::default()
-                    .event("slash_command")
-                    .json_data(serde_json::json!({"command": "tasks"}))
-                    .unwrap_or_else(|_| Event::default().event("error")))).await;
+                let _ = tx
+                    .send(Ok(Event::default()
+                        .event("slash_command")
+                        .json_data(serde_json::json!({"command": "tasks"}))
+                        .unwrap_or_else(|_| Event::default().event("error"))))
+                    .await;
                 summary
             }
             "doctor" => {
@@ -217,13 +243,60 @@ async fn handle_chat(
                         r.pass, r.warn, r.fail,
                     )
                 } else {
-                    "System health report not yet available. Try again after startup completes.".to_string()
+                    "System health report not yet available. Try again after startup completes."
+                        .to_string()
                 };
-                let _ = tx.send(Ok(Event::default()
-                    .event("slash_command")
-                    .json_data(serde_json::json!({"command": "doctor"}))
-                    .unwrap_or_else(|_| Event::default().event("error")))).await;
+                let _ = tx
+                    .send(Ok(Event::default()
+                        .event("slash_command")
+                        .json_data(serde_json::json!({"command": "doctor"}))
+                        .unwrap_or_else(|_| Event::default().event("error"))))
+                    .await;
                 status
+            }
+            "workspace" => {
+                let path = args.trim();
+                if path.is_empty() || path == "reset" {
+                    // Unbind: revert to sandbox default
+                    let _ = state.db.set_session_workspace(session_id, None).await;
+                    let _ = state
+                        .create_sandbox(
+                            session_id,
+                            crate::routes::chat::resolve_permission(
+                                &state.config.default_permission_level,
+                            ),
+                            None,
+                        )
+                        .await;
+                    let _ = tx.send(Ok(Event::default()
+                        .event("workspace_changed")
+                        .json_data(serde_json::json!({"session_id": session_id.to_string(), "workspace_dir": null}))
+                        .unwrap_or_else(|_| Event::default().event("error")))).await;
+                    "Workspace reset to sandbox default. Shell commands now run in the isolated sandbox directory."
+                        .to_string()
+                } else {
+                    let p = std::path::Path::new(path);
+                    if !p.is_dir() {
+                        format!("Error: '{path}' is not a valid directory.")
+                    } else {
+                        let ws = p.to_string_lossy().to_string();
+                        let _ = state.db.set_session_workspace(session_id, Some(&ws)).await;
+                        let _ = state
+                            .create_sandbox(
+                                session_id,
+                                crate::routes::chat::resolve_permission(
+                                    &state.config.default_permission_level,
+                                ),
+                                Some(ws.clone()),
+                            )
+                            .await;
+                        let _ = tx.send(Ok(Event::default()
+                            .event("workspace_changed")
+                            .json_data(serde_json::json!({"session_id": session_id.to_string(), "workspace_dir": ws}))
+                            .unwrap_or_else(|_| Event::default().event("error")))).await;
+                        format!("Workspace set to: {path}\n\nAll shell commands and file operations will use this directory. Use `/workspace reset` to revert to sandbox default.")
+                    }
+                }
             }
             _ => req.message.clone(),
         }
@@ -261,7 +334,11 @@ async fn handle_chat(
         .filter_map(|c| c.try_lock().ok().map(|g| g.tools.len()))
         .sum();
     let tool_count = base_tool_count + mcp_tool_count;
-    let workspace_path = state.workspace_dir.read().await.clone();
+    // Use per-session sandbox work_dir (may be workspace or sandbox default)
+    let workspace_path = {
+        let sandboxes = state.sandboxes.read().await;
+        sandboxes.get(&session_id).map(|sb| sb.work_dir().clone())
+    };
     let workspace_path_str = workspace_path.as_ref().map(|p| p.display().to_string());
 
     // Git detection (Claude Code alignment)
@@ -280,20 +357,34 @@ async fn handle_chat(
     // pending from completed work and correctly interpret "继续" (continue).
     let todo_summary = {
         let store = state.todo_store.read().await;
-        store.get(&session_id).map(|items| {
-            if items.is_empty() {
-                "(empty)".to_string()
-            } else {
-                items.iter().map(|item| {
+        let fmt_items = |items: &[everevo_agent::tools::builtins::TodoItem]| {
+            items
+                .iter()
+                .map(|item| {
                     let icon = match item.status.as_str() {
                         "completed" => "✅",
                         "in_progress" => "🔄",
                         _ => "⬜",
                     };
                     format!("- {} {} ({})", icon, item.content, item.status)
-                }).collect::<Vec<_>>().join("\n")
-            }
-        })
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let global = store
+            .get(&everevo_agent::tools::builtins::GLOBAL_TASK_KEY)
+            .filter(|g| !g.is_empty());
+        let session = store.get(&session_id).filter(|s| !s.is_empty());
+        match (global, session) {
+            (Some(g), Some(s)) => format!(
+                "## Global (cross-conversation):\n{}\n\n## This session:\n{}",
+                fmt_items(g),
+                fmt_items(s)
+            ),
+            (Some(g), None) => format!("## Global (cross-conversation):\n{}", fmt_items(g)),
+            (None, Some(s)) => fmt_items(s),
+            (None, None) => "(empty)".to_string(),
+        }
     };
 
     let ctx = ContextBuildContext {
@@ -313,13 +404,35 @@ async fn handle_chat(
         git_status,
         workspace_context_files,
         current_date: Some(chrono::Utc::now().format("%Y-%m-%d").to_string()),
-        todo_summary: todo_summary.clone(),
+        todo_summary: Some(todo_summary.clone()),
         plan_mode: {
             let ps = state.plan_mode_sessions.read().await;
             ps.contains_key(&session_id)
         },
         escalation_level: None,
         fixation_detail: None,
+        runtime_summary: {
+            let report = state.startup_report.read().await;
+            report.as_ref().and_then(|r| {
+                r.items
+                    .iter()
+                    .find(|c| c.name == "Runtime smoke test")
+                    .map(|c| c.detail.clone())
+            })
+        },
+        sandbox_root: Some(
+            state
+                .config
+                .data_dir
+                .join("sandbox")
+                .join(session_id.to_string())
+                .display()
+                .to_string(),
+        ),
+        startup_verified: {
+            let report = state.startup_report.read().await;
+            report.as_ref().map(|r| r.fail == 0).unwrap_or(false)
+        },
     };
     let persona_profile_path = state
         .config
@@ -329,7 +442,8 @@ async fn handle_chat(
         .join("profile.json");
     let memory_stage = {
         let mut stage = everevo_agent::MemoryStage::new(state.fact_manager.clone())
-            .with_knowledge_graph(state.knowledge_graph.clone());
+            .with_knowledge_graph(state.knowledge_graph.clone())
+            .with_workflows_dir(state.config.data_dir.join("workflows"));
         if let Some(ref rag) = state.rag_pipeline {
             stage = stage.with_rag(Arc::clone(rag));
         }
@@ -360,7 +474,7 @@ async fn handle_chat(
         None,
         &shell,
         &["shell".into(), "memory".into()],
-        todo_summary.clone(),
+        Some(todo_summary.clone()),
     )
     .await;
     // Inherit parent session's permission level for sub-agents.
@@ -369,9 +483,11 @@ async fn handle_chat(
     // Inject T1 memory context for sub-agents (≤400 chars)
     if let Ok(t1) = state.fact_manager.load_tier1() {
         if !t1.is_empty() {
-            let lines: Vec<String> = t1.iter().take(5).map(|f| {
-                format!("- {} — {}", f.name, f.description)
-            }).collect();
+            let lines: Vec<String> = t1
+                .iter()
+                .take(5)
+                .map(|f| format!("- {} — {}", f.name, f.description))
+                .collect();
             sub_ctx.memory_context = Some(lines.join("\n"));
         }
     }
@@ -379,7 +495,9 @@ async fn handle_chat(
     if let Ok(kg) = state.knowledge_graph.read() {
         let ec = kg.entity_count();
         if ec > 0 {
-            sub_ctx.kg_context = Some(format!("{ec} entities available. Use `memory` → `kg_search` to explore."));
+            sub_ctx.kg_context = Some(format!(
+                "{ec} entities available. Use `memory` → `kg_search` to explore."
+            ));
         }
     }
 
@@ -392,8 +510,7 @@ async fn handle_chat(
 
     // Determine turn number (user+assistant pairs → turns)
     let turn_number = ctx.history.len() / 2 + 1;
-    let (messages, snapshot) =
-        pipeline.assemble_with_snapshot(&ctx, session_id, turn_number);
+    let (messages, snapshot) = pipeline.assemble_with_snapshot(&ctx, session_id, turn_number);
 
     // Store snapshot for observability dashboard (fire-and-forget)
     let snapshots_state = Arc::clone(&state);
@@ -410,9 +527,12 @@ async fn handle_chat(
         .map_err(|e| format!("Failed to save user message: {e}"))?;
 
     // Feed raw message into the dreaming engine's buffer
-    state
-        .dreaming_engine
-        .push_message("user", &req.message, &user_msg.id.to_string(), &session_id.to_string());
+    state.dreaming_engine.push_message(
+        "user",
+        &req.message,
+        &user_msg.id.to_string(),
+        &session_id.to_string(),
+    );
 
     // Bump session updated_at
     let _ = state
@@ -482,9 +602,7 @@ async fn handle_chat(
     let mut messages_for_autocontinue = messages.clone();
     let client_for_autocontinue = Arc::clone(&client);
     let tools_for_autocontinue = Arc::clone(&tools);
-    let proactivity = Arc::new(std::sync::Mutex::new(
-        everevo_agent::ProactivityState::new(),
-    ));
+    let proactivity = Arc::new(std::sync::Mutex::new(everevo_agent::ProactivityState::new()));
     let agent = everevo_agent::AgentLoop::new()
         .with_subagent_channel(subagent_rx)
         .with_pending_subagents(pending_subagents)
@@ -635,9 +753,10 @@ async fn handle_chat(
             for (task_id, desc, result) in &new_results {
                 let short: String = result.chars().take(2000).collect();
                 let _ = tx
-                    .send(Ok(Event::default()
-                        .event("subagent_result")
-                        .data(serde_json::json!({"id": task_id, "description": desc, "result": short}).to_string())))
+                    .send(Ok(Event::default().event("subagent_result").data(
+                        serde_json::json!({"id": task_id, "description": desc, "result": short})
+                            .to_string(),
+                    )))
                     .await;
                 messages_for_autocontinue.push(everevo_core::llm::LlmMessage::user(format!(
                     "[SubAgent Result]\n{result}"
@@ -723,22 +842,54 @@ async fn handle_chat(
     )
     .await;
 
-    // ── Post-turn memory extraction (Mem0 pattern: async LLM extraction) ──
+    // ── Post-turn memory extraction + reflection (async, fire-and-forget) ──
     if !s.full_response.is_empty() {
         let llm = state.llm.read().await;
         if let Some(primary) = llm.values().find_map(|v| v.clone()) {
             let fm = state.fact_manager.clone();
             let user_msg = req.message.clone();
             let assistant_msg = s.full_response.clone();
-            tokio::spawn(async move {
-                everevo_agent::memory::extractor::extract_from_turn(
-                    &primary,
-                    &fm,
-                    &user_msg,
-                    &assistant_msg,
-                )
-                .await;
-            });
+            // Memory extraction (Mem0 pattern: durable facts).
+            {
+                let (p, fm, um, am) = (
+                    Arc::clone(&primary),
+                    Arc::clone(&fm),
+                    user_msg.clone(),
+                    assistant_msg.clone(),
+                );
+                tokio::spawn(async move {
+                    everevo_agent::memory::extractor::extract_from_turn(&p, &fm, &um, &am).await;
+                });
+            }
+            // Reflection agent (Reflexion pattern: lessons → Feedback facts,
+            // auto-surfaced next time via MemoryStage — zero wiring).
+            {
+                let (p, fm, um, am) = (
+                    Arc::clone(&primary),
+                    Arc::clone(&fm),
+                    user_msg,
+                    assistant_msg,
+                );
+                tokio::spawn(async move {
+                    everevo_agent::memory::reflection::reflect_on_turn(&p, &fm, &um, &am).await;
+                });
+            }
+            // Summary agent (auto-compose: repeatable task → reusable workflow
+            // saved to data/workflows/, runnable later by name).
+            {
+                let (p, dir, um, am) = (
+                    Arc::clone(&primary),
+                    state.config.data_dir.join("workflows"),
+                    req.message.clone(),
+                    s.full_response.clone(),
+                );
+                tokio::spawn(async move {
+                    everevo_agent::memory::reflection::compose_workflow_if_reusable(
+                        &p, &dir, &um, &am,
+                    )
+                    .await;
+                });
+            }
         }
     }
 
@@ -770,14 +921,14 @@ async fn handle_reconnect(
 
     // Send session info event
     let _ = tx
-        .send(Ok(Event::default()
-            .event("session_info")
-            .data(serde_json::json!({
+        .send(Ok(Event::default().event("session_info").data(
+            serde_json::json!({
                 "session_id": session_id,
                 "mode": meta.mode.as_str(),
                 "state": meta.state.as_str(),
             })
-            .to_string())))
+            .to_string(),
+        )))
         .await;
 
     // Load all messages
@@ -796,15 +947,15 @@ async fn handle_reconnect(
             _ => "message",
         };
         let _ = tx
-            .send(Ok(Event::default()
-                .event(event_type)
-                .data(serde_json::json!({
+            .send(Ok(Event::default().event(event_type).data(
+                serde_json::json!({
                     "id": msg.id,
                     "role": msg.role,
                     "content": msg.content,
                     "created_at": msg.created_at,
                 })
-                .to_string())))
+                .to_string(),
+            )))
             .await;
     }
 
@@ -834,15 +985,15 @@ async fn handle_reconnect(
             // Send any new messages
             for msg in &current[last_count..] {
                 let _ = tx
-                    .send(Ok(Event::default()
-                        .event("new_message")
-                        .data(serde_json::json!({
+                    .send(Ok(Event::default().event("new_message").data(
+                        serde_json::json!({
                             "id": msg.id,
                             "role": msg.role,
                             "content": msg.content,
                             "created_at": msg.created_at,
                         })
-                        .to_string())))
+                        .to_string(),
+                    )))
                     .await;
             }
             last_count = current.len();
@@ -851,13 +1002,13 @@ async fn handle_reconnect(
 
     // Done
     let _ = tx
-        .send(Ok(Event::default()
-            .event("reconnect_done")
-            .data(serde_json::json!({
+        .send(Ok(Event::default().event("reconnect_done").data(
+            serde_json::json!({
                 "session_id": session_id,
                 "message_count": messages.len(),
             })
-            .to_string())))
+            .to_string(),
+        )))
         .await;
 
     Ok(())
@@ -905,6 +1056,9 @@ pub(crate) fn db_message_to_llm(m: &MessageRow) -> LlmMessage {
             .as_ref()
             .and_then(|tc| serde_json::from_str(tc).ok()),
         tool_call_id: m.tool_call_id.clone(),
+        // Images are not persisted to DB — only carried in-memory for the
+        // current turn. Reconstructed history is text-only by design.
+        images: Vec::new(),
     }
 }
 
@@ -943,15 +1097,26 @@ fn detect_git(workspace: &std::path::Path) -> (Option<String>, Option<String>) {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .filter(|s| !s.trim().is_empty())
         .map(|s| {
-            let modified = s.lines().filter(|l| {
-                let trimmed = l.trim();
-                !trimmed.is_empty() && !trimmed.starts_with("??")
-            }).count();
+            let modified = s
+                .lines()
+                .filter(|l| {
+                    let trimmed = l.trim();
+                    !trimmed.is_empty() && !trimmed.starts_with("??")
+                })
+                .count();
             let untracked = s.lines().filter(|l| l.trim().starts_with("??")).count();
             let mut parts = Vec::new();
-            if modified > 0 { parts.push(format!("{modified} modified")); }
-            if untracked > 0 { parts.push(format!("{untracked} untracked")); }
-            if parts.is_empty() { "clean".to_string() } else { parts.join(", ") }
+            if modified > 0 {
+                parts.push(format!("{modified} modified"));
+            }
+            if untracked > 0 {
+                parts.push(format!("{untracked} untracked"));
+            }
+            if parts.is_empty() {
+                "clean".to_string()
+            } else {
+                parts.join(", ")
+            }
         });
     (branch, status)
 }
@@ -960,9 +1125,7 @@ fn detect_git(workspace: &std::path::Path) -> (Option<String>, Option<String>) {
 
 /// Walk up from workspace root discovering CLAUDE.md / AGENTS.md files
 /// (Claude Code alignment — hierarchical context chain).
-fn discover_workspace_context(
-    workspace: &std::path::Path,
-) -> Vec<(String, String)> {
+fn discover_workspace_context(workspace: &std::path::Path) -> Vec<(String, String)> {
     let mut files = Vec::new();
     let mut current = Some(workspace.to_path_buf());
     while let Some(dir) = current {

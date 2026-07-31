@@ -23,9 +23,10 @@ async fn get_latest_snapshot(
     let latest = snapshots.get(&id).and_then(|v| v.last()).cloned();
 
     match latest {
-        Some(snapshot) => Json(serde_json::to_value(&snapshot).unwrap_or_else(|_| {
-            serde_json::json!({"error": "serialization failed"})
-        })),
+        Some(snapshot) => Json(
+            serde_json::to_value(&snapshot)
+                .unwrap_or_else(|_| serde_json::json!({"error": "serialization failed"})),
+        ),
         None => Json(serde_json::json!({
             "error": "No context snapshot available for this session",
             "hint": "Send a message first to trigger context assembly"

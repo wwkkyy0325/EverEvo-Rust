@@ -61,10 +61,16 @@ struct LangPatterns {
 
 fn rust_patterns() -> LangPatterns {
     LangPatterns {
-        functions: Regex::new(r"^\s*(?:pub(?:\s*\(\s*crate\s*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s+(\w+)").unwrap(),
+        functions: Regex::new(
+            r"^\s*(?:pub(?:\s*\(\s*crate\s*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s+(\w+)",
+        )
+        .unwrap(),
         structs: Regex::new(r"^\s*(?:pub(?:\s*\(\s*crate\s*\))?\s+)?struct\s+(\w+)").unwrap(),
         impls: Some(Regex::new(r"^\s*impl\s+(?:[^<]*?)(?:<[^>]*>)?\s*(\w+)").unwrap()),
-        traits: Some(Regex::new(r"^\s*(?:pub(?:\s*\(\s*crate\s*\))?\s+)?(?:unsafe\s+)?trait\s+(\w+)").unwrap()),
+        traits: Some(
+            Regex::new(r"^\s*(?:pub(?:\s*\(\s*crate\s*\))?\s+)?(?:unsafe\s+)?trait\s+(\w+)")
+                .unwrap(),
+        ),
         enums: Some(Regex::new(r"^\s*(?:pub(?:\s*\(\s*crate\s*\))?\s+)?enum\s+(\w+)").unwrap()),
         modules: Regex::new(r"^\s*(?:pub\s+)?mod\s+(\w+)").unwrap(),
         types: Some(Regex::new(r"^\s*(?:pub(?:\s*\(\s*crate\s*\))?\s+)?type\s+(\w+)").unwrap()),
@@ -145,8 +151,14 @@ fn c_cpp_patterns() -> LangPatterns {
 
 fn kotlin_patterns() -> LangPatterns {
     LangPatterns {
-        functions: Regex::new(r"^\s*(?:suspend\s+)?(?:private|internal|protected|public)?\s*fun\s+(\w+)\s*\(").unwrap(),
-        structs: Regex::new(r"^\s*(?:data\s+)?(?:sealed\s+)?(?:abstract\s+)?(?:open\s+)?class\s+(\w+)").unwrap(),
+        functions: Regex::new(
+            r"^\s*(?:suspend\s+)?(?:private|internal|protected|public)?\s*fun\s+(\w+)\s*\(",
+        )
+        .unwrap(),
+        structs: Regex::new(
+            r"^\s*(?:data\s+)?(?:sealed\s+)?(?:abstract\s+)?(?:open\s+)?class\s+(\w+)",
+        )
+        .unwrap(),
         impls: None,
         traits: Some(Regex::new(r"^\s*interface\s+(\w+)").unwrap()),
         enums: Some(Regex::new(r"^\s*enum\s+class\s+(\w+)").unwrap()),
@@ -192,14 +204,20 @@ fn is_comment_or_string(line: &str, ext: &str) -> bool {
         return true;
     }
     match ext {
-        "rs" | "go" | "java" | "kt" | "kts" | "swift" | "c" | "cpp" | "h" | "hpp" | "cc" | "cxx" =>
-            trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') || trimmed.starts_with("///"),
-        "py" =>
-            trimmed.starts_with('#') || trimmed.starts_with("\"\"\"") || trimmed.starts_with("'''"),
-        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" =>
-            trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*'),
-        "rb" =>
-            trimmed.starts_with('#') || trimmed.starts_with("=begin"),
+        "rs" | "go" | "java" | "kt" | "kts" | "swift" | "c" | "cpp" | "h" | "hpp" | "cc"
+        | "cxx" => {
+            trimmed.starts_with("//")
+                || trimmed.starts_with("/*")
+                || trimmed.starts_with('*')
+                || trimmed.starts_with("///")
+        }
+        "py" => {
+            trimmed.starts_with('#') || trimmed.starts_with("\"\"\"") || trimmed.starts_with("'''")
+        }
+        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => {
+            trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*')
+        }
+        "rb" => trimmed.starts_with('#') || trimmed.starts_with("=begin"),
         _ => false,
     }
 }
@@ -247,10 +265,17 @@ pub fn scan_file(path: &Path, relative_to: &Path) -> Vec<CodeSymbol> {
 
         // Track parent module
         if let Some(caps) = patterns.modules.captures(line) {
-            let name = caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str().to_string()).unwrap_or_default();
+            let name = caps
+                .get(1)
+                .or_else(|| caps.get(2))
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
             if !name.is_empty() && ext == "rs" {
-                if parent.is_empty() { parent = name.clone(); }
-                else { parent = format!("{}::{}", parent, name); }
+                if parent.is_empty() {
+                    parent = name.clone();
+                } else {
+                    parent = format!("{}::{}", parent, name);
+                }
             }
         }
 
@@ -258,7 +283,9 @@ pub fn scan_file(path: &Path, relative_to: &Path) -> Vec<CodeSymbol> {
         macro_rules! try_extract {
             ($regex:expr, $kind:expr) => {
                 if let Some(caps) = $regex.captures(line) {
-                    let name = caps.get(1).or_else(|| caps.get(2))
+                    let name = caps
+                        .get(1)
+                        .or_else(|| caps.get(2))
                         .map(|m| m.as_str().to_string())
                         .unwrap_or_default();
                     if !name.is_empty() && !is_keyword(&name) {
@@ -277,10 +304,18 @@ pub fn scan_file(path: &Path, relative_to: &Path) -> Vec<CodeSymbol> {
 
         try_extract!(patterns.functions, SymbolKind::Function);
         try_extract!(patterns.structs, SymbolKind::Struct);
-        if let Some(ref rx) = patterns.impls { try_extract!(*rx, SymbolKind::Impl); }
-        if let Some(ref rx) = patterns.traits { try_extract!(*rx, SymbolKind::Trait); }
-        if let Some(ref rx) = patterns.enums { try_extract!(*rx, SymbolKind::Enum); }
-        if let Some(ref rx) = patterns.types { try_extract!(*rx, SymbolKind::TypeAlias); }
+        if let Some(ref rx) = patterns.impls {
+            try_extract!(*rx, SymbolKind::Impl);
+        }
+        if let Some(ref rx) = patterns.traits {
+            try_extract!(*rx, SymbolKind::Trait);
+        }
+        if let Some(ref rx) = patterns.enums {
+            try_extract!(*rx, SymbolKind::Enum);
+        }
+        if let Some(ref rx) = patterns.types {
+            try_extract!(*rx, SymbolKind::TypeAlias);
+        }
         try_extract!(patterns.constants, SymbolKind::Constant);
 
         // Module symbols (Rust mod declarations)
@@ -305,11 +340,42 @@ pub fn scan_file(path: &Path, relative_to: &Path) -> Vec<CodeSymbol> {
 }
 
 fn is_keyword(name: &str) -> bool {
-    matches!(name, "pub" | "crate" | "self" | "super" | "mut" | "ref" |
-        "true" | "false" | "if" | "else" | "for" | "while" | "loop" |
-        "match" | "return" | "let" | "use" | "as" | "in" | "where" |
-        "async" | "await" | "move" | "dyn" | "impl" | "fn" | "mod" |
-        "struct" | "enum" | "trait" | "type" | "const" | "static")
+    matches!(
+        name,
+        "pub"
+            | "crate"
+            | "self"
+            | "super"
+            | "mut"
+            | "ref"
+            | "true"
+            | "false"
+            | "if"
+            | "else"
+            | "for"
+            | "while"
+            | "loop"
+            | "match"
+            | "return"
+            | "let"
+            | "use"
+            | "as"
+            | "in"
+            | "where"
+            | "async"
+            | "await"
+            | "move"
+            | "dyn"
+            | "impl"
+            | "fn"
+            | "mod"
+            | "struct"
+            | "enum"
+            | "trait"
+            | "type"
+            | "const"
+            | "static"
+    )
 }
 
 #[cfg(test)]
@@ -327,7 +393,11 @@ mod tests {
         let code = "pub fn hello_world() {}\nfn private_fn() {}\npub async fn async_fn() {}";
         let (_dir, path) = write_temp(code, "rs");
         let symbols = scan_file(&path, _dir.path());
-        let names: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Function).map(|s| s.name.clone()).collect();
+        let names: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .map(|s| s.name.clone())
+            .collect();
         assert!(names.contains(&"hello_world".into()));
         assert!(names.contains(&"private_fn".into()));
         assert!(names.contains(&"async_fn".into()));
@@ -338,7 +408,11 @@ mod tests {
         let code = "pub struct MyStruct {}\nstruct PrivateStruct;";
         let (_dir, path) = write_temp(code, "rs");
         let symbols = scan_file(&path, _dir.path());
-        let names: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Struct).map(|s| s.name.clone()).collect();
+        let names: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Struct)
+            .map(|s| s.name.clone())
+            .collect();
         assert!(names.contains(&"MyStruct".into()));
         assert!(names.contains(&"PrivateStruct".into()));
     }
@@ -348,8 +422,12 @@ mod tests {
         let code = "def my_func():\n    pass\n\nclass MyClass:\n    pass";
         let (_dir, path) = write_temp(code, "py");
         let symbols = scan_file(&path, _dir.path());
-        assert!(symbols.iter().any(|s| s.name == "my_func" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "MyClass" && s.kind == SymbolKind::Struct));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "my_func" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "MyClass" && s.kind == SymbolKind::Struct));
     }
 
     #[test]
@@ -395,8 +473,12 @@ mod tests {
         let code = "public class UserService {\n    public User findUser(String id) {\n        return null;\n    }\n}";
         let (_dir, path) = write_temp(code, "java");
         let symbols = scan_file(&path, _dir.path());
-        assert!(symbols.iter().any(|s| s.name == "UserService" && s.kind == SymbolKind::Struct));
-        assert!(symbols.iter().any(|s| s.name == "findUser" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "UserService" && s.kind == SymbolKind::Struct));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "findUser" && s.kind == SymbolKind::Function));
     }
 
     #[test]
@@ -404,7 +486,9 @@ mod tests {
         let code = "class Calculator {\npublic:\n    int add(int a, int b);\n};";
         let (_dir, path) = write_temp(code, "cpp");
         let symbols = scan_file(&path, _dir.path());
-        assert!(symbols.iter().any(|s| s.name == "Calculator" && s.kind == SymbolKind::Struct));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Calculator" && s.kind == SymbolKind::Struct));
     }
 
     #[test]
@@ -412,8 +496,12 @@ mod tests {
         let code = "data class User(val name: String)\nfun main() {\n    println(\"hello\")\n}";
         let (_dir, path) = write_temp(code, "kt");
         let symbols = scan_file(&path, _dir.path());
-        assert!(symbols.iter().any(|s| s.name == "User" && s.kind == SymbolKind::Struct));
-        assert!(symbols.iter().any(|s| s.name == "main" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "User" && s.kind == SymbolKind::Struct));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "main" && s.kind == SymbolKind::Function));
     }
 
     #[test]
@@ -421,8 +509,12 @@ mod tests {
         let code = "class MyClass\n  def my_method\n    puts 'hello'\n  end\nend";
         let (_dir, path) = write_temp(code, "rb");
         let symbols = scan_file(&path, _dir.path());
-        assert!(symbols.iter().any(|s| s.name == "MyClass" && s.kind == SymbolKind::Struct));
-        assert!(symbols.iter().any(|s| s.name == "my_method" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "MyClass" && s.kind == SymbolKind::Struct));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "my_method" && s.kind == SymbolKind::Function));
     }
 
     #[test]
@@ -430,7 +522,11 @@ mod tests {
         let code = "class ViewController: UIViewController {\n    func viewDidLoad() {\n        super.viewDidLoad()\n    }\n}";
         let (_dir, path) = write_temp(code, "swift");
         let symbols = scan_file(&path, _dir.path());
-        assert!(symbols.iter().any(|s| s.name == "ViewController" && s.kind == SymbolKind::Struct));
-        assert!(symbols.iter().any(|s| s.name == "viewDidLoad" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "ViewController" && s.kind == SymbolKind::Struct));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "viewDidLoad" && s.kind == SymbolKind::Function));
     }
 }

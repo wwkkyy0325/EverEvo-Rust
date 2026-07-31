@@ -47,6 +47,20 @@ pub struct LlmMessage {
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Image attachments (base64). Empty = text-only. Carried in-memory only
+    /// (not persisted to DB) — feeds screenshots to vision-capable LLMs.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub images: Vec<ImageData>,
+}
+
+/// A base64-encoded image attachment for multimodal (vision) messages.
+/// Carried alongside text `content`; serialized as image content blocks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageData {
+    /// Base64-encoded image bytes (no `data:` prefix).
+    pub data: String,
+    /// MIME type, e.g. `"image/png"`.
+    pub mime_type: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +128,7 @@ impl LlmMessage {
             thinking: None,
             tool_calls: None,
             tool_call_id: None,
+            images: Vec::new(),
         }
     }
     pub fn user(content: impl Into<String>) -> Self {
@@ -123,6 +138,7 @@ impl LlmMessage {
             thinking: None,
             tool_calls: None,
             tool_call_id: None,
+            images: Vec::new(),
         }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
@@ -132,6 +148,7 @@ impl LlmMessage {
             thinking: None,
             tool_calls: None,
             tool_call_id: None,
+            images: Vec::new(),
         }
     }
     pub fn tool(content: impl Into<String>, call_id: impl Into<String>) -> Self {
@@ -141,6 +158,7 @@ impl LlmMessage {
             thinking: None,
             tool_calls: None,
             tool_call_id: Some(call_id.into()),
+            images: Vec::new(),
         }
     }
 }

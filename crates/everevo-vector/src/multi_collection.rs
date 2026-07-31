@@ -92,16 +92,21 @@ impl MultiCollectionStore {
         );
 
         Ok(Self {
-            inner: Mutex::new(Inner { stores, dim, base_dir }),
+            inner: Mutex::new(Inner {
+                stores,
+                dim,
+                base_dir,
+            }),
         })
     }
 
     /// Insert chunks into a specific collection. Creates the collection
     /// lazily if it doesn't exist. Files are named `{collection}-{dim}.bin`.
     pub fn insert(&self, collection: &str, chunks: Vec<MemoryChunk>) -> Result<(), EverEvoError> {
-        let mut inner = self.inner.lock().map_err(|e| {
-            EverEvoError::Internal(format!("Lock collections: {e}"))
-        })?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| EverEvoError::Internal(format!("Lock collections: {e}")))?;
         if !inner.stores.contains_key(collection) {
             let file_stem = format!("{}-{}", collection, inner.dim);
             let store = HnswStore::open(inner.base_dir.join(&file_stem), inner.dim)?;
@@ -117,9 +122,10 @@ impl MultiCollectionStore {
         query_vector: &[f32],
         top_k: usize,
     ) -> Result<Vec<ScoredChunk>, EverEvoError> {
-        let inner = self.inner.lock().map_err(|e| {
-            EverEvoError::Internal(format!("Lock collections: {e}"))
-        })?;
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|e| EverEvoError::Internal(format!("Lock collections: {e}")))?;
         if let Some(store) = inner.stores.get(collection) {
             store.search(query_vector, top_k)
         } else {
@@ -141,9 +147,10 @@ impl MultiCollectionStore {
             return self.search(collections[0], query_vector, top_k);
         }
 
-        let inner = self.inner.lock().map_err(|e| {
-            EverEvoError::Internal(format!("Lock collections: {e}"))
-        })?;
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|e| EverEvoError::Internal(format!("Lock collections: {e}")))?;
 
         let mut all_results: Vec<Vec<ScoredChunk>> = Vec::new();
         for &col in collections {
@@ -174,16 +181,21 @@ impl MultiCollectionStore {
                 chunk
             })
             .collect();
-        merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        merged.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         merged.truncate(top_k);
         Ok(merged)
     }
 
     /// Delete chunks from a collection.
     pub fn delete(&self, collection: &str, ids: &[Uuid]) -> Result<(), EverEvoError> {
-        let inner = self.inner.lock().map_err(|e| {
-            EverEvoError::Internal(format!("Lock collections: {e}"))
-        })?;
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|e| EverEvoError::Internal(format!("Lock collections: {e}")))?;
         if let Some(store) = inner.stores.get(collection) {
             store.delete(ids)
         } else {
@@ -230,7 +242,11 @@ impl MultiCollectionStore {
         // Try both .bin and .json extensions.
         let old_bin = old_path.with_extension("bin");
         let old_json = old_path.with_extension("json");
-        let actual_old = if old_bin.exists() { &old_bin } else { &old_json };
+        let actual_old = if old_bin.exists() {
+            &old_bin
+        } else {
+            &old_json
+        };
         if !actual_old.exists() {
             return;
         }
@@ -282,8 +298,12 @@ mod tests {
 
         let id1 = Uuid::new_v4();
         let id2 = Uuid::new_v4();
-        store.insert("memory", vec![make_chunk(id1, vec![1.0, 0.0, 0.0, 0.0])]).unwrap();
-        store.insert("code", vec![make_chunk(id2, vec![0.0, 1.0, 0.0, 0.0])]).unwrap();
+        store
+            .insert("memory", vec![make_chunk(id1, vec![1.0, 0.0, 0.0, 0.0])])
+            .unwrap();
+        store
+            .insert("code", vec![make_chunk(id2, vec![0.0, 1.0, 0.0, 0.0])])
+            .unwrap();
 
         let mem = store.search("memory", &[0.9, 0.1, 0.0, 0.0], 5).unwrap();
         assert_eq!(mem.len(), 1);
@@ -305,7 +325,12 @@ mod tests {
         // Initially only "memory" exists.
         assert_eq!(store.count("memory"), 0);
         // Accessing "code" creates it lazily.
-        store.insert("code", vec![make_chunk(Uuid::new_v4(), vec![1.0, 0.0, 0.0])]).unwrap();
+        store
+            .insert(
+                "code",
+                vec![make_chunk(Uuid::new_v4(), vec![1.0, 0.0, 0.0])],
+            )
+            .unwrap();
         assert_eq!(store.count("code"), 1);
     }
 
@@ -316,10 +341,16 @@ mod tests {
 
         let id1 = Uuid::new_v4();
         let id2 = Uuid::new_v4();
-        store.insert("memory", vec![make_chunk(id1, vec![1.0, 0.0, 0.0, 0.0])]).unwrap();
-        store.insert("code", vec![make_chunk(id2, vec![0.9, 0.1, 0.0, 0.0])]).unwrap();
+        store
+            .insert("memory", vec![make_chunk(id1, vec![1.0, 0.0, 0.0, 0.0])])
+            .unwrap();
+        store
+            .insert("code", vec![make_chunk(id2, vec![0.9, 0.1, 0.0, 0.0])])
+            .unwrap();
 
-        let results = store.search_multi(&["memory", "code"], &[1.0, 0.0, 0.0, 0.0], 5).unwrap();
+        let results = store
+            .search_multi(&["memory", "code"], &[1.0, 0.0, 0.0, 0.0], 5)
+            .unwrap();
         assert_eq!(results.len(), 2);
     }
 
@@ -332,7 +363,8 @@ mod tests {
         let old_bin = dir.path().join("memory.bin");
         {
             let old = HnswStore::open(dir.path().join("memory"), 3).unwrap();
-            old.insert(vec![make_chunk(Uuid::new_v4(), vec![1.0, 0.0, 0.0])]).unwrap();
+            old.insert(vec![make_chunk(Uuid::new_v4(), vec![1.0, 0.0, 0.0])])
+                .unwrap();
         }
         assert!(old_bin.exists());
 

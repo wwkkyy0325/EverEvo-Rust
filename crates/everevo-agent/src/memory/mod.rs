@@ -27,6 +27,7 @@ pub mod facts;
 pub mod frontmatter;
 pub mod index;
 pub mod pipeline;
+pub mod reflection;
 pub mod scheduler;
 pub mod wiki;
 

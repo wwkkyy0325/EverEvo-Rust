@@ -34,11 +34,7 @@ impl HttpClient {
     /// Classify HTTP error for better diagnostics.
     fn classify_http_error(status: reqwest::StatusCode, body: &str) -> String {
         let code = status.as_u16();
-        let detail = if body.len() > 300 {
-            &body[..300]
-        } else {
-            body
-        };
+        let detail = if body.len() > 300 { &body[..300] } else { body };
         match code {
             401 | 403 => format!(
                 "Authentication failed (HTTP {code}). Check your API key in data/config.toml."
@@ -115,6 +111,14 @@ impl HttpClient {
                             "text": m.content,
                         }));
                     }
+                    // Multimodal: append image blocks (e.g. browser screenshots)
+                    // for vision-capable models.
+                    for img in &m.images {
+                        content_blocks.push(serde_json::json!({
+                            "type": "image",
+                            "source": { "type": "base64", "media_type": img.mime_type, "data": img.data }
+                        }));
+                    }
                 }
                 if let Some(ref tcs) = m.tool_calls {
                     for tc in tcs {
@@ -144,10 +148,25 @@ impl HttpClient {
                             }
                         }
                     } else {
+                        // Anthropic tool_result.content accepts an array of
+                        // text/image blocks — used to carry screenshots back.
+                        let content = if m.images.is_empty() {
+                            serde_json::Value::String(m.content.clone())
+                        } else {
+                            let mut parts =
+                                vec![serde_json::json!({ "type": "text", "text": m.content })];
+                            for img in &m.images {
+                                parts.push(serde_json::json!({
+                                    "type": "image",
+                                    "source": { "type": "base64", "media_type": img.mime_type, "data": img.data }
+                                }));
+                            }
+                            serde_json::Value::Array(parts)
+                        };
                         content_blocks.push(serde_json::json!({
                             "type": "tool_result",
                             "tool_use_id": raw_id,
-                            "content": m.content,
+                            "content": content,
                         }));
                     }
                 }
@@ -200,7 +219,22 @@ impl HttpClient {
                 continue;
             }
 
-            let mut msg = serde_json::json!({ "role": role, "content": m.content });
+            // OpenAI: tool-role messages can't carry images inline. Non-tool
+            // messages with images use a content array (text + image_url).
+            let is_tool_msg = m.tool_call_id.is_some();
+            let content = if !is_tool_msg && !m.images.is_empty() {
+                let mut parts = vec![serde_json::json!({ "type": "text", "text": m.content })];
+                for img in &m.images {
+                    parts.push(serde_json::json!({
+                        "type": "image_url",
+                        "image_url": { "url": format!("data:{};base64,{}", img.mime_type, img.data) }
+                    }));
+                }
+                serde_json::Value::Array(parts)
+            } else {
+                serde_json::Value::String(m.content.clone())
+            };
+            let mut msg = serde_json::json!({ "role": role, "content": content });
             if let Some(ref thinking) = m.thinking {
                 if !thinking.is_empty() {
                     msg["reasoning_content"] = serde_json::json!(thinking);
@@ -212,11 +246,26 @@ impl HttpClient {
                 })).collect::<Vec<_>>());
                 msg["content"] = serde_json::Value::Null;
             }
-            if m.tool_call_id.is_some() {
+            if is_tool_msg {
                 msg["role"] = serde_json::json!("tool");
                 msg["tool_call_id"] = serde_json::json!(m.tool_call_id);
             }
             msgs.push(msg);
+
+            // Tool-result images can't live in a tool-role message; emit a
+            // follow-up user message so a vision model can see the screenshot.
+            if is_tool_msg && !m.images.is_empty() {
+                let mut img_parts = vec![serde_json::json!({
+                    "type": "text", "text": "[screenshot from tool result]"
+                })];
+                for img in &m.images {
+                    img_parts.push(serde_json::json!({
+                        "type": "image_url",
+                        "image_url": { "url": format!("data:{};base64,{}", img.mime_type, img.data) }
+                    }));
+                }
+                msgs.push(serde_json::json!({ "role": "user", "content": img_parts }));
+            }
         }
 
         let mut body = serde_json::json!({
@@ -241,34 +290,118 @@ impl LlmProvider for HttpClient {
         tools: &[ToolSchema],
     ) -> Result<LlmResponse, EverEvoError> {
         let body = self.build_body(messages, tools, false);
-        let mut req = self.client.post(self.endpoint()).json(&body);
-        if self.api_format == "anthropic" {
-            req = req
-                .header("x-api-key", &self.api_key)
-                .header("anthropic-version", "2023-06-01");
-        } else {
-            req = req.header("Authorization", format!("Bearer {}", self.api_key));
+        let mut last_error: Option<EverEvoError> = None;
+
+        for attempt in 0..=HttpClient::MAX_RETRIES {
+            if attempt > 0 {
+                let delay_ms = HttpClient::BASE_BACKOFF_MS * (1u64 << (attempt - 1)); // 1s, 2s, 4s
+                tracing::info!(
+                    attempt,
+                    max_retries = HttpClient::MAX_RETRIES,
+                    delay_ms,
+                    "LLM retry — transient failure, backing off"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+
+            let mut req = self.client.post(self.endpoint()).json(&body);
+            if self.api_format == "anthropic" {
+                req = req
+                    .header("x-api-key", &self.api_key)
+                    .header("anthropic-version", "2023-06-01");
+            } else {
+                req = req.header("Authorization", format!("Bearer {}", self.api_key));
+            }
+
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    // reqwest errors (timeout, connection reset, DNS) are retryable
+                    let msg = format!("{e}");
+                    let is_timeout = e.is_timeout() || msg.contains("timeout");
+                    let is_connect = e.is_connect() || msg.contains("connect");
+                    if is_timeout || is_connect {
+                        last_error = Some(EverEvoError::LlmProvider(format!(
+                            "Request failed (attempt {}/{}): {e}",
+                            attempt + 1,
+                            HttpClient::MAX_RETRIES + 1
+                        )));
+                        continue;
+                    }
+                    return Err(EverEvoError::LlmProvider(e.to_string()));
+                }
+            };
+
+            let status = resp.status();
+
+            // Read body once (reqwest responses are not cloneable for streaming).
+            let body_text = match resp.text().await {
+                Ok(t) => t,
+                Err(e) => {
+                    last_error = Some(EverEvoError::LlmProvider(format!(
+                        "Failed to read response body: {e}"
+                    )));
+                    continue;
+                }
+            };
+
+            let json: serde_json::Value = match serde_json::from_str(&body_text) {
+                Ok(v) => v,
+                Err(e) => {
+                    // Non-JSON response — might be a reverse proxy error page
+                    if HttpClient::is_retryable(status) {
+                        last_error = Some(EverEvoError::LlmProvider(format!(
+                            "Non-JSON response (HTTP {}), attempt {}/{}",
+                            status.as_u16(),
+                            attempt + 1,
+                            HttpClient::MAX_RETRIES + 1
+                        )));
+                        continue;
+                    }
+                    return Err(EverEvoError::LlmProvider(format!(
+                        "Invalid JSON response: {e}"
+                    )));
+                }
+            };
+
+            if !status.is_success() {
+                let classified = Self::classify_http_error(status, &json.to_string());
+                if HttpClient::is_retryable(status) {
+                    last_error = Some(EverEvoError::LlmProvider(format!(
+                        "{classified} (attempt {}/{})",
+                        attempt + 1,
+                        HttpClient::MAX_RETRIES + 1
+                    )));
+                    continue;
+                }
+                // Client errors (400, 401, 403, 404) — don't retry
+                return Err(EverEvoError::LlmProvider(classified));
+            }
+
+            return Ok(Self::parse_response(&json));
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| EverEvoError::LlmProvider(e.to_string()))?;
-        let status = resp.status();
-        let json: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| EverEvoError::LlmProvider(e.to_string()))?;
-        if !status.is_success() {
-            return Err(EverEvoError::LlmProvider(Self::classify_http_error(
-                status,
-                &json.to_string(),
-            )));
-        }
-        Ok(Self::parse_response(&json))
+
+        // All retries exhausted
+        Err(last_error.unwrap_or_else(|| {
+            EverEvoError::LlmProvider(format!(
+                "LLM request failed after {} attempts",
+                HttpClient::MAX_RETRIES + 1
+            ))
+        }))
     }
 }
 
 impl HttpClient {
+    /// Maximum retries for transient LLM API failures (429, 5xx, timeout).
+    const MAX_RETRIES: u32 = 3;
+    /// Base backoff in milliseconds.
+    const BASE_BACKOFF_MS: u64 = 1000;
+
+    /// Whether an HTTP status is retryable (transient server/rate-limit errors).
+    fn is_retryable(status: reqwest::StatusCode) -> bool {
+        status.as_u16() == 429 || status.is_server_error()
+    }
+
     fn parse_response(json: &serde_json::Value) -> LlmResponse {
         if Self::guess_format(json) == "anthropic" {
             let content = json["content"].as_array().and_then(|blocks| {
@@ -443,7 +576,11 @@ impl HttpClient {
                                                 let id = cb["id"].as_str().unwrap_or("");
                                                 let name = cb["name"].as_str().unwrap_or("");
                                                 active_tool_id = Some(id.to_string());
-                                                tracing::info!(tool_name = name, tool_id = id, "LLM tool call start");
+                                                tracing::info!(
+                                                    tool_name = name,
+                                                    tool_id = id,
+                                                    "LLM tool call start"
+                                                );
                                                 let _ = tx
                                                     .send(StreamEvent::ToolCallStart {
                                                         id: id.into(),
@@ -535,7 +672,9 @@ impl HttpClient {
                                         return;
                                     }
                                     if choice["finish_reason"].as_str() == Some("tool_calls") {
-                                        tracing::info!("LLM stream ended (finish_reason=tool_calls)");
+                                        tracing::info!(
+                                            "LLM stream ended (finish_reason=tool_calls)"
+                                        );
                                         let _ = tx.send(StreamEvent::Done).await;
                                         return;
                                     }

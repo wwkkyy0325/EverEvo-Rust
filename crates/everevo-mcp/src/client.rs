@@ -145,7 +145,7 @@ impl McpClient {
         name: &str,
         arguments: serde_json::Value,
         cancel: Option<&tokio_util::sync::CancellationToken>,
-    ) -> Result<String, String> {
+    ) -> Result<(String, Vec<everevo_core::ImageData>), String> {
         // Check cancellation before sending
         if cancel.is_some_and(|c| c.is_cancelled()) {
             return Err("cancelled".into());
@@ -180,17 +180,23 @@ impl McpClient {
         let call: CallToolResult =
             serde_json::from_value(result).map_err(|e| format!("parse tools/call result: {e}"))?;
 
-        let text = call
-            .content
-            .iter()
-            .filter_map(|b| match b {
-                ContentBlock::Text { text } => Some(text.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let mut text_parts = Vec::new();
+        let mut images = Vec::new();
+        for block in &call.content {
+            match block {
+                ContentBlock::Text { text } => text_parts.push(text.clone()),
+                ContentBlock::Image { data, mime_type } => {
+                    images.push(everevo_core::ImageData {
+                        data: data.clone(),
+                        mime_type: mime_type.clone(),
+                    });
+                }
+                ContentBlock::Resource { .. } => {}
+            }
+        }
+        let text = text_parts.join("\n");
 
-        Ok(text)
+        Ok((text, images))
     }
 
     /// List available tool names.
@@ -309,10 +315,7 @@ impl McpClient {
                     .write_all(b"\n")
                     .await
                     .map_err(|e| format!("write newline: {e}"))?;
-                writer
-                    .flush()
-                    .await
-                    .map_err(|e| format!("flush: {e}"))?;
+                writer.flush().await.map_err(|e| format!("flush: {e}"))?;
 
                 let mut line = String::new();
                 reader
@@ -371,14 +374,18 @@ impl McpClient {
                             line.strip_prefix("data: ")
                                 .and_then(|data| serde_json::from_str(data).ok())
                         })
-                        .ok_or_else(|| format!("Invalid response (not JSON nor SSE data): {body}"))?
+                        .ok_or_else(|| {
+                            format!("Invalid response (not JSON nor SSE data): {body}")
+                        })?
                 };
 
                 if let Some(err) = json_val.get("error") {
                     return Err(format!(
                         "MCP error {}: {}",
                         err.get("code").and_then(|c| c.as_i64()).unwrap_or(-1),
-                        err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown"),
+                        err.get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("unknown"),
                     ));
                 }
                 Ok(json_val
@@ -411,10 +418,7 @@ impl McpClient {
                     .write_all(b"\n")
                     .await
                     .map_err(|e| format!("write newline: {e}"))?;
-                writer
-                    .flush()
-                    .await
-                    .map_err(|e| format!("flush: {e}"))?;
+                writer.flush().await.map_err(|e| format!("flush: {e}"))?;
                 Ok(())
             }
             Transport::Http {

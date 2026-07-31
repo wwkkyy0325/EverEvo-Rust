@@ -20,6 +20,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use everevo_core::tool::{Tool, ToolOutput};
@@ -50,6 +51,8 @@ impl CodeSearchTool {
 
     /// Trigger background indexing without blocking.
     /// Uses smart_reindex: full rebuild if index is empty, incremental otherwise.
+    /// Marks `last_indexed` on completion so the polling check in `execute()`
+    /// can detect staleness and auto-reindex.
     pub fn start_background_index(&self) {
         let index = Arc::clone(&self.index);
         let ready = Arc::clone(&self.index_ready);
@@ -57,32 +60,95 @@ impl CodeSearchTool {
         tokio::spawn(async move {
             let db_path = root.join(".everevo").join("code_index.db");
             match CodeIndex::open(&db_path, &root).await {
-                Ok(idx) => {
+                Ok(mut idx) => {
                     tracing::info!(path = %root.display(), "Background code indexing started");
                     match idx.smart_reindex().await {
                         Ok(stats) => {
                             tracing::info!(
-                                symbols = stats.symbols, files = stats.files,
-                                elapsed_ms = stats.elapsed_ms, "Code indexing complete"
+                                symbols = stats.symbols,
+                                files = stats.files,
+                                elapsed_ms = stats.elapsed_ms,
+                                "Code indexing complete"
                             );
-                            // Prevent WAL file growth after large reindex
                             idx.wal_checkpoint().await;
                         }
                         Err(e) => tracing::warn!(error = %e, "Code indexing failed"),
                     }
+                    idx.last_indexed = Some(std::time::Instant::now());
                     *index.lock().await = Some(idx);
                 }
-                Err(e) => tracing::warn!(error = %e, "Failed to open code index for background build"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to open code index for background build")
+                }
             }
             ready.notify_waiters();
         });
+    }
+
+    /// Check whether files have changed since the last index and, if so,
+    /// run an incremental reindex. Called on every `code_search` invocation
+    /// so the index stays fresh without manual `reindex: true`.
+    async fn auto_reindex_if_stale(&self) {
+        let mut guard = self.index.lock().await;
+        if let Some(ref mut idx) = *guard {
+            // Only check once every 10 seconds to avoid thrashing.
+            if let Some(last) = idx.last_indexed {
+                if last.elapsed().as_secs() < 10 {
+                    return;
+                }
+            }
+            // Drop the guard briefly so reindex_changed can acquire the pool
+        }
+        drop(guard);
+
+        // Check for changes in a blocking task (walkdir is sync I/O)
+        let root = self.workspace_root.clone();
+        let needs_reindex = tokio::task::spawn_blocking(move || {
+            // Compare against 20 s ago as a safety margin
+            let since = SystemTime::now()
+                .checked_sub(std::time::Duration::from_secs(20))
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            crate::code_search::has_changes_since(&root, since)
+        })
+        .await
+        .unwrap_or(false);
+
+        if !needs_reindex {
+            // Update the timestamp so we don't re-check for 10 s
+            let mut guard = self.index.lock().await;
+            if let Some(ref mut idx) = *guard {
+                idx.last_indexed = Some(std::time::Instant::now());
+            }
+            return;
+        }
+
+        let mut guard = self.index.lock().await;
+        if let Some(ref mut idx) = *guard {
+            tracing::debug!("Polling detected file changes — auto reindexing");
+            match idx.reindex_changed().await {
+                Ok(stats) => {
+                    if stats.files > 0 {
+                        tracing::info!(
+                            symbols = stats.symbols,
+                            files = stats.files,
+                            "Auto-reindex: code index updated"
+                        );
+                    }
+                    idx.wal_checkpoint().await;
+                }
+                Err(e) => tracing::warn!(error = %e, "Auto-reindex failed"),
+            }
+            idx.last_indexed = Some(std::time::Instant::now());
+        }
     }
 
     /// Wait for the background index build (up to 120s).
     pub async fn ensure_index(&self) -> Result<(), String> {
         {
             let guard = self.index.lock().await;
-            if guard.is_some() { return Ok(()); }
+            if guard.is_some() {
+                return Ok(());
+            }
         }
         let timeout = std::time::Duration::from_secs(120);
         tokio::select! {
@@ -100,7 +166,11 @@ impl CodeSearchTool {
 
     /// Run ripgrep as fallback when the index is unavailable or query is too short.
     /// Returns results in the same compact format as indexed search.
-    #[allow(clippy::disallowed_methods)] // rg is read-only, same as read_file/list_dir
+    ///
+    /// Tries `rg` first, then `grep -rn` (Git Bash / MSYS2 / WSL), then PowerShell
+    /// `Select-String` on Windows. This avoids the silent-failure path where rg
+    /// doesn't exist on PATH and the tool returns nothing useful.
+    #[allow(clippy::disallowed_methods)] // rg/grep are read-only, same as read_file/list_dir
     async fn run_grep_fallback(&self, query: &str, kind: Option<&str>, limit: usize) -> String {
         let kind_pattern = kind.map(|k| match k {
             "fn" => format!("fn\\s+{query}"),
@@ -116,7 +186,9 @@ impl CodeSearchTool {
         let pattern = kind_pattern.as_deref().unwrap_or(query);
 
         let max_count = (limit * 3).min(50);
-        let result = tokio::process::Command::new("rg")
+
+        // ── Tier 1: ripgrep (fastest, best output) ──
+        let rg_result = tokio::process::Command::new("rg")
             .args(["--no-heading", "-n", "-i", pattern, "--type-add"])
             .arg("code:*.{rs,ts,tsx,js,jsx,py,go,java,kt,rb,swift,c,cpp,h,hpp}")
             .args(["-t", "code"])
@@ -125,44 +197,134 @@ impl CodeSearchTool {
             .output()
             .await;
 
-        match result {
+        match rg_result {
             Ok(output) if output.status.success() => {
-                let files: Vec<String> = String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .filter(|l| !l.is_empty())
-                    .take(max_count)
-                    .map(|s| s.to_string())
-                    .collect();
-
-                if files.is_empty() {
-                    return format!("No matches found for '{query}' with rg. Try a different keyword.");
-                }
-
-                let count = files.len();
-                let mut out = format!("{count} files matching '{query}' (rg fallback):\n");
-                for f in &files {
-                    out.push_str(&format!("- `{f}`\n"));
-                }
-                if count >= max_count {
-                    out.push_str(&format!(
-                        "\n[{count} total matches, showing top {max_count}. Refine your query for more precision.]\n"
-                    ));
-                }
-                out.push_str("\nUse `read_file` to inspect individual files.\n");
-                out
+                return format_grep_output(&output.stdout, query, max_count, "rg");
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                format!("rg search failed: {stderr}")
+                tracing::debug!(stderr = %stderr, "rg exited non-zero, trying grep fallback");
             }
-            Err(_e) => {
-                format!(
-                    "ripgrep (rg) is not available. Use the `shell` tool for ad-hoc search:\n\
-                     `grep -rn '{query}' .` or `rg '{query}'`"
-                )
+            Err(_) => {
+                tracing::debug!("rg not on PATH, trying grep fallback");
             }
         }
+
+        // ── Tier 2: grep -rn (Git Bash / MSYS2 / WSL / macOS / Linux) ──
+        let grep_result = tokio::process::Command::new("grep")
+            .args(["-rn", "-i", pattern])
+            .arg("--include=*.rs")
+            .arg("--include=*.ts")
+            .arg("--include=*.tsx")
+            .arg("--include=*.js")
+            .arg("--include=*.jsx")
+            .arg("--include=*.py")
+            .arg("--include=*.go")
+            .arg("--include=*.java")
+            .arg("--include=*.kt")
+            .arg("--include=*.c")
+            .arg("--include=*.cpp")
+            .arg("--include=*.h")
+            .arg("--include=*.hpp")
+            .args(["-l"])
+            .current_dir(&self.workspace_root)
+            .output()
+            .await;
+
+        match grep_result {
+            Ok(output) if output.status.success() => {
+                return format_grep_output(&output.stdout, query, max_count, "grep");
+            }
+            Ok(_) | Err(_) => {
+                tracing::debug!("grep not on PATH or no matches, trying PowerShell fallback");
+            }
+        }
+
+        // ── Tier 3: PowerShell Select-String (Windows built-in) ──
+        #[cfg(windows)]
+        {
+            let ps_pattern = kind_pattern.as_deref().unwrap_or(query);
+            let ps_script = format!(
+                "Get-ChildItem -Recurse -File -Include *.rs,*.ts,*.tsx,*.js,*.jsx,*.py,*.go,*.java,*.kt,*.c,*.cpp,*.h,*.hpp | \
+                 Select-String -Pattern '{ps_pattern}' -List | \
+                 ForEach-Object {{ $_.Path }}",
+            );
+            let ps_result = tokio::process::Command::new("powershell")
+                .args(["-NoProfile", "-Command", &ps_script])
+                .current_dir(&self.workspace_root)
+                .output()
+                .await;
+
+            match ps_result {
+                Ok(output) if output.status.success() => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let files: Vec<String> = stdout
+                        .lines()
+                        .filter(|l| !l.is_empty())
+                        .take(max_count)
+                        .map(|s| {
+                            // Make path relative to workspace root
+                            let p = std::path::Path::new(s.trim());
+                            p.strip_prefix(&self.workspace_root)
+                                .unwrap_or(p)
+                                .to_string_lossy()
+                                .replace('\\', "/")
+                        })
+                        .collect();
+                    if files.is_empty() {
+                        return format!("No matches found for '{query}'.");
+                    }
+                    let count = files.len();
+                    let mut out = format!("{count} files matching '{query}' (PowerShell Select-String):\n");
+                    for f in &files {
+                        out.push_str(&format!("- `{f}`\n"));
+                    }
+                    if count >= max_count {
+                        out.push_str(&format!(
+                            "\n[{count} total matches, showing top {max_count}.]\n"
+                        ));
+                    }
+                    out.push_str("\nUse `read_file` to inspect individual files.\n");
+                    return out;
+                }
+                _ => {}
+            }
+        }
+
+        format!(
+            "No search tool available. All of rg, grep, and PowerShell Select-String are unavailable.\n\
+             Use the `shell` tool for ad-hoc search:\n\
+             `grep -rn '{query}' .` or `Select-String -Path . -Pattern '{query}' -Recurse`"
+        )
     }
+}
+
+/// Format the stdout output from `rg -l` or `grep -rnl` into the standard
+/// compact result block.
+fn format_grep_output(stdout: &[u8], query: &str, max_count: usize, tool_name: &str) -> String {
+    let files: Vec<String> = String::from_utf8_lossy(stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .take(max_count)
+        .map(|s| s.to_string())
+        .collect();
+
+    if files.is_empty() {
+        return format!("No matches found for '{query}' with {tool_name}. Try a different keyword.");
+    }
+
+    let count = files.len();
+    let mut out = format!("{count} files matching '{query}' ({tool_name} fallback):\n");
+    for f in &files {
+        out.push_str(&format!("- `{f}`\n"));
+    }
+    if count >= max_count {
+        out.push_str(&format!(
+            "\n[{count} total matches, showing top {max_count}. Refine your query for more precision.]\n"
+        ));
+    }
+    out.push_str("\nUse `read_file` to inspect individual files.\n");
+    out
 }
 
 #[async_trait]
@@ -224,13 +386,21 @@ impl Tool for CodeSearchTool {
     ) -> Result<ToolOutput, EverEvoError> {
         let query = params["query"].as_str().unwrap_or("");
         if query.is_empty() {
-            return Ok(ToolOutput { content: "query is required".into(), is_error: true });
+            return Ok(ToolOutput {
+                content: "query is required".into(),
+                is_error: true,
+                ..Default::default()
+            });
         }
 
         let limit = params["limit"].as_u64().unwrap_or(10).min(12) as usize;
         let kind = params["kind"].as_str();
         let expand = params["expand"].as_bool().unwrap_or(false);
         let do_reindex = params["reindex"].as_bool().unwrap_or(false);
+
+        // ── Auto-reindex on staleness (polling, no watcher dependency) ──
+        // Runs before the search; skips if checked <10 s ago.
+        self.auto_reindex_if_stale().await;
 
         let config = SearchConfig {
             max_results: limit,
@@ -242,7 +412,11 @@ impl Tool for CodeSearchTool {
         if query.len() < config.min_query_len {
             tracing::info!(query = %query, len = query.len(), "Query too short for trigram index, using rg fallback");
             let output = self.run_grep_fallback(query, kind, limit).await;
-            return Ok(ToolOutput { content: output, is_error: false });
+            return Ok(ToolOutput {
+                content: output,
+                is_error: false,
+                ..Default::default()
+            });
         }
 
         // ── Reindex if requested ──
@@ -250,7 +424,11 @@ impl Tool for CodeSearchTool {
             let guard = self.index.lock().await;
             if let Some(ref index) = *guard {
                 if let Err(e) = index.reindex_changed().await {
-                    return Ok(ToolOutput { content: format!("Reindex failed: {e}"), is_error: true });
+                    return Ok(ToolOutput {
+                        content: format!("Reindex failed: {e}"),
+                        is_error: true,
+                        ..Default::default()
+                    });
                 }
             }
         }
@@ -259,7 +437,8 @@ impl Tool for CodeSearchTool {
         match self.ensure_index().await {
             Ok(()) => {
                 let guard = self.index.lock().await;
-                let index = guard.as_ref()
+                let index = guard
+                    .as_ref()
                     .ok_or_else(|| EverEvoError::Internal("index not initialized".into()))?;
 
                 let results = if let Some(k) = kind {
@@ -273,16 +452,28 @@ impl Tool for CodeSearchTool {
                         // Index returned 0 results — try rg as follow-up
                         tracing::info!(query = %query, "FTS5 returned 0 results, trying rg fallback");
                         let output = self.run_grep_fallback(query, kind, limit).await;
-                        Ok(ToolOutput { content: output, is_error: false })
+                        Ok(ToolOutput {
+                            content: output,
+                            is_error: false,
+                            ..Default::default()
+                        })
                     }
                     Ok(r) => {
                         let formatted = format_search_results(&r, query, &config);
-                        Ok(ToolOutput { content: formatted, is_error: false })
+                        Ok(ToolOutput {
+                            content: formatted,
+                            is_error: false,
+                            ..Default::default()
+                        })
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "FTS5 search error, trying rg fallback");
                         let output = self.run_grep_fallback(query, kind, limit).await;
-                        Ok(ToolOutput { content: output, is_error: false })
+                        Ok(ToolOutput {
+                            content: output,
+                            is_error: false,
+                            ..Default::default()
+                        })
                     }
                 }
             }
@@ -290,7 +481,11 @@ impl Tool for CodeSearchTool {
                 // Index not available — automatic rg fallback
                 tracing::info!(error = %e, "Index unavailable, using rg fallback");
                 let output = self.run_grep_fallback(query, kind, limit).await;
-                Ok(ToolOutput { content: output, is_error: false })
+                Ok(ToolOutput {
+                    content: output,
+                    is_error: false,
+                    ..Default::default()
+                })
             }
         }
     }
@@ -357,16 +552,26 @@ impl Tool for CodeMapTool {
         // Read entries, skip hidden/system dirs
         let mut entries: Vec<_> = match std::fs::read_dir(&target) {
             Ok(iter) => iter.filter_map(|e| e.ok()).collect(),
-            Err(e) => return Ok(ToolOutput {
-                content: format!("Cannot read directory: {e}"),
-                is_error: true,
-            }),
+            Err(e) => {
+                return Ok(ToolOutput {
+                    content: format!("Cannot read directory: {e}"),
+                    is_error: true,
+                    ..Default::default()
+                })
+            }
         };
-        entries.sort_by_key(|e| (e.file_type().map(|t| !t.is_dir()).unwrap_or(true), e.file_name()));
+        entries.sort_by_key(|e| {
+            (
+                e.file_type().map(|t| !t.is_dir()).unwrap_or(true),
+                e.file_name(),
+            )
+        });
 
         for entry in &entries {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') || name == "target" || name == "node_modules" { continue; }
+            if name.starts_with('.') || name == "target" || name == "node_modules" {
+                continue;
+            }
 
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
             let prefix = if is_dir { "📁" } else { "📄" };
@@ -382,7 +587,11 @@ impl Tool for CodeMapTool {
                         first_line_desc(&cargo)
                     } else {
                         let pkg = entry.path().join("package.json");
-                        if pkg.exists() { first_line_desc(&pkg) } else { String::new() }
+                        if pkg.exists() {
+                            first_line_desc(&pkg)
+                        } else {
+                            String::new()
+                        }
                     }
                 }
             } else {
@@ -401,15 +610,29 @@ impl Tool for CodeMapTool {
             map.push('\n');
         }
 
-        Ok(ToolOutput { content: map, is_error: false })
+        Ok(ToolOutput {
+            content: map,
+            is_error: false,
+            ..Default::default()
+        })
     }
 }
 
 fn first_line_desc(path: &std::path::Path) -> String {
-    std::fs::read_to_string(path).ok()
-        .and_then(|c| c.lines().next().map(|l| l.trim().trim_start_matches("# ").trim_start_matches("// ").to_string()))
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|c| {
+            c.lines().next().map(|l| {
+                l.trim()
+                    .trim_start_matches("# ")
+                    .trim_start_matches("// ")
+                    .to_string()
+            })
+        })
         .unwrap_or_default()
-        .chars().take(100).collect()
+        .chars()
+        .take(100)
+        .collect()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────

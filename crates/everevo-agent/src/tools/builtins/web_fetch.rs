@@ -81,6 +81,7 @@ impl Tool for WebFetchTool {
             return Ok(ToolOutput {
                 content: "cancelled".into(),
                 is_error: true,
+                ..Default::default()
             });
         }
 
@@ -91,26 +92,24 @@ impl Tool for WebFetchTool {
         // Only allow http/https
         if !url.starts_with("http://") && !url.starts_with("https://") {
             return Ok(ToolOutput {
-                content: format!(
-                    "Error: Only http/https URLs are supported. Got: {url}"
-                ),
+                content: format!("Error: Only http/https URLs are supported. Got: {url}"),
                 is_error: true,
+                ..Default::default()
             });
         }
 
-        let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
-            .user_agent("EverEvo/0.1 (desktop AI agent)")
-            .redirect(reqwest::redirect::Policy::limited(5))
-            .build()
-            .map_err(|e| EverEvoError::LlmProvider(e.to_string()))?;
+        // Browser-grade client shared with web_search: realistic headers +
+        // proxy awareness, so fetches aren't blocked by anti-bot filters.
+        let client = super::http_util::build_browser_client(
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS),
+        )?;
 
         let resp = client
             .get(url)
             .send()
             .await
-            .map_err(|e| EverEvoError::LlmProvider(format!("Fetch failed: {e}")))?;
+            .map_err(|e| EverEvoError::Network(format!("Fetch failed: {e}")))?;
 
         let status = resp.status();
         let content_type = resp
@@ -123,7 +122,7 @@ impl Tool for WebFetchTool {
         let body = resp
             .text()
             .await
-            .map_err(|e| EverEvoError::LlmProvider(format!("Read body: {e}")))?;
+            .map_err(|e| EverEvoError::Network(format!("Read body: {e}")))?;
 
         // Convert HTML to plain text; leave JSON/XML/text as-is
         let text = if content_type.contains("html") {
@@ -150,6 +149,7 @@ impl Tool for WebFetchTool {
         Ok(ToolOutput {
             content: truncated,
             is_error: false,
+            ..Default::default()
         })
     }
 }
@@ -167,7 +167,10 @@ mod tests {
     #[test]
     fn test_strip_html_plain_text() {
         let text = "just plain text\nno tags here";
-        assert_eq!(WebFetchTool::strip_html(text), "just plain text no tags here");
+        assert_eq!(
+            WebFetchTool::strip_html(text),
+            "just plain text no tags here"
+        );
     }
 
     #[test]

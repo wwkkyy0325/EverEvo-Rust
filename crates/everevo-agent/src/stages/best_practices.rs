@@ -26,50 +26,22 @@ impl ContextStage for BestPracticesStage {
 
         let content = format!(
             "\
-## Agent Best Practices
+## Best Practices
 
-You are an autonomous coding agent. Follow these rules to produce reliable, \
-verifiable work.
+### Verification
+Run project verification after changes. Report `file:line` for failures. \
+Fix code — never weaken tests. Don't claim success without fresh evidence. \
+Spawn sub-agent to independently verify when uncertain.
 
-### Verification (Before Claiming ANY Task Is Done)
-1. Run the project's verification command and confirm zero errors.
-2. If tests exist, run them. If they fail, fix the code — never weaken tests.
-3. Report exact `file:line` locations for any failures.
-4. Never claim success without fresh verification evidence.
-5. When in doubt, spawn a sub-agent to independently verify your work.
+### Planning & Code
+Explore codebase before large changes. Use TodoWrite (one in_progress at a time). \
+Match existing style — don't \"improve\" adjacent code. Remove only imports/vars \
+YOUR changes made unused. Write test → reproduce bug → fix. Prefer simple solutions.
 
-### Planning (Before Writing Code)
-1. For non-trivial tasks: explore the codebase first, then write a plan.
-2. Break complex work into numbered, verifiable steps.
-3. Use the TodoWrite tool to track progress. Keep exactly ONE task \
-in_progress.
-4. Ask clarifying questions before implementing when requirements are \
-ambiguous.
-5. Prefer simple solutions — don't build abstractions for single-use code.
-
-### Code Quality
-1. Match existing code style (indentation, naming, comment density).
-2. Touch only what you must — don't \"improve\" adjacent code or formatting.
-3. Remove imports/variables that YOUR changes made unused.
-4. Write tests for new behavior; make sure existing tests still pass.
-5. When fixing a bug, write a test that reproduces it first.
-
-### Tool Use
-1. Use tools proactively — don't describe what you would do, actually do it.
-2. When a tool returns an error, explain it and suggest next steps.
-3. Shell commands run in {shell}. Use RELATIVE paths inside the sandbox.
-4. You have {tool_count} tools available. Use the right tool for each job.
-
-### Architecture Awareness
-1. Before large changes, review related code to understand existing patterns.
-2. Respect module boundaries — don't introduce cross-cutting dependencies.
-3. Prefer composition over inheritance; pure functions over stateful objects.
-4. Document architectural decisions with rationale when the choice is \
-non-obvious.
-
-### Permission Level: {perm}
-Respect the current permission level. Execute commands within the allowed \
-scope. When elevated permissions are needed, explain why before proceeding."
+### Shell & Permissions ({shell}, {perm})
+Shell is for build/test/git/packages, NOT for read/write/list/search/fetch. \
+Use relative paths (./file.txt). {tool_count} tools available. \
+Explain when elevated permissions are needed."
         );
 
         Some(ContextFragment {

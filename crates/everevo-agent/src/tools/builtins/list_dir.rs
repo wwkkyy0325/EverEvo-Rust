@@ -4,14 +4,50 @@
 //! but EverEvo runs on Windows where `ls`/`dir`/`Get-ChildItem` syntax varies.
 //! A dedicated tool gives the LLM consistent structured output regardless of shell.
 
-use std::path::PathBuf;
-use std::time::UNIX_EPOCH;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use everevo_core::tool::{Tool, ToolOutput};
 use everevo_core::types::RiskLevel;
 use everevo_core::EverEvoError;
 use tokio_util::sync::CancellationToken;
+
+/// Resolve a user-supplied relative path against the workspace root and verify
+/// it stays within bounds (no `../` escape). Returns the resolved path or an
+/// error describing the escape attempt.
+fn resolve_workspace_path(workspace_root: &Path, rel_path: &str) -> Result<PathBuf, String> {
+    let joined = workspace_root.join(rel_path.trim_start_matches('/').trim_start_matches('\\'));
+
+    let normalized = normalize_path(&joined);
+    let normalized_root = normalize_path(workspace_root);
+
+    if !normalized.starts_with(&normalized_root) {
+        return Err(format!(
+            "Path traversal blocked: '{}' is outside the workspace",
+            rel_path
+        ));
+    }
+    Ok(joined)
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut components: Vec<std::path::Component<'_>> = Vec::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                if matches!(components.last(), Some(std::path::Component::Normal(_))) {
+                    components.pop();
+                } else {
+                    components.push(c);
+                }
+            }
+            std::path::Component::CurDir => {}
+            other => components.push(other),
+        }
+    }
+    components.iter().collect()
+}
 
 /// Maximum entries returned — prevents context blowout from large directories.
 const MAX_LIMIT: usize = 200;
@@ -84,28 +120,44 @@ impl Tool for ListDirTool {
         let subpath = params["path"].as_str().unwrap_or("");
         let target = if subpath.is_empty() || subpath == "." {
             self.workspace_root.clone()
+        } else if std::path::Path::new(subpath).is_absolute() {
+            return Ok(ToolOutput {
+                content: format!(
+                    "Absolute paths are not allowed. Use a path relative to workspace: {}",
+                    self.workspace_root.display()
+                ),
+                is_error: true,
+                ..Default::default()
+            });
         } else {
-            self.workspace_root
-                .join(subpath.trim_start_matches('/').trim_start_matches('\\'))
+            match resolve_workspace_path(&self.workspace_root, subpath) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Ok(ToolOutput {
+                        content: e,
+                        is_error: true,
+                        ..Default::default()
+                    });
+                }
+            }
         };
 
         if !target.exists() {
             return Ok(ToolOutput {
                 content: format!("Path not found: {}", target.display()),
                 is_error: true,
+                ..Default::default()
             });
         }
         if !target.is_dir() {
             return Ok(ToolOutput {
                 content: format!("Not a directory: {}", target.display()),
                 is_error: true,
+                ..Default::default()
             });
         }
 
-        let depth = params["depth"]
-            .as_u64()
-            .unwrap_or(1)
-            .min(MAX_DEPTH as u64) as usize;
+        let depth = params["depth"].as_u64().unwrap_or(1).min(MAX_DEPTH as u64) as usize;
         let limit = params["limit"]
             .as_u64()
             .unwrap_or(DEFAULT_LIMIT as u64)
@@ -116,6 +168,7 @@ impl Tool for ListDirTool {
             return Ok(ToolOutput {
                 content: format!("(empty directory)\n{}", target.display()),
                 is_error: false,
+                ..Default::default()
             });
         }
 
@@ -136,6 +189,7 @@ impl Tool for ListDirTool {
         Ok(ToolOutput {
             content: header + &lines.join("\n"),
             is_error: false,
+            ..Default::default()
         })
     }
 }
@@ -176,11 +230,16 @@ fn collect_entries(root: &std::path::Path, max_depth: usize, limit: usize) -> Ve
             let modified = metadata
                 .modified()
                 .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| {
-                    let secs = d.as_secs();
-                    // Simple relative time
-                    if secs < 3600 {
+                .and_then(|t| {
+                    SystemTime::now()
+                        .duration_since(t)
+                        .ok()
+                })
+                .map(|age| {
+                    let secs = age.as_secs();
+                    if secs < 60 {
+                        format!("{}s ago", secs)
+                    } else if secs < 3600 {
                         format!("{}m ago", secs / 60)
                     } else if secs < 86400 {
                         format!("{}h ago", secs / 3600)
@@ -224,11 +283,7 @@ fn collect_entries(root: &std::path::Path, max_depth: usize, limit: usize) -> Ve
                             || name == ".github"
                             || name == ".everevo"
                     })
-                    .filter_map(|e| {
-                        e.metadata()
-                            .ok()
-                            .and_then(|m| m.is_dir().then(|| e.path()))
-                    })
+                    .filter_map(|e| e.metadata().ok().and_then(|m| m.is_dir().then(|| e.path())))
                     .collect();
                 // Reverse to maintain original order after stack pop
                 subdirs.reverse();

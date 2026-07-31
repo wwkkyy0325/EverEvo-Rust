@@ -3,7 +3,7 @@
 //! Claude Code equivalent: `Write` tool. Creates parent directories automatically.
 //! Scoped to workspace — refuses absolute paths outside workspace.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use everevo_core::tool::{Tool, ToolOutput};
@@ -14,6 +14,42 @@ use tokio_util::sync::CancellationToken;
 /// Creates or overwrites a file in the workspace.
 pub struct WriteFileTool {
     workspace_root: PathBuf,
+}
+
+/// Resolve a user-supplied relative path against the workspace root and verify
+/// it stays within bounds (no `../` escape). Returns the resolved path or an
+/// error describing the escape attempt.
+fn resolve_workspace_path(workspace_root: &Path, rel_path: &str) -> Result<PathBuf, String> {
+    let joined = workspace_root.join(rel_path.trim_start_matches('/').trim_start_matches('\\'));
+
+    let normalized = normalize_path(&joined);
+    let normalized_root = normalize_path(workspace_root);
+
+    if !normalized.starts_with(&normalized_root) {
+        return Err(format!(
+            "Path traversal blocked: '{}' is outside the workspace",
+            rel_path
+        ));
+    }
+    Ok(joined)
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut components: Vec<std::path::Component<'_>> = Vec::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                if matches!(components.last(), Some(std::path::Component::Normal(_))) {
+                    components.pop();
+                } else {
+                    components.push(c);
+                }
+            }
+            std::path::Component::CurDir => {}
+            other => components.push(other),
+        }
+    }
+    components.iter().collect()
 }
 
 impl WriteFileTool {
@@ -63,24 +99,41 @@ impl Tool for WriteFileTool {
     ) -> Result<ToolOutput, EverEvoError> {
         let rel_path = params["path"].as_str().unwrap_or("");
         if rel_path.is_empty() {
-            return Ok(ToolOutput { content: "path is required".into(), is_error: true });
+            return Ok(ToolOutput {
+                content: "path is required".into(),
+                is_error: true,
+                ..Default::default()
+            });
         }
         let content = params["content"].as_str().unwrap_or("");
         if content.is_empty() && !params["content"].is_string() {
-            return Ok(ToolOutput { content: "content is required".into(), is_error: true });
+            return Ok(ToolOutput {
+                content: "content is required".into(),
+                is_error: true,
+                ..Default::default()
+            });
         }
 
-        // Resolve path relative to workspace; reject absolute paths
-        let target = if std::path::Path::new(rel_path).is_absolute() {
+        // Resolve path relative to workspace; reject absolute paths and traversal
+        if std::path::Path::new(rel_path).is_absolute() {
             return Ok(ToolOutput {
                 content: format!(
                     "Absolute paths are not allowed. Use a path relative to workspace: {}",
                     self.workspace_root.display()
                 ),
                 is_error: true,
+                ..Default::default()
             });
-        } else {
-            self.workspace_root.join(rel_path.trim_start_matches('/').trim_start_matches('\\'))
+        }
+        let target = match resolve_workspace_path(&self.workspace_root, rel_path) {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(ToolOutput {
+                    content: e,
+                    is_error: true,
+                    ..Default::default()
+                });
+            }
         };
 
         // Create parent directories
@@ -105,6 +158,7 @@ impl Tool for WriteFileTool {
                 size,
             ),
             is_error: false,
+            ..Default::default()
         })
     }
 }

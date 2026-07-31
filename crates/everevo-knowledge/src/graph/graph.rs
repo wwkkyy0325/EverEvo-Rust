@@ -172,6 +172,98 @@ impl KnowledgeGraph {
             .count()
     }
 
+    /// Seed the knowledge graph with project structure entities so
+    /// `memory kg_search` returns useful results immediately — no empty
+    /// "no entities" response on first use.
+    ///
+    /// Only seeds if the graph is empty (idempotent). Call after `open()`.
+    pub fn seed_project_structure(&mut self, crate_names: &[&str]) {
+        if self.entity_count() > 0 {
+            return; // already seeded
+        }
+        let now = chrono::Utc::now();
+        let empty_props = std::collections::HashMap::new();
+        let empty_sources = Vec::new();
+
+        // Root project entity
+        self.upsert_entity(Entity {
+            id: "everevo".into(),
+            label: "EverEvo".into(),
+            entity_type: EntityType::Project,
+            properties: empty_props.clone(),
+            sources: empty_sources.clone(),
+            created_at: now,
+            updated_at: now,
+            merged_into: None,
+        });
+
+        // Crate entities with relations
+        for &name in crate_names {
+            let id = format!("crate-{name}");
+            self.upsert_entity(Entity {
+                id: id.clone(),
+                label: format!("Crate: {name}"),
+                entity_type: EntityType::Other("Crate".into()),
+                properties: empty_props.clone(),
+                sources: empty_sources.clone(),
+                created_at: now,
+                updated_at: now,
+                merged_into: None,
+            });
+            self.add_relation(Relation {
+                from: "everevo".into(),
+                predicate: "contains".into(),
+                to: id,
+                status: RelationStatus::Active,
+                valid_from: now,
+                valid_until: None,
+                sources: empty_sources.clone(),
+            });
+        }
+
+        // Tech stack entities
+        let techs = [
+            ("rust", "Rust", "Language"),
+            ("typescript", "TypeScript", "Language"),
+            ("react", "React", "Framework"),
+            ("axum", "Axum", "Framework"),
+            ("sqlite", "SQLite", "Database"),
+            ("oxigraph", "Oxigraph", "GraphDB"),
+            ("onnx", "ONNX", "Runtime"),
+            ("tauri", "Tauri", "Framework"),
+            ("tokio", "Tokio", "Runtime"),
+            ("reqwest", "reqwest", "Library"),
+            ("sqlx", "SQLx", "Library"),
+        ];
+        for (id, label, kind) in &techs {
+            self.upsert_entity(Entity {
+                id: id.to_string(),
+                label: label.to_string(),
+                entity_type: EntityType::Other(kind.to_string()),
+                properties: empty_props.clone(),
+                sources: empty_sources.clone(),
+                created_at: now,
+                updated_at: now,
+                merged_into: None,
+            });
+            self.add_relation(Relation {
+                from: "everevo".into(),
+                predicate: "uses".into(),
+                to: id.to_string(),
+                status: RelationStatus::Active,
+                valid_from: now,
+                valid_until: None,
+                sources: empty_sources.clone(),
+            });
+        }
+
+        tracing::info!(
+            entities = self.entity_count(),
+            relations = self.relation_count(),
+            "Knowledge graph seeded with project structure"
+        );
+    }
+
     // ── Graph Operations ──────────────────────────────────────────────
     pub fn expand(&self, start_id: &str, depth: usize) -> Vec<Entity> {
         let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();

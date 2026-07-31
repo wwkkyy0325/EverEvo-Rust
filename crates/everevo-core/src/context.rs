@@ -175,6 +175,18 @@ pub struct ContextBuildContext {
     /// Detail about the fixation pattern (tool name + error summary),
     /// for targeted nudges. Only set when escalation_level >= 2.
     pub fixation_detail: Option<String>,
+    /// Credential config removed — sandbox now inherits host git config directly.
+    /// Global ~/.gitconfig and ~/.ssh are used as-is.
+    /// Summary of available portable runtimes (Python, Node, Git, ONNX).
+    /// e.g. "Python 3.12.8, Node v22.12.0, Git 2.47.1, ONNX Runtime ✅"
+    /// Built from startup_check results; displayed in SessionMetadataStage.
+    pub runtime_summary: Option<String>,
+    /// The sandbox root directory path. Helps the LLM understand what's
+    /// inside vs outside the isolation boundary.
+    pub sandbox_root: Option<String>,
+    /// Whether the startup self-check passed all critical tests.
+    /// When true, the LLM should trust that ONNX, SQLite, and runtimes work.
+    pub startup_verified: bool,
 }
 
 // ── Context Stage Trait ─────────────────────────────────────────────────
@@ -465,21 +477,12 @@ impl ContextStage for SessionMetadataStage {
         // Shell-specific command syntax guidance
         let shell_guide = shell_specific_guide(shell);
 
-        // Build workspace line — show actual path when set (Claude Code alignment)
+        // Build workspace line
         let workspace_line = if let Some(ref wp) = ctx.workspace_path {
-            format!("Primary working directory: {wp}\n")
+            format!("Working directory: {wp}\n")
         } else {
-            "Working directory: sandbox work dir\n".to_string()
+            String::new()
         };
-        let work_area = if ctx.workspace_path.is_some() {
-            "workspace"
-        } else {
-            "sandbox"
-        };
-
-        // Platform line (Claude Code alignment)
-        let platform = ctx.platform.as_deref().unwrap_or(std::env::consts::OS);
-        let platform_line = format!("Platform: {platform}\n");
 
         // Current date (Claude Code alignment)
         let today = ctx
@@ -506,7 +509,11 @@ impl ContextStage for SessionMetadataStage {
             for (path, content) in &ctx.workspace_context_files {
                 // Truncate very long context files to avoid blowing context budget
                 let truncated = if content.len() > 4000 {
-                    format!("{}...\n[truncated — full file at {}]", &content[..4000], path)
+                    format!(
+                        "{}...\n[truncated — full file at {}]",
+                        &content[..4000],
+                        path
+                    )
                 } else {
                     content.clone()
                 };
@@ -520,34 +527,44 @@ impl ContextStage for SessionMetadataStage {
             String::new()
         };
 
+        // ── Environment (single reality — no host/sandbox distinction) ──
+        let runtime_info = ctx.runtime_summary.as_deref().unwrap_or("available");
+        let startup_note = if ctx.startup_verified {
+            "✅ system startup checks passed"
+        } else {
+            "⚠️ some startup checks had warnings (non-critical)"
+        };
+
         let mut info = format!(
             "{context_files_block}\
-             ## Runtime Environment\n\
+             ## Environment\n\n\
              {date_line}\
+             OS: {os}\n\
              Shell: {shell}\n\
-             {platform_line}\
              {workspace_line}\
              {git_lines}\
-             Permission: {perm} (semi_auto = dangerous commands require your confirmation)\n\
-             {tools} tools registered\n\n\
+             **Runtimes**: {runtime_info}\n\
+             **Status**: {startup_note}\n\
+             {tools} tools, permission level: {perm}\n\n\
              {shell_guide}\n\
-             ## Permission Rules\n\
-             - Use RELATIVE paths (./file.txt) for files inside the {work_area}\n\
-             - External paths (outside {work_area}) trigger a user confirmation dialog\n\
-             - Dangerous commands (rm -rf, curl|bash, chmod +s, nmap, etc.) trigger confirmation\n\
-             - Admin commands (sudo, runas) ALWAYS require user approval\n\
-             - The user will see a popup — explain what you're doing and they'll approve\n\
-             - If a command is denied: explain why and suggest an alternative",
+             ## Permissions\n\n\
+             - Working directory and its children: free access.\n\
+             - Other paths: require user approval (a confirmation dialog).\n\
+             - Dangerous operations require confirmation regardless of path.\n\
+             - If something is denied: explain why and suggest an alternative.\n\
+             - If a tool or runtime is missing: use `which <name>` to check, \
+             then tell the user what's needed.\n",
             shell = shell,
             perm = perm,
             tools = ctx.tool_count,
             date_line = date_line,
             workspace_line = workspace_line,
-            platform_line = platform_line,
+            os = ctx.platform.as_deref().unwrap_or(std::env::consts::OS),
             git_lines = git_lines,
-            work_area = work_area,
             shell_guide = shell_guide,
             context_files_block = context_files_block,
+            runtime_info = runtime_info,
+            startup_note = startup_note,
         );
         if !ctx.trusted_paths.is_empty() {
             info.push_str(&format!(
@@ -685,122 +702,70 @@ pub fn default_pipeline() -> ContextPipeline {
 /// Default system prompt — shell-specific instructions are injected
 /// dynamically by SessionMetadataStage, so this stays shell-agnostic.
 pub const SYSTEM_PROMPT: &str = "\
-You are EverEvo, a powerful desktop AI agent running locally on the user's machine. \
-You have access to tools for shell execution, file downloads, environment checks, \
-and long-term memory. Use tools whenever the user asks you to DO something — \
-never just describe what you would do.\n\
+You are EverEvo, a desktop AI agent. Use tools to DO things — never just describe.\n\
 \n\
-## Available Tools\n\
+## Tool Rules (MUST FOLLOW)\n\
 \n\
-- `shell` — Execute a shell command in a sandboxed environment (timeout 30s, max 300s). \
-  Use for: running code, checking files, installing packages, system operations.\n\
-- `download` — Download files from URLs with multi-mirror failover and resume support. \
-  Parameters: url, dest_path, region (domestic/international/auto).\n\
-- `bootstrap_check` — Check status of portable runtimes (Python, Node.js, Git, ONNX) \
-  and local embedding models. Returns which assets are ready, missing, or corrupt.\n\
-- `memory` — Search and manage persistent long-term memory. Use to recall facts, \
-  preferences, and past decisions across sessions. Parameters: action (search/save/delete), \
-  query, content.\n\
-- `TodoWrite` — Create and manage a structured task list for the current session. \
-  Use proactively for multi-step tasks. Each task needs content, status \
-  (pending/in_progress/completed), and activeForm. Exactly ONE task in_progress \
-  at a time. Mark complete immediately after finishing.\n\
-- `Workflow` — Execute multiple tasks in parallel using sub-agents. Use for complex \
-  multi-step work where tasks are independent. Provide a list of tasks each with \
-  description and prompt. Supports parallel and sequential modes.\n\
-- `EnterPlanMode` / `ExitPlanMode` — Use before non-trivial implementation tasks. \
-  EnterPlanMode signals you want to plan first; ExitPlanMode submits the plan \
-  for user approval before implementation.\n\
-- `Skill` — Invoke specialized skills by name. Use action='list' to discover \
-  available skills, or provide a skill name to load its instructions. Skills \
-  extend capabilities for specific domains (e.g., frontend-design, testing).\n\
-- `Verify` — Verify the output of a previous task. Checks for correctness, \
-  completeness, and edge cases. Use after sub-agent tasks complete to ensure \
-  quality.\n\
-- `Task` — Spawn a sub-agent to execute a task independently. Use for complex \
-  work that benefits from isolated execution. Sub-agents run with their own \
-  tool access and context.\n\
-- `web_fetch` — Fetch content from a URL. Strips HTML tags and returns plain text. \
-  Use for reading documentation, API docs, or any public webpage. For authenticated \
-  URLs, use `shell` with curl instead. Parameters: url.\n\
-- `web_search` — Search the web and return result blocks with titles and URLs. \
-  Use for finding documentation, error solutions, library docs, or any information \
-  that requires up-to-date web knowledge. Prefer this over guessing. \
-  Parameters: query (required), limit (default 8, max 20), \
-  allowed_domains (optional string array), blocked_domains (optional string array).\n\
-- `compact` — Manually trigger context compaction to free up space. \
-  Use when the conversation is getting long, you notice context quality degrading, \
-  or after a context overflow error. Parameters: focus (optional priority topic).\n\
-- `team` — Dispatch a team of role-specialized sub-agents to work in parallel. \
-  Roles: reviewer (code review), researcher (investigation), coder (implementation), \
-  tester (testing). Each member gets a role-specific system prompt. \
-  Parameters: task, members[{role, focus}].\n\
-- `code_search` — Search the codebase for symbols (functions, structs, impls, etc.) \
-  using a pre-built FTS5 code index. Returns file:line locations with signatures. \
-  Parameters: query, kind (optional: fn/struct/impl/trait/enum/mod/type/const), limit. \
-  For full-text grep, use the `shell` tool with `rg` or `grep` instead.\n\
-- `code_map` — Return a lightweight Markdown directory overview of the codebase. \
-  Shows folder structure with one-line descriptions from README/Cargo.toml. \
-  Use to understand project layout before diving into specific directories.\n\
-- `list_dir` — List files and directories in the workspace. Returns structured \
-  output with names, 📁/📄 icons, sizes, and modification times. Use to explore \
-  the project structure before reading or editing files. \
-  Parameters: path (default: '.'), depth (1-3), limit (default: 50, max: 200).\n\
-- `read_file` — Read a file from the workspace. Returns content with line numbers. \
-  Use for inspecting source code, config files, or any text file. \
-  Parameters: path (required, relative to workspace), offset (1-based line), \
-  limit (max lines, default: 2000).\n\
-- `write_file` — Create or overwrite a file in the workspace. Creates parent \
-  directories automatically. Use for writing code, config, or any text content. \
-  Parameters: path (required, relative to workspace), content (required).\n\
-- `cluster` — Orchestrate parallel sub-agents using cluster patterns:\n\
-  fan_out (N workers on same task), map_reduce (N workers → synthesize), \
-  verify (adversarial verification with majority vote). \
-  Use for complex tasks that benefit from parallel analysis, diverse perspectives, \
-  or quality verification. \
-  Parameters: action (fan_out/map_reduce/verify), prompt, \
-  workers (default 3, max 10), items/perspectives/claims (action-specific).\n\
-- `workflow_run` — Execute a multi-step automation workflow. Define steps as JSON: \
-  shell commands, URL fetches, memory operations, sub-agents, delays, conditions, \
-  and variable passing between steps. Parameters: workflow (JSON definition).\n\
-- MCP tools — Additional tools from connected MCP servers (e.g., web search, \
-  file system access). Available when configured in data/config.toml.\n\
+Shell is LAST RESORT. Use specialized tools first:\n\
 \n\
-## Docker Safety\n\
+| Operation | ✅ | ❌ |\n\
+|-----------|---|---|\n\
+| Read file | `read_file` | `shell cat` |\n\
+| Write file | `write_file` | `shell echo` |\n\
+| List dir | `list_dir` | `shell ls` |\n\
+| Search code | `code_search` | `shell grep` |\n\
+| Search web | `web_search` | `shell curl` |\n\
+| Fetch URL | `web_fetch` | `shell curl` |\n\
+| Download | `download` | `shell wget` |\n\
+| Build/test/run | `shell` | — (OK) |\n\
+| Git/packages | `shell` | — (OK) |\n\
 \n\
-Docker commands run through the `shell` tool. Dangerous operations trigger \
-user confirmation before execution:\n\
-- **Privileged containers**: --privileged, --pid=host, --network=host, SYS_ADMIN cap\n\
-- **Security bypass**: --security-opt label=disable, apparmor=unconfined, seccomp=unconfined\n\
-- **Host mounts**: -v /:/host, --device=/dev/*\n\
-- **Destructive**: docker rm -f, system prune, volume prune, compose down -v\n\
+Other tools: `TodoWrite` (tasks, scope=session/global), `Task` (sub-agents) + \
+`cancel_task` (stop one by id), `team`/`cluster`/`parallel_agents` (multi-agent), \
+`memory`, `list_workflows` + `workflow_run` (reusable automations, run by name), \
+`EnterPlanMode`/`ExitPlanMode`, `Verify`, `Skill`, `code_map`, `compact`, \
+`bootstrap_check`, MCP tools.\n\
 \n\
-## Conversation Continuity\n\
+## When to Delegate / Collaborate\n\
 \n\
-These rules are CRITICAL for correct behavior across turns:\n\
+| Situation | Use |\n\
+|-----------|-----|\n\
+| 2+ independent sub-tasks | `Task` with `subtasks` (parallel) |\n\
+| Focused reasoning in isolation | `Task` (single sub-agent) |\n\
+| Role-based review/research/coding | `team` |\n\
+| Adversarial verify (majority vote) | `cluster` (verify) |\n\
+| Map->reduce over many items | `cluster` (map_reduce) |\n\
+| Repeatable multi-step procedure | `list_workflows` -> `workflow_run name=` |\n\
+| Sub-agent gone wrong / too slow | `cancel_task <task_id>` |\n\
 \n\
-- If the user says they've already done something (\"I fixed X\", \"做好了Y\"), \
-  they are REPORTING completion. VERIFY — do NOT redo it.\n\
-- \"继续\" (continue) means: resume the oldest PENDING task from the TodoWrite list. \
-  It does NOT mean redo the most recently discussed topic.\n\
-- If no TodoWrite list exists, scan the conversation history to find what was \
-  in progress BEFORE the most recent user message.\n\
-- Always distinguish: \"I did X\" (verify) vs \"Do X\" (execute) vs \"继续\" (resume pending).\n\
-- Never repeat work the user explicitly states they completed.\n\
+Don't delegate trivial single-step lookups - just call the tool. The `task` tool \
+returns a task_id; use `cancel_task` to stop it. Prefer a saved workflow (by name) \
+over hand-writing steps. Use `TodoWrite` with scope=global for project work that \
+spans conversations.\n\
 \n\
-## Guidelines\n\
+## Self-Evolution (learn from every task)\n\
 \n\
-- Use tools proactively — don't describe what you would do, actually do it.\n\
-- When a tool returns an error, explain it and suggest next steps.\n\
-- Shell commands run in an isolated sandbox; use RELATIVE paths (e.g., `./output.txt`).\n\
-- Be thorough: if a task requires multiple tools, call them in sequence.\n\
-- You may use `memory` to store important facts the user might need later.\n\
-- When generating plans or multi-step work, break it into clear, numbered steps.\n\
-- For web searches (finding information), use `web_search` — it returns result blocks.\n\
-- For reading a specific URL, use `web_fetch`; for auth-required URLs, use `shell` + curl.\n\
-- Search before fetching — don't guess URLs when `web_search` can find them.\n\
-- Use `list_dir` to explore the workspace before reading or creating files.\n\
-- Use RELATIVE paths (./file.txt) for files inside the workspace.";
+- After each task, lessons + repeatable procedures are auto-saved (memory + workflows).\n\
+- BEFORE a non-trivial task: run `list_workflows` and check memory — REUSE before re-inventing.\n\
+- Found a matching workflow? `workflow_run name=` instead of hand-rolling steps.\n\
+- Solved a repeatable multi-step problem? `save_workflow` it for next time.\n\
+- Sedimented lessons auto-surface in future turns — trust and build on them.\n\
+\n\
+## Critical Rules\n\
+\n\
+- **2-failure limit**: If a command fails twice, STOP. Diagnose root cause \
+(`which`, `echo $VAR`, read error), web_search the error, switch approach \
+(SSH→HTTPS, different library). Never retry with minor tweaks.\n\
+- **\"我做了X\" = report, not request**: User stating completion → VERIFY, don't redo.\n\
+- **\"继续\" = resume oldest PENDING TodoWrite task**, not most recent topic.\n\
+- **SSH→HTTPS**: Use `git clone https://...` and `gh` CLI. Never `git@github.com:`.\n\
+- **Git auth**: Uses your global git config and SSH/HTTPS settings. \
+  `gh` CLI uses stored OAuth. No extra credential setup needed.\n\
+- **[SYSTEM NOTE] / [REQUIRED] messages**: Follow them — they're not suggestions.\n\
+- **Type `/help`** to see slash commands. `/clear` resets context. `/compact` saves space.\n\
+- **Admit when stuck**: \"I tried X, Y, Z. Here's what failed and what I need.\" \
+Better than looping.\n\
+- Verify before claiming done. Fix code, never weaken tests. Match existing style.";
 
 // ── Tests ─────────────────────────────────────────────────────────────────
 
@@ -878,8 +843,7 @@ mod tests {
     fn test_pipeline_new_is_empty() {
         let pipeline = ContextPipeline::new();
         let ctx = ContextBuildContext::default();
-        let (messages, snapshot) =
-            pipeline.assemble_with_snapshot(&ctx, uuid::Uuid::new_v4(), 1);
+        let (messages, snapshot) = pipeline.assemble_with_snapshot(&ctx, uuid::Uuid::new_v4(), 1);
         assert!(messages.is_empty());
         assert_eq!(snapshot.total_estimated_tokens, 0);
     }
@@ -895,8 +859,7 @@ mod tests {
         ctx.user_message = "hello".into();
         ctx.history = vec![LlmMessage::user("old")];
 
-        let (_messages, snapshot) =
-            pipeline.assemble_with_snapshot(&ctx, uuid::Uuid::new_v4(), 1);
+        let (_messages, snapshot) = pipeline.assemble_with_snapshot(&ctx, uuid::Uuid::new_v4(), 1);
 
         assert_eq!(snapshot.stages.len(), 3);
         assert_eq!(snapshot.stages[0].stage_name, "system_prompt");
@@ -980,7 +943,8 @@ mod tests {
         let stage = SessionMetadataStage;
         let ctx = ContextBuildContext::default();
         let fragment = stage.build(&ctx).unwrap();
-        assert!(fragment.messages[0].content.contains("Runtime Environment"));
+        assert!(fragment.messages[0].content.contains("Environment"));
+        assert!(fragment.messages[0].content.contains("Permissions"));
     }
 
     #[test]
@@ -1071,8 +1035,7 @@ mod tests {
         let pipeline = default_pipeline();
         let mut ctx = ContextBuildContext::default();
         ctx.user_message = "hello".into();
-        let (messages, snapshot) =
-            pipeline.assemble_with_snapshot(&ctx, uuid::Uuid::new_v4(), 1);
+        let (messages, snapshot) = pipeline.assemble_with_snapshot(&ctx, uuid::Uuid::new_v4(), 1);
         assert!(!snapshot.stages.is_empty());
         assert!(!messages.is_empty());
     }
@@ -1087,8 +1050,7 @@ mod tests {
 
         let mut ctx = ContextBuildContext::default();
         ctx.user_message = "hi".into();
-        let (_messages, snapshot) =
-            pipeline.assemble_with_snapshot(&ctx, uuid::Uuid::new_v4(), 1);
+        let (_messages, snapshot) = pipeline.assemble_with_snapshot(&ctx, uuid::Uuid::new_v4(), 1);
 
         assert!(snapshot
             .flags
@@ -1127,8 +1089,7 @@ mod tests {
         let mut ctx = ContextBuildContext::default();
         ctx.max_context_tokens = 1000;
 
-        let (_messages, snapshot) =
-            pipeline.assemble_with_snapshot(&ctx, uuid::Uuid::new_v4(), 1);
+        let (_messages, snapshot) = pipeline.assemble_with_snapshot(&ctx, uuid::Uuid::new_v4(), 1);
 
         let huge = snapshot
             .stages
@@ -1161,8 +1122,7 @@ mod tests {
         let mut ctx = ContextBuildContext::default();
         ctx.max_context_tokens = 500;
 
-        let (_messages, snapshot) =
-            pipeline.assemble_with_snapshot(&ctx, uuid::Uuid::new_v4(), 1);
+        let (_messages, snapshot) = pipeline.assemble_with_snapshot(&ctx, uuid::Uuid::new_v4(), 1);
 
         assert!(snapshot
             .flags

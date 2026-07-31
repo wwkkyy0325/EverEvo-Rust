@@ -17,8 +17,7 @@ fn workspace_config_path(state: &AppState) -> PathBuf {
 }
 
 pub fn router() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/api/workspace", get(get_workspace).put(set_workspace))
+    Router::new().route("/api/workspace", get(get_workspace).put(set_workspace))
 }
 
 async fn get_workspace(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -64,7 +63,10 @@ async fn set_workspace(
     let saved = serde_json::json!({
         "workspace_dir": path.display().to_string(),
     });
-    let _ = std::fs::write(&config_path, serde_json::to_string_pretty(&saved).unwrap_or_default());
+    let _ = std::fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&saved).unwrap_or_default(),
+    );
 
     Json(serde_json::json!({
         "ok": true,

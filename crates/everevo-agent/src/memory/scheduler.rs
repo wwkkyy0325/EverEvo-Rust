@@ -224,6 +224,7 @@ impl DreamingScheduler {
         engine: Arc<DreamingEngine>,
         fact_manager: Arc<FactManager>,
         wiki_generator: Arc<WikiGenerator>,
+        persona_profile: Option<std::path::PathBuf>,
     ) -> tokio::task::JoinHandle<()> {
         self.running.store(1, Ordering::Relaxed);
         let this = Arc::clone(self);
@@ -257,12 +258,20 @@ impl DreamingScheduler {
                                 this.release_light();
                             }
                             this.mark_completed(phase);
-                            // After DEEP: generate wiki pages from promoted facts
+                            // After DEEP: generate wiki + update persona
                             if matches!(phase, ScheduledPhase::Deep | ScheduledPhase::RemAndDeep) {
+                                // Wiki generation
                                 if let Err(e) =
                                     wiki_generator.generate_from_facts(&fact_manager).await
                                 {
                                     tracing::warn!(error = %e, "Wiki generation failed");
+                                }
+                                // Persona auto-update from accumulated facts
+                                if let Some(ref path) = persona_profile {
+                                    let facts = fact_manager.load_all().unwrap_or_default();
+                                    crate::stages::persona::update_persona_from_facts(
+                                        path, &facts,
+                                    );
                                 }
                             }
                             tracing::info!(?phase, "Dreaming phase completed");

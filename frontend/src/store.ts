@@ -26,6 +26,8 @@ export interface SessionItem {
   mode?: string;
   /** Session state: "idle" | "running" | "completed" | "failed". */
   state?: string;
+  /** Per-session workspace directory (null = sandbox default). */
+  workspace_dir?: string | null;
 }
 
 export interface ToolInfo {
@@ -151,6 +153,7 @@ interface ChatState {
   workspacePath: string | null;
   /** Set the workspace directory. */
   setWorkspace: (path: string) => Promise<void>;
+  bindSessionWorkspace: (sessionId: string, path: string | null) => Promise<void>;
   /** Whether the current session is in plan mode (read-only exploration). */
   planMode: boolean;
   /** The task being planned in plan mode. */
@@ -499,6 +502,12 @@ export const useStore = create<ChatState>((set, get) => ({
             return;
           }
 
+          // ── workspace_changed → refresh session workspace info ──
+          if (currentEvent === 'workspace_changed') {
+            get().loadSessions();
+            // Don't return — let the LLM response follow
+          }
+
           // ── Legacy thinking / token events ─────────────────────────
           if (currentEvent === 'thinking') {
             const last = lastBlock();
@@ -599,6 +608,7 @@ export const useStore = create<ChatState>((set, get) => ({
   },
 
   // ── Workspace management ───────────────────────────────────────────
+  /** Set the GLOBAL default workspace (applies to new sessions without override). */
   setWorkspace: async (path: string) => {
     try {
       await fetch('/api/workspace', {
@@ -607,6 +617,18 @@ export const useStore = create<ChatState>((set, get) => ({
         body: JSON.stringify({ path }),
       });
       await get().loadHealth();
+    } catch { /* ignore */ }
+  },
+
+  /** Bind a workspace to the CURRENT active session only. */
+  bindSessionWorkspace: async (sessionId: string, path: string | null) => {
+    try {
+      await fetch(`/api/sessions/${sessionId}/workspace`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path }),
+      });
+      await get().loadSessions();
     } catch { /* ignore */ }
   },
 

@@ -61,6 +61,7 @@ impl Tool for VerifyTool {
                  check correctness, completeness, and edge cases."
             ),
             is_error: false,
+            ..Default::default()
         })
     }
 }

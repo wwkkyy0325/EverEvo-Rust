@@ -186,7 +186,13 @@ impl TaskTool {
         }
     }
 
-    fn dispatch_one(&self, desc: &str, stype: &str, max_turns: usize, isolation: Option<String>) {
+    fn dispatch_one(
+        &self,
+        desc: &str,
+        stype: &str,
+        max_turns: usize,
+        isolation: Option<String>,
+    ) -> Uuid {
         self.pending.fetch_add(1, Ordering::SeqCst);
 
         let cancel = CancellationToken::new();
@@ -378,10 +384,11 @@ impl TaskTool {
 
             if let Some(result_text) = outcome.1.clone() {
                 let _ = tx.map(|t| t.send(result_text.clone()));
-                backlog
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push((subagent_id.to_string(), desc.to_string(), result_text));
+                backlog.lock().unwrap_or_else(|e| e.into_inner()).push((
+                    subagent_id.to_string(),
+                    desc.to_string(),
+                    result_text,
+                ));
             } else if outcome.0 == "cancelled" {
                 let _ = tx.map(|t| {
                     t.send(format!(
@@ -394,6 +401,7 @@ impl TaskTool {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(handle);
+        subagent_id
     }
 }
 
@@ -426,16 +434,22 @@ impl Tool for TaskTool {
         _cancel: Option<&CancellationToken>,
     ) -> Result<ToolOutput, EverEvoError> {
         if let Some(subtasks) = params["subtasks"].as_array() {
+            let mut ids = Vec::new();
             for st in subtasks {
                 let d = st["description"].as_str().unwrap_or("unnamed");
                 let t = st["subagent_type"].as_str().unwrap_or("code-explorer");
                 let mt = st["max_turns"].as_u64().map(|v| v as usize).unwrap_or(0);
                 let iso = st["isolation"].as_str().map(|s| s.to_string());
-                self.dispatch_one(d, t, mt, iso);
+                ids.push(self.dispatch_one(d, t, mt, iso).to_string());
             }
             return Ok(ToolOutput {
-                content: format!("{} subagents dispatched", subtasks.len()),
+                content: format!(
+                    "{} subagents dispatched (task_ids: {}). Use cancel_task with any id to stop it.",
+                    ids.len(),
+                    ids.join(", ")
+                ),
                 is_error: false,
+                ..Default::default()
             });
         }
         let desc = params["description"]
@@ -448,10 +462,114 @@ impl Tool for TaskTool {
             .unwrap_or(0);
         let stype = params["subagent_type"].as_str().unwrap_or("code-explorer");
         let isolation = params["isolation"].as_str().map(|s| s.to_string());
-        self.dispatch_one(desc, stype, max_turns, isolation);
+        let id = self.dispatch_one(desc, stype, max_turns, isolation);
         Ok(ToolOutput {
-            content: format!("SubAgent dispatched: {desc}"),
+            content: format!(
+                "SubAgent dispatched: {desc} (task_id: {id}). Use cancel_task with this task_id to stop it if needed."
+            ),
             is_error: false,
+            ..Default::default()
+        })
+    }
+}
+
+// ── CancelTaskTool — lets the LLM proactively stop a sub-agent ───────────
+
+/// Tool for the LLM to cancel a running sub-agent by its `task_id`.
+/// Shares the TaskTool's `handles`/`pending`/`statuses` so the cancellation
+/// propagates to the spawned sub-agent's `CancellationToken` and the pending
+/// count stays consistent (so auto-continue doesn't wait on a dead task).
+pub struct CancelTaskTool {
+    handles: Arc<std::sync::Mutex<Vec<SubAgentHandle>>>,
+    statuses: Arc<std::sync::Mutex<Vec<SubAgentStatus>>>,
+    pending: Arc<AtomicUsize>,
+}
+
+impl CancelTaskTool {
+    pub fn new(
+        handles: Arc<std::sync::Mutex<Vec<SubAgentHandle>>>,
+        statuses: Arc<std::sync::Mutex<Vec<SubAgentStatus>>>,
+        pending: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            handles,
+            statuses,
+            pending,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for CancelTaskTool {
+    fn name(&self) -> &str {
+        "cancel_task"
+    }
+    fn description(&self) -> &str {
+        "Cancel a running sub-agent by its task_id (the UUID returned by the `task` tool). \
+         Use when a spawned task is no longer needed, is taking too long, or duplicated work — \
+         the cancelled sub-agent stops at its next tool call and its result is discarded. \
+         Parameters: task_id (required)."
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "The sub-agent UUID returned by the `task` tool"
+                }
+            },
+            "required": ["task_id"]
+        })
+    }
+    fn risk_level(&self) -> RiskLevel {
+        RiskLevel::Low
+    }
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        _cancel: Option<&CancellationToken>,
+    ) -> Result<ToolOutput, EverEvoError> {
+        let id_str = params["task_id"]
+            .as_str()
+            .ok_or_else(|| EverEvoError::InvalidInput("task_id is required".into()))?;
+        let task_id: Uuid = id_str
+            .parse()
+            .map_err(|_| EverEvoError::InvalidInput(format!("invalid task_id: {id_str}")))?;
+
+        let mut handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pos) = handles.iter().position(|h| h.id == task_id) {
+            let handle = handles.remove(pos);
+            drop(handles);
+            handle.cancel.cancel();
+            // Mark status cancelled + decrement pending count.
+            let mut statuses = self.statuses.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(s) = statuses.iter_mut().find(|s| s.id == task_id) {
+                s.status = "cancelled".into();
+            }
+            drop(statuses);
+            let prev = self.pending.fetch_sub(1, Ordering::SeqCst);
+            tracing::info!(
+                %task_id,
+                prev_pending = prev,
+                desc = %handle.description,
+                "Sub-agent cancelled by LLM via cancel_task tool"
+            );
+            return Ok(ToolOutput {
+                content: format!(
+                    "Cancelled sub-agent {task_id} ({}). It will stop at its next tool call; its result is discarded.",
+                    handle.description
+                ),
+                is_error: false,
+                ..Default::default()
+            });
+        }
+        Ok(ToolOutput {
+            content: format!(
+                "No running sub-agent with task_id {task_id} — it may have already finished or been cancelled."
+            ),
+            is_error: false,
+            ..Default::default()
         })
     }
 }
@@ -578,6 +696,65 @@ async fn spawn_single(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_cancel_state() -> (
+        Arc<std::sync::Mutex<Vec<SubAgentHandle>>>,
+        Arc<std::sync::Mutex<Vec<SubAgentStatus>>>,
+        Arc<AtomicUsize>,
+    ) {
+        (
+            Arc::new(std::sync::Mutex::new(vec![])),
+            Arc::new(std::sync::Mutex::new(vec![])),
+            Arc::new(AtomicUsize::new(0)),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_cancel_task_cancels_and_decrements() {
+        let (handles, statuses, pending) = make_cancel_state();
+        let id = Uuid::new_v4();
+        let token = CancellationToken::new();
+        handles.lock().unwrap().push(SubAgentHandle {
+            id,
+            description: "research X".into(),
+            started_at: Utc::now(),
+            cancel: token.clone(),
+        });
+        statuses.lock().unwrap().push(SubAgentStatus {
+            id,
+            description: "research X".into(),
+            started_at: Utc::now().to_rfc3339(),
+            status: "running".into(),
+            elapsed_ms: 0,
+        });
+        pending.store(1, Ordering::SeqCst);
+
+        let tool = CancelTaskTool::new(handles.clone(), statuses.clone(), pending.clone());
+        let out = tool
+            .execute(serde_json::json!({"task_id": id.to_string()}), None)
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(handles.lock().unwrap().is_empty(), "handle removed");
+        assert_eq!(pending.load(Ordering::SeqCst), 0, "pending decremented");
+        assert_eq!(statuses.lock().unwrap()[0].status, "cancelled");
+        assert!(token.is_cancelled(), "cancellation token fired");
+    }
+
+    #[tokio::test]
+    async fn test_cancel_task_unknown_id_is_not_error() {
+        let (handles, statuses, pending) = make_cancel_state();
+        let tool = CancelTaskTool::new(handles.clone(), statuses, pending);
+        let out = tool
+            .execute(
+                serde_json::json!({"task_id": Uuid::new_v4().to_string()}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(out.content.contains("No running sub-agent"));
+    }
 
     #[test]
     fn test_name() {

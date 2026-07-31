@@ -68,26 +68,39 @@ impl HnswStore {
 
     fn empty(data_path: PathBuf, dim: usize) -> Self {
         let hnsw = Hnsw::<f32, DistCosine>::new(
-            M, INITIAL_CAPACITY, MAX_LAYER, EF_CONSTRUCTION, DistCosine {},
+            M,
+            INITIAL_CAPACITY,
+            MAX_LAYER,
+            EF_CONSTRUCTION,
+            DistCosine {},
         );
         if let Some(parent) = data_path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
         tracing::info!(dim, "HnswStore created (empty)");
-        Self { hnsw, meta: Mutex::new(Meta { id_map: HashMap::new(), rev_map: HashMap::new(), vectors: HashMap::new(), next_id: 0 }), data_path }
+        Self {
+            hnsw,
+            meta: Mutex::new(Meta {
+                id_map: HashMap::new(),
+                rev_map: HashMap::new(),
+                vectors: HashMap::new(),
+                next_id: 0,
+            }),
+            data_path,
+        }
     }
 
     fn load(bin_path: &std::path::Path, _dim: usize) -> Result<Self, EverEvoError> {
-        let file = std::fs::File::open(bin_path).map_err(|e| {
-            EverEvoError::Internal(format!("Open {}: {e}", bin_path.display()))
-        })?;
+        let file = std::fs::File::open(bin_path)
+            .map_err(|e| EverEvoError::Internal(format!("Open {}: {e}", bin_path.display())))?;
         let reader = BufReader::new(file);
         let entries: Vec<VectorEntry> = bincode::deserialize_from(reader)
             .map_err(|e| EverEvoError::Internal(format!("Load {}: {e}", bin_path.display())))?;
 
         let count = entries.len();
         let capacity = (count + 1000).max(INITIAL_CAPACITY);
-        let hnsw = Hnsw::<f32, DistCosine>::new(M, capacity, MAX_LAYER, EF_CONSTRUCTION, DistCosine {});
+        let hnsw =
+            Hnsw::<f32, DistCosine>::new(M, capacity, MAX_LAYER, EF_CONSTRUCTION, DistCosine {});
 
         let mut id_map = HashMap::with_capacity(count);
         let mut rev_map = HashMap::with_capacity(count);
@@ -106,19 +119,28 @@ impl HnswStore {
         tracing::info!(count, path = %bin_path.display(), "HnswStore loaded (bincode)");
         Ok(Self {
             hnsw,
-            meta: Mutex::new(Meta { id_map, rev_map, vectors, next_id: max_id + 1 }),
+            meta: Mutex::new(Meta {
+                id_map,
+                rev_map,
+                vectors,
+                next_id: max_id + 1,
+            }),
             data_path: bin_path.to_path_buf(),
         })
     }
 
-    fn migrate_from_json(json_path: &std::path::Path, bin_path: &std::path::Path, _dim: usize) -> Result<Self, EverEvoError> {
-        let json = std::fs::read_to_string(json_path).map_err(|e| {
-            EverEvoError::Internal(format!("Read JSON: {e}"))
-        })?;
+    fn migrate_from_json(
+        json_path: &std::path::Path,
+        bin_path: &std::path::Path,
+        _dim: usize,
+    ) -> Result<Self, EverEvoError> {
+        let json = std::fs::read_to_string(json_path)
+            .map_err(|e| EverEvoError::Internal(format!("Read JSON: {e}")))?;
         let entries: Vec<JsonEntry> = serde_json::from_str(&json).unwrap_or_default();
         let count = entries.len();
         let capacity = (count + 1000).max(INITIAL_CAPACITY);
-        let hnsw = Hnsw::<f32, DistCosine>::new(M, capacity, MAX_LAYER, EF_CONSTRUCTION, DistCosine {});
+        let hnsw =
+            Hnsw::<f32, DistCosine>::new(M, capacity, MAX_LAYER, EF_CONSTRUCTION, DistCosine {});
 
         let mut id_map = HashMap::with_capacity(count);
         let mut rev_map = HashMap::with_capacity(count);
@@ -136,7 +158,12 @@ impl HnswStore {
 
         let store = Self {
             hnsw,
-            meta: Mutex::new(Meta { id_map, rev_map, vectors, next_id: max_id + 1 }),
+            meta: Mutex::new(Meta {
+                id_map,
+                rev_map,
+                vectors,
+                next_id: max_id + 1,
+            }),
             data_path: bin_path.to_path_buf(),
         };
         store.save()?;
@@ -146,9 +173,10 @@ impl HnswStore {
     }
 
     fn save(&self) -> Result<(), EverEvoError> {
-        let meta = self.meta.lock().map_err(|e| {
-            EverEvoError::Internal(format!("Lock meta: {e}"))
-        })?;
+        let meta = self
+            .meta
+            .lock()
+            .map_err(|e| EverEvoError::Internal(format!("Lock meta: {e}")))?;
 
         // Collect entries: for each DataId, find its UUID.
         // We don't store the vector here because HNSW owns the vectors internally.
@@ -170,13 +198,15 @@ impl HnswStore {
         // and search works via HNSW internal vectors, so persistence works for
         // search but not for `get()` returning full vector data.
 
-        let entries: Vec<VectorEntry> = meta.rev_map.iter().map(|(&data_id, &uuid)| {
-            VectorEntry {
+        let entries: Vec<VectorEntry> = meta
+            .rev_map
+            .iter()
+            .map(|(&data_id, &uuid)| VectorEntry {
                 uuid: uuid.as_u128(),
                 data_id,
                 vector: meta.vectors.get(&data_id).cloned().unwrap_or_default(),
-            }
-        }).collect();
+            })
+            .collect();
 
         let file = std::fs::File::create(&self.data_path).map_err(|e| {
             EverEvoError::Internal(format!("Create {}: {e}", self.data_path.display()))
@@ -191,9 +221,14 @@ impl HnswStore {
 
 impl VectorStore for HnswStore {
     fn insert(&self, chunks: Vec<MemoryChunk>) -> Result<(), EverEvoError> {
-        if chunks.is_empty() { return Ok(()); }
+        if chunks.is_empty() {
+            return Ok(());
+        }
         {
-            let mut meta = self.meta.lock().map_err(|e| EverEvoError::Internal(format!("Lock meta: {e}")))?;
+            let mut meta = self
+                .meta
+                .lock()
+                .map_err(|e| EverEvoError::Internal(format!("Lock meta: {e}")))?;
             for chunk in &chunks {
                 let id = meta.next_id;
                 meta.next_id += 1;
@@ -209,24 +244,36 @@ impl VectorStore for HnswStore {
     fn search(&self, query_vector: &[f32], top_k: usize) -> Result<Vec<ScoredChunk>, EverEvoError> {
         let ef = (top_k * 2).clamp(50, 512);
         let neighbors = self.hnsw.search(query_vector, top_k, ef);
-        let meta = self.meta.lock().map_err(|e| EverEvoError::Internal(format!("Lock meta: {e}")))?;
-        Ok(neighbors.iter().filter_map(|n| {
-            let uuid = *meta.rev_map.get(&n.d_id)?;
-            Some(ScoredChunk {
-                chunk: MemoryChunk {
-                    id: uuid, content: String::new(), vector: vec![],
-                    source_pointers: vec![],
-                    projection: ProjectionMetadata::new("2.0.0", "hnsw", vec![], 1.0),
-                    chunk_type: ChunkType::Fact,
-                    created_at: chrono::Utc::now(), retrieval_count: 0,
-                },
-                score: 1.0 - n.distance,
+        let meta = self
+            .meta
+            .lock()
+            .map_err(|e| EverEvoError::Internal(format!("Lock meta: {e}")))?;
+        Ok(neighbors
+            .iter()
+            .filter_map(|n| {
+                let uuid = *meta.rev_map.get(&n.d_id)?;
+                Some(ScoredChunk {
+                    chunk: MemoryChunk {
+                        id: uuid,
+                        content: String::new(),
+                        vector: vec![],
+                        source_pointers: vec![],
+                        projection: ProjectionMetadata::new("2.0.0", "hnsw", vec![], 1.0),
+                        chunk_type: ChunkType::Fact,
+                        created_at: chrono::Utc::now(),
+                        retrieval_count: 0,
+                    },
+                    score: 1.0 - n.distance,
+                })
             })
-        }).collect())
+            .collect())
     }
 
     fn delete(&self, ids: &[Uuid]) -> Result<(), EverEvoError> {
-        let mut meta = self.meta.lock().map_err(|e| EverEvoError::Internal(format!("Lock meta: {e}")))?;
+        let mut meta = self
+            .meta
+            .lock()
+            .map_err(|e| EverEvoError::Internal(format!("Lock meta: {e}")))?;
         for uuid in ids {
             if let Some(internal_id) = meta.id_map.remove(uuid) {
                 meta.rev_map.remove(&internal_id);
@@ -237,17 +284,22 @@ impl VectorStore for HnswStore {
         self.save()
     }
 
-    fn count(&self) -> usize { self.meta.lock().map(|m| m.id_map.len()).unwrap_or(0) }
+    fn count(&self) -> usize {
+        self.meta.lock().map(|m| m.id_map.len()).unwrap_or(0)
+    }
 
     fn get(&self, id: &Uuid) -> Option<MemoryChunk> {
         let meta = self.meta.lock().ok()?;
         let _internal_id = meta.id_map.get(id)?;
         Some(MemoryChunk {
-            id: *id, content: String::new(), vector: vec![],
+            id: *id,
+            content: String::new(),
+            vector: vec![],
             source_pointers: vec![],
             projection: ProjectionMetadata::new("2.0.0", "hnsw", vec![], 1.0),
             chunk_type: ChunkType::Fact,
-            created_at: chrono::Utc::now(), retrieval_count: 0,
+            created_at: chrono::Utc::now(),
+            retrieval_count: 0,
         })
     }
 }
@@ -276,10 +328,15 @@ mod tests {
     use tempfile::TempDir;
 
     fn make_chunk(id: Uuid, v: Vec<f32>) -> MemoryChunk {
-        MemoryChunk { id, content: String::new(), vector: v,
+        MemoryChunk {
+            id,
+            content: String::new(),
+            vector: v,
             source_pointers: vec![],
             projection: ProjectionMetadata::new("test", "test", vec![], 1.0),
-            chunk_type: ChunkType::Fact, created_at: chrono::Utc::now(), retrieval_count: 0,
+            chunk_type: ChunkType::Fact,
+            created_at: chrono::Utc::now(),
+            retrieval_count: 0,
         }
     }
 
@@ -287,10 +344,12 @@ mod tests {
     fn test_insert_and_search() {
         let dir = TempDir::new().unwrap();
         let store = HnswStore::open(dir.path().join("test-store"), 4).unwrap();
-        store.insert(vec![
-            make_chunk(Uuid::new_v4(), vec![1.0, 0.0, 0.0, 0.0]),
-            make_chunk(Uuid::new_v4(), vec![0.0, 1.0, 0.0, 0.0]),
-        ]).unwrap();
+        store
+            .insert(vec![
+                make_chunk(Uuid::new_v4(), vec![1.0, 0.0, 0.0, 0.0]),
+                make_chunk(Uuid::new_v4(), vec![0.0, 1.0, 0.0, 0.0]),
+            ])
+            .unwrap();
         assert_eq!(store.count(), 2);
         let r = store.search(&[0.9, 0.1, 0.0, 0.0], 2).unwrap();
         assert_eq!(r.len(), 2);
@@ -304,7 +363,9 @@ mod tests {
         let id = Uuid::new_v4();
         {
             let store = HnswStore::open(&path, 3).unwrap();
-            store.insert(vec![make_chunk(id, vec![1.0, 0.0, 0.0])]).unwrap();
+            store
+                .insert(vec![make_chunk(id, vec![1.0, 0.0, 0.0])])
+                .unwrap();
         }
         assert!(path.with_extension("bin").exists());
         let store2 = HnswStore::open(&path, 3).unwrap();
@@ -317,7 +378,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let json_path = dir.path().join("store.json");
         let bin_path = dir.path().join("store.bin");
-        let entries = vec![JsonEntry { id: 0, uuid: Uuid::new_v4().to_string(), vector: vec![1.0, 0.0, 0.0] }];
+        let entries = vec![JsonEntry {
+            id: 0,
+            uuid: Uuid::new_v4().to_string(),
+            vector: vec![1.0, 0.0, 0.0],
+        }];
         std::fs::write(&json_path, serde_json::to_string(&entries).unwrap()).unwrap();
         let store = HnswStore::open(dir.path().join("store"), 3).unwrap();
         assert_eq!(store.count(), 1);

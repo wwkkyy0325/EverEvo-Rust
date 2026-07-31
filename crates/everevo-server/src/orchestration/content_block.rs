@@ -125,6 +125,9 @@ impl ContentBlockStreamer {
                 name: _,
                 content,
                 is_error,
+                // Images are carried in-memory to the LLM (vision); not persisted
+                // to DB nor forwarded over SSE in this iteration.
+                images: _,
             } => {
                 if let Some(b) = self
                     .persisted_blocks
@@ -306,6 +309,7 @@ mod tests {
                     name: "shell".into(),
                     content: "file1\nfile2".into(),
                     is_error: false,
+                    images: Vec::new(),
                 },
                 &tx,
             )

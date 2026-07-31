@@ -113,9 +113,18 @@ pub async fn run_startup_check(data_dir: &Path, requested_port: u16) -> StartupR
     items.push(check_permission_model());
 
     let total_ms = overall_start.elapsed().as_millis() as u64;
-    let pass = items.iter().filter(|i| i.status == CheckStatus::Pass).count();
-    let warn = items.iter().filter(|i| i.status == CheckStatus::Warn).count();
-    let fail = items.iter().filter(|i| i.status == CheckStatus::Fail).count();
+    let pass = items
+        .iter()
+        .filter(|i| i.status == CheckStatus::Pass)
+        .count();
+    let warn = items
+        .iter()
+        .filter(|i| i.status == CheckStatus::Warn)
+        .count();
+    let fail = items
+        .iter()
+        .filter(|i| i.status == CheckStatus::Fail)
+        .count();
 
     let report = StartupReport {
         items,
@@ -184,7 +193,12 @@ fn check_data_dirs(data_dir: &Path) -> CheckItem {
         )
     };
 
-    item("Data directories", status, detail, start.elapsed().as_millis() as u64)
+    item(
+        "Data directories",
+        status,
+        detail,
+        start.elapsed().as_millis() as u64,
+    )
 }
 
 /// Check that all required assets have valid `.extracted` sentinels.
@@ -247,7 +261,12 @@ fn check_asset_integrity(data_dir: &Path) -> CheckItem {
         )
     };
 
-    item("Asset integrity", status, detail, start.elapsed().as_millis() as u64)
+    item(
+        "Asset integrity",
+        status,
+        detail,
+        start.elapsed().as_millis() as u64,
+    )
 }
 
 fn check_onnx_embeddings(data_dir: &Path) -> CheckItem {
@@ -302,7 +321,12 @@ fn check_onnx_embeddings(data_dir: &Path) -> CheckItem {
         CheckStatus::Warn
     };
 
-    item("ONNX Embeddings", status, detail, start.elapsed().as_millis() as u64)
+    item(
+        "ONNX Embeddings",
+        status,
+        detail,
+        start.elapsed().as_millis() as u64,
+    )
 }
 
 /// Check free disk space on the data directory's partition.
@@ -332,7 +356,12 @@ fn check_disk_space(data_dir: &Path) -> CheckItem {
         (CheckStatus::Warn, "Cannot determine free space".into())
     };
 
-    item("Disk space", status, detail, start.elapsed().as_millis() as u64)
+    item(
+        "Disk space",
+        status,
+        detail,
+        start.elapsed().as_millis() as u64,
+    )
 }
 
 fn available_disk_space(path: &Path) -> u64 {
@@ -470,7 +499,8 @@ fn check_llm_config(data_dir: &Path) -> CheckItem {
 
     match std::fs::read_to_string(&config_path) {
         Ok(content) => {
-            let has_anthropic = content.contains("ANTHROPIC_API_KEY") || content.contains("anthropic");
+            let has_anthropic =
+                content.contains("ANTHROPIC_API_KEY") || content.contains("anthropic");
             let has_openai = content.contains("OPENAI_API_KEY") || content.contains("openai");
 
             let mut providers = Vec::new();
@@ -559,7 +589,11 @@ fn check_runtime_smoke(data_dir: &Path) -> CheckItem {
     }
 
     let ok_count = results.iter().filter(|r| !r.contains(':')).count();
-    let status = if ok_count == results.len() { CheckStatus::Pass } else { CheckStatus::Warn };
+    let status = if ok_count == results.len() {
+        CheckStatus::Pass
+    } else {
+        CheckStatus::Warn
+    };
 
     item(
         "Runtime smoke test",
@@ -744,9 +778,7 @@ fn print_report(report: &StartupReport) {
     if report.fail > 0 {
         println!("{red}  ⚡ Critical issues detected — system may not function correctly.{reset}");
     } else if report.warn > 0 {
-        println!(
-            "{yellow}  ⚡ Warnings present — some features degraded.{reset}"
-        );
+        println!("{yellow}  ⚡ Warnings present — some features degraded.{reset}");
     } else {
         println!("{green}  ⚡ All systems nominal.{reset}");
     }

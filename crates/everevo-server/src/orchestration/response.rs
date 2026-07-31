@@ -59,9 +59,12 @@ pub async fn persist_and_send(
             .add_message(&msg)
             .await
             .map_err(|e| e.to_string())?;
-        state
-            .dreaming_engine
-            .push_message("assistant", full_response, &assistant_id.to_string(), &session_id.to_string());
+        state.dreaming_engine.push_message(
+            "assistant",
+            full_response,
+            &assistant_id.to_string(),
+            &session_id.to_string(),
+        );
     }
 
     // Close open blocks

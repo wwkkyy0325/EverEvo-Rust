@@ -14,12 +14,13 @@ use everevo_agent::memory::scheduler::{DreamingScheduler, SchedulerConfig};
 use everevo_agent::memory::wiki::WikiGenerator;
 use everevo_agent::memory::DreamingEngine;
 use everevo_agent::rag::RagPipeline;
-use everevo_vector::{ModelRegistry, MultiCollectionStore};
 use everevo_agent::skill::SkillRegistry;
 use everevo_agent::tools::builtins::{SubAgentHandle, SubAgentStatus};
 use everevo_bootstrap::pipeline::InitPipeline;
 use everevo_bootstrap::Bootstrap;
 use everevo_core::context::ContextSnapshot;
+use everevo_vector::{ModelRegistry, MultiCollectionStore};
+
 use everevo_core::slash_command::SlashCommandRegistry;
 use everevo_core::{AppConfig, EverEvoError};
 use everevo_core::{Telemetry, TelemetryConfig};
@@ -110,6 +111,7 @@ pub struct AppState {
     pub skill_registry: Arc<SkillRegistry>,
     /// Slash command registry — built-in + plugin slash commands for chat input.
     pub commands: Arc<SlashCommandRegistry>,
+    /// Credential config removed — sandbox inherits host git config directly.
     /// Cached runtime environment — computed once at startup, reused for every
     /// sandbox creation to avoid repeated filesystem scans of .extracted sentinels.
     pub runtime_env: everevo_bootstrap::runtime::RuntimeEnv,
@@ -171,19 +173,55 @@ impl AppState {
         // so it can be passed to the DreamingEngine for DEEP phase KG sync)
         let graph_dir = config.data_dir.join("memory").join("graph");
         std::fs::create_dir_all(&graph_dir).ok();
-        let knowledge_graph = Arc::new(std::sync::RwLock::new(
-            everevo_agent::knowledge::KnowledgeGraph::open(&graph_dir)
+        let knowledge_graph = Arc::new(std::sync::RwLock::new({
+            let mut kg = everevo_agent::knowledge::KnowledgeGraph::open(&graph_dir)
                 .unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "Failed to open knowledge graph, starting empty");
                     everevo_agent::knowledge::KnowledgeGraph::open(&graph_dir).unwrap()
-                }),
-        ));
+                });
+            // Seed project structure on first open so `memory kg_search` has
+            // entities to return from the very first query.
+            kg.seed_project_structure(&[
+                "everevo-core",
+                "everevo-agent",
+                "everevo-server",
+                "everevo-db",
+                "everevo-sandbox",
+                "everevo-vector",
+                "everevo-knowledge",
+                "everevo-bootstrap",
+                "everevo-downloader",
+                "everevo-mcp",
+                "everevo-workflow",
+                "everevo-bundler",
+            ]);
+            kg
+        }));
 
         let (fact_manager, diary_manager, scheduler, dreaming_engine, wiki_generator) =
             Self::init_memory(&config, &llm, &knowledge_graph)?;
 
+        // Start the background dreaming scheduler — was never started before!
+        // Without this, LIGHT (diary), REM (themes), DEEP (consolidation),
+        // wiki generation, and persona updates NEVER run. All memory features
+        // are read-only without the scheduler ticking.
+        let persona_profile = config.data_dir.join("memory").join("persona").join("profile.json");
+        scheduler.start_background(
+            Arc::clone(&dreaming_engine),
+            Arc::clone(&fact_manager),
+            Arc::clone(&wiki_generator),
+            Some(persona_profile),
+        );
+        tracing::info!("Dreaming scheduler started (LIGHT/REM/DEEP + wiki + persona)");
+
         // Wire SQLite FTS5 for fact keyword search (triple-write: MD + SQLite + Vector)
         fact_manager.set_db(Arc::new(db.clone()));
+        // Serialized FTS5 writer actor — all fact upserts flow through a single
+        // consumer, eliminating concurrent external-content trigger conflicts
+        // (root cause of "SQL logic error" under burst saves). See:
+        // https://emschwartz.me/psa-your-sqlite-connection-pool-might-be-ruining-your-write-performance/
+        let fact_tx = Self::spawn_fact_writer(db.clone());
+        fact_manager.set_write_queue(fact_tx);
 
         // Model registry — auto-discovers ONNX models under data/models/.
         let model_registry = {
@@ -195,7 +233,7 @@ impl AppState {
                     // Return a dummy? No — ModelRegistry::discover fails if no models.
                     // This should never happen in production (models bundled).
                     panic!("No embedding models found — cannot start");
-                })
+                }),
             ))
         };
 
@@ -212,7 +250,9 @@ impl AppState {
             let r = Arc::clone(rag);
             tokio::spawn(async move {
                 match fm.index_into_rag(&r) {
-                    Ok(n) => tracing::info!(count = n, "Backfilled existing facts into vector store"),
+                    Ok(n) => {
+                        tracing::info!(count = n, "Backfilled existing facts into vector store")
+                    }
                     Err(e) => tracing::warn!(error = %e, "Fact vector backfill failed (non-fatal)"),
                 }
             });
@@ -252,11 +292,7 @@ impl AppState {
 
         // Todo store with disk persistence — survives server restarts
         let todo_store = everevo_agent::tools::builtins::new_todo_store();
-        everevo_agent::tools::builtins::load_persisted_tasks(
-            &todo_store,
-            &config.data_dir,
-        )
-        .await;
+        everevo_agent::tools::builtins::load_persisted_tasks(&todo_store, &config.data_dir).await;
 
         let state = Arc::new(Self {
             config,
@@ -355,9 +391,9 @@ impl AppState {
                                 everevo_mcp::discover_mcp_tools_http(&srv.url, &srv.headers).await
                             }
                             _ => {
-                                let args: Vec<&str> =
-                                    srv.args.iter().map(String::as_str).collect();
-                                everevo_mcp::discover_mcp_tools(&srv.command, &args, &srv.env).await
+                                let args: Vec<&str> = srv.args.iter().map(String::as_str).collect();
+                                let env = state.inject_runtime_path(&srv.env);
+                                everevo_mcp::discover_mcp_tools(&srv.command, &args, &env).await
                             }
                         };
 
@@ -368,11 +404,7 @@ impl AppState {
                                     tool_count = tools.len(),
                                     "MCP server auto-reconnected"
                                 );
-                                state
-                                    .mcp_clients
-                                    .write()
-                                    .await
-                                    .insert(name.clone(), client);
+                                state.mcp_clients.write().await.insert(name.clone(), client);
                             }
                             Err(e) => {
                                 tracing::error!(
@@ -400,7 +432,10 @@ impl AppState {
                 _ => {
                     // stdio (default)
                     let args: Vec<&str> = srv.args.iter().map(String::as_str).collect();
-                    everevo_mcp::discover_mcp_tools(&srv.command, &args, &srv.env).await
+                    // Ensure bootstrapped runtimes (node/npx) are on the child's PATH
+                    // so `npx @playwright/mcp` resolves even on a clean machine.
+                    let env = state.inject_runtime_path(&srv.env);
+                    everevo_mcp::discover_mcp_tools(&srv.command, &args, &env).await
                 }
             };
 
@@ -423,6 +458,35 @@ impl AppState {
                 }
             }
         }
+    }
+
+    /// Build the env map for a stdio MCP child process, prepending bootstrapped
+    /// runtime dirs (node/npx) to PATH so `npx @playwright/mcp` resolves on a
+    /// clean machine that has no system Node installed.
+    fn inject_runtime_path(&self, base: &HashMap<String, String>) -> HashMap<String, String> {
+        let mut env = base.clone();
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        // Windows env lookup is case-insensitive; reuse an existing-key spelling
+        // (e.g. "Path") if the caller already set one, else use canonical "PATH".
+        let key = env
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case("PATH"))
+            .cloned()
+            .unwrap_or_else(|| "PATH".to_string());
+        let host_path = std::env::var("PATH").unwrap_or_default();
+        let runtime_paths: Vec<String> = self
+            .runtime_env
+            .paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        let combined = if runtime_paths.is_empty() {
+            host_path
+        } else {
+            format!("{}{}{}", runtime_paths.join(sep), sep, host_path)
+        };
+        env.insert(key, combined);
+        env
     }
 
     fn init_downloader() -> Result<Arc<Downloader>, EverEvoError> {
@@ -463,16 +527,13 @@ impl AppState {
         );
         // Use ANY available LLM for the dreaming pipeline, not just "primary".
         // Falls back to first non-None entry if "primary" isn't configured.
-        let primary = llm.get("primary")
+        let primary = llm
+            .get("primary")
             .and_then(|v| v.clone())
             .or_else(|| llm.values().find_map(|v| v.clone()));
         let sched = Arc::new(DreamingScheduler::new(SchedulerConfig::default()));
-        let mut engine = DreamingEngine::new(
-            Arc::clone(&dm),
-            Arc::clone(&fm),
-            primary.clone(),
-            &root,
-        )?;
+        let mut engine =
+            DreamingEngine::new(Arc::clone(&dm), Arc::clone(&fm), primary.clone(), &root)?;
         // Wire shared KG for DEEP phase entity extraction sync
         engine.set_knowledge_graph(Arc::clone(knowledge_graph));
         let engine = Arc::new(engine);
@@ -554,12 +615,103 @@ impl AppState {
         reg.register(SlashCommand::new("help", "List all available commands"));
         reg.register(SlashCommand::new("clear", "Clear current session history"));
         reg.register(SlashCommand::new("compact", "Trigger context compaction").with_args("topic"));
-        reg.register(SlashCommand::new("plan", "Enter plan mode for task planning; /plan cancel to exit").with_args("task"));
+        reg.register(
+            SlashCommand::new(
+                "plan",
+                "Enter plan mode for task planning; /plan cancel to exit",
+            )
+            .with_args("task"),
+        );
         reg.register(SlashCommand::new("memory", "Search persistent memory").with_args("query"));
-        reg.register(SlashCommand::new("config", "Show current configuration status"));
+        reg.register(SlashCommand::new(
+            "config",
+            "Show current configuration status",
+        ));
         reg.register(SlashCommand::new("tasks", "Show current task list status"));
-        reg.register(SlashCommand::new("doctor", "Run system diagnostics and show health report"));
+        reg.register(SlashCommand::new(
+            "doctor",
+            "Run system diagnostics and show health report",
+        ));
+        reg.register(
+            SlashCommand::new("workspace", "Set workspace directory for current session")
+                .with_args("path"),
+        );
         Arc::new(reg)
+    }
+
+    /// Spawn the serialized FTS5 fact-writer actor.
+    ///
+    /// All fact upserts flow through a single consumer task, eliminating
+    /// concurrent writes to the FTS5 external-content table. This is the
+    /// canonical single-writer SQLite pattern: one owned connection, writes
+    /// queued via an mpsc channel, processed strictly in order.
+    ///
+    /// Each write retries with exponential backoff (50ms, 100ms) to absorb
+    /// transient `SQLITE_BUSY` from external connections (e.g. background
+    /// migrations) that briefly hold the write lock.
+    ///
+    /// The actor lives for the lifetime of `AppState`; it exits when the
+    /// sender held by `FactManager` is dropped on shutdown.
+    fn spawn_fact_writer(db: everevo_db::Database) -> everevo_agent::memory::facts::FactWriteTx {
+        use everevo_agent::memory::facts::FactWriteTask;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<FactWriteTask>();
+        tokio::spawn(async move {
+            // Acquire a single connection and hold it — all upserts go through
+            // this one conn, avoiding pool contention (SQLITE_BUSY_SNAPSHOT 517
+            // from chat-route writes competing with re-acquired pool connections).
+            let mut conn = match db.pool.acquire().await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!(error = %e, "Fact writer: cannot acquire connection — exiting");
+                    return;
+                }
+            };
+            while let Some(task) = rx.recv().await {
+                for attempt in 0u32..3u32 {
+                    // Sanitize content inline (null-bytes → "SQL logic error").
+                    let content = task.content.replace('\0', "\\0");
+                    if task.id.is_empty() || content.is_empty() {
+                        break;
+                    }
+                    let result = sqlx::query(
+                        "INSERT INTO facts (id, description, content, fact_type, retrieval_count, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, 0, datetime('now'), datetime('now'))
+                         ON CONFLICT(id) DO UPDATE SET description=?2, content=?3, fact_type=?4, updated_at=datetime('now')"
+                    )
+                    .bind(&task.id)
+                    .bind(&task.description)
+                    .bind(&content)
+                    .bind(&task.fact_type)
+                    .execute(&mut *conn)
+                    .await;
+                    match result {
+                        Ok(_) => break,
+                        Err(e) => {
+                            if attempt < 2 {
+                                let delay = std::time::Duration::from_millis(50 << attempt);
+                                tracing::warn!(
+                                    attempt = attempt + 1,
+                                    id = %task.id,
+                                    error = %e,
+                                    ?delay,
+                                    "Fact FTS5 upsert failed — retrying"
+                                );
+                                tokio::time::sleep(delay).await;
+                            } else {
+                                tracing::warn!(
+                                    id = %task.id,
+                                    error = %e,
+                                    "Fact FTS5 upsert failed after 3 attempts — dropped"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            tracing::info!("Fact writer actor stopped");
+        });
+        tx
     }
 
     /// Create a sandbox for a session. Default level is SemiAuto.
@@ -567,29 +719,40 @@ impl AppState {
     /// Uses the cached runtime_env (computed once at startup) to inject
     /// portable runtime paths. This avoids repeated filesystem scans on
     /// every session creation.
+    /// Create a sandbox for a session. If `session_workspace` is provided, it
+    /// takes precedence over the global workspace_dir for this session only.
+    /// Default (None/null) uses the isolated sandbox directory.
     pub async fn create_sandbox(
         &self,
         session_id: uuid::Uuid,
         level: everevo_sandbox::PermissionLevel,
+        session_workspace: Option<String>,
     ) -> Result<(), EverEvoError> {
         let sandbox_root = self.config.data_dir.join("sandbox");
-        let workspace = self.workspace_dir.read().await.clone();
-        // Add workspace path to injected_paths so commands inside workspace
-        // are auto-approved at SemiAuto (Claude Code alignment: inside workspace = free)
+        // Only use per-session workspace if explicitly set.
+        // New sessions default to sandbox isolation — NO fallback to global.
+        let effective_ws: Option<std::path::PathBuf> = session_workspace
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from);
+        // Add effective workspace to injected_paths for auto-approval
         let mut injected_paths = self.runtime_env.paths.clone();
-        if let Some(ref ws) = workspace {
+        if let Some(ref ws) = effective_ws {
             if ws.is_dir() {
                 injected_paths.push(ws.clone());
             }
         }
+        // Sandbox inherits host env vars directly (no credential injection needed)
+        let injected_env: Vec<(String, String)> =
+            self.runtime_env.env_vars.clone().into_iter().collect();
         let base_config = SandboxConfig {
             sandbox_root,
             injected_paths,
-            injected_env: self.runtime_env.env_vars.clone().into_iter().collect::<Vec<_>>(),
+            injected_env,
             ..Default::default()
         };
         let mut sandbox = SessionSandbox::create(&session_id.to_string(), &base_config)?
-            .with_workspace(workspace);
+            .with_workspace(effective_ws);
         sandbox.set_permission_level(level);
         self.sandboxes.write().await.insert(session_id, sandbox);
         Ok(())
@@ -637,7 +800,11 @@ fn load_workspace_config(config: &AppConfig) -> Option<PathBuf> {
     let content = std::fs::read_to_string(&path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
     let p = PathBuf::from(json.get("workspace_dir")?.as_str()?);
-    if p.is_dir() { Some(p) } else { None }
+    if p.is_dir() {
+        Some(p)
+    } else {
+        None
+    }
 }
 
 impl AppState {
@@ -660,6 +827,7 @@ impl AppState {
         };
 
         let mut map = HashMap::new();
+        let mut plaintext_keys_found = false;
         for entry in llm_arr {
             let id = entry
                 .get("id")
@@ -674,9 +842,18 @@ impl AppState {
             let model = entry.get("model").and_then(|v| v.as_str()).unwrap_or("");
 
             if !key.is_empty() {
+                plaintext_keys_found = true;
                 let client = HttpClient::new(api_fmt, key, url, model);
                 map.insert(id.to_string(), Some(Arc::new(client)));
             }
+        }
+        if plaintext_keys_found {
+            tracing::warn!(
+                "⚠️  API keys found in plaintext in data/config/config.toml. \
+                 For better security, move keys to a .env file (loaded automatically) \
+                 or environment variables. The config.toml file is readable by shell \
+                 and read_file tools — plaintext keys are a security risk."
+            );
         }
         map
     }

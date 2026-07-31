@@ -38,11 +38,19 @@ pub type PlanModeState = Arc<RwLock<HashMap<Uuid, String>>>;
 
 /// Read-only tool names — allowed in plan mode (Claude Code alignment).
 const READ_ONLY_TOOLS: &[&str] = &[
-    "read_file", "list_dir", "code_search", "code_map",
-    "memory", "web_fetch", "web_search",
-    "EnterPlanMode", "ExitPlanMode",
-    "Skill", "Verify",
-    "TodoWrite", "Compact",
+    "read_file",
+    "list_dir",
+    "code_search",
+    "code_map",
+    "memory",
+    "web_fetch",
+    "web_search",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "Skill",
+    "Verify",
+    "TodoWrite",
+    "Compact",
 ];
 
 /// Check if a tool is allowed in plan mode.
@@ -108,8 +116,10 @@ impl Tool for EnterPlanModeTool {
         if state.contains_key(&session_id) {
             return Ok(ToolOutput {
                 content: "Already in plan mode. Use ExitPlanMode to submit your plan \
-                          or call CancelPlanMode to discard it.".into(),
+                          or call CancelPlanMode to discard it."
+                    .into(),
                 is_error: true,
+                ..Default::default()
             });
         }
 
@@ -131,8 +141,10 @@ impl Tool for EnterPlanModeTool {
                       5. **ExitPlanMode** — Call ExitPlanMode with your plan summary. \
                          The plan will be saved and presented to the user for approval.\n\n\
                       ⚠️ Write tools (shell, write_file, download) are BLOCKED until \
-                      the user approves your plan.".into(),
+                      the user approves your plan."
+                .into(),
             is_error: false,
+            ..Default::default()
         })
     }
 }
@@ -146,7 +158,10 @@ pub struct ExitPlanModeTool {
 
 impl ExitPlanModeTool {
     pub fn new(plan_state: PlanModeState, data_dir: PathBuf) -> Self {
-        Self { plan_state, data_dir }
+        Self {
+            plan_state,
+            data_dir,
+        }
     }
 }
 
@@ -198,8 +213,10 @@ impl Tool for ExitPlanModeTool {
             if !state.contains_key(&session_id) {
                 return Ok(ToolOutput {
                     content: "Not currently in plan mode. Use EnterPlanMode first \
-                              if you want to plan before implementing.".into(),
+                              if you want to plan before implementing."
+                        .into(),
                     is_error: true,
+                    ..Default::default()
                 });
             }
         }
@@ -235,6 +252,7 @@ impl Tool for ExitPlanModeTool {
                 old_perm = old_perm.as_deref().unwrap_or("unknown"),
             ),
             is_error: false,
+            ..Default::default()
         })
     }
 }
@@ -247,7 +265,13 @@ fn slugify(text: &str) -> String {
     let slug: String = text
         .chars()
         .take(80)
-        .map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { ' ' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == ' ' || c == '-' {
+                c
+            } else {
+                ' '
+            }
+        })
         .collect();
     let words: Vec<&str> = slug.split_whitespace().take(6).collect();
     if words.is_empty() {
@@ -297,10 +321,10 @@ mod tests {
         rt.block_on(async {
             let state = Arc::new(RwLock::new(HashMap::new()));
             let tool = ExitPlanModeTool::new(state, PathBuf::from("/tmp"));
-            let result = tool.execute(
-                serde_json::json!({"plan": "test plan"}),
-                None,
-            ).await.unwrap();
+            let result = tool
+                .execute(serde_json::json!({"plan": "test plan"}), None)
+                .await
+                .unwrap();
             assert!(result.is_error);
             assert!(result.content.contains("Not currently in plan mode"));
         });
@@ -316,26 +340,35 @@ mod tests {
             let exit = ExitPlanModeTool::new(Arc::clone(&state), PathBuf::from("/tmp"));
 
             // Enter plan mode
-            let r = enter.execute(
-                serde_json::json!({"session_id": session_id.to_string()}),
-                None,
-            ).await.unwrap();
+            let r = enter
+                .execute(
+                    serde_json::json!({"session_id": session_id.to_string()}),
+                    None,
+                )
+                .await
+                .unwrap();
             assert!(!r.is_error);
             assert!(r.content.contains("Plan mode entered"));
 
             // Enter again should fail
-            let r2 = enter.execute(
-                serde_json::json!({"session_id": session_id.to_string()}),
-                None,
-            ).await.unwrap();
+            let r2 = enter
+                .execute(
+                    serde_json::json!({"session_id": session_id.to_string()}),
+                    None,
+                )
+                .await
+                .unwrap();
             assert!(r2.is_error);
             assert!(r2.content.contains("Already in plan mode"));
 
             // Exit plan mode
-            let r3 = exit.execute(
-                serde_json::json!({"session_id": session_id.to_string(), "plan": "Test plan"}),
-                None,
-            ).await.unwrap();
+            let r3 = exit
+                .execute(
+                    serde_json::json!({"session_id": session_id.to_string(), "plan": "Test plan"}),
+                    None,
+                )
+                .await
+                .unwrap();
             assert!(!r3.is_error);
             assert!(r3.content.contains("Plan submitted"));
 

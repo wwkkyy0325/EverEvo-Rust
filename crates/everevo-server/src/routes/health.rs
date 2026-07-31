@@ -23,24 +23,22 @@ async fn handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> 
         .read()
         .await
         .iter()
-        .map(|(name, client)| {
-            match client.try_lock() {
-                Ok(mut guard) => {
-                    let alive = guard.is_alive();
-                    serde_json::json!({
-                        "name": name,
-                        "tools": guard.tools.len(),
-                        "tool_names": guard.tool_names(),
-                        "server": guard.server_info.name,
-                        "status": if alive { "connected" } else { "dead" },
-                    })
-                }
-                Err(_) => serde_json::json!({
+        .map(|(name, client)| match client.try_lock() {
+            Ok(mut guard) => {
+                let alive = guard.is_alive();
+                serde_json::json!({
                     "name": name,
-                    "status": "busy",
-                    "note": "Tool executing — lock held"
-                }),
+                    "tools": guard.tools.len(),
+                    "tool_names": guard.tool_names(),
+                    "server": guard.server_info.name,
+                    "status": if alive { "connected" } else { "dead" },
+                })
             }
+            Err(_) => serde_json::json!({
+                "name": name,
+                "status": "busy",
+                "note": "Tool executing — lock held"
+            }),
         })
         .collect();
 

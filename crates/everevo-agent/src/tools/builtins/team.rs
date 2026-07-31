@@ -12,8 +12,8 @@
 //! - `tester` — Test writing: add tests, run suite, report coverage
 //! - `general` — General-purpose (default, no specialization)
 
-use std::sync::Arc;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use everevo_core::tool::{Tool, ToolOutput};
@@ -268,9 +268,7 @@ impl TeamTool {
         let subagent_id = Uuid::new_v4();
         let role_prompt = role.system_prompt();
         // Combine role prompt + task
-        let full_prompt = format!(
-            "{role_prompt}\n\n## Task\n{task_prompt}",
-        );
+        let full_prompt = format!("{role_prompt}\n\n## Task\n{task_prompt}",);
 
         let messages = vec![everevo_core::llm::LlmMessage::user(&full_prompt)];
         let max_turns = if max_turns == 0 { 3 } else { max_turns };
@@ -307,10 +305,15 @@ impl TeamTool {
                 .with_tool_result_budget(4000)
                 .with_context_budget(40000);
 
-            let result_text = config.run_subagent(llm, tools, messages, CancellationToken::new()).await;
+            let result_text = config
+                .run_subagent(llm, tools, messages, CancellationToken::new())
+                .await;
 
             // Store result
-            results.lock().unwrap().insert(subagent_id.to_string(), result_text.clone());
+            results
+                .lock()
+                .unwrap()
+                .insert(subagent_id.to_string(), result_text.clone());
 
             // Update status
             if let Ok(mut s) = statuses.lock() {
@@ -405,6 +408,7 @@ impl Tool for TeamTool {
             return Ok(ToolOutput {
                 content: "No team members specified.".into(),
                 is_error: true,
+                ..Default::default()
             });
         }
 
@@ -418,10 +422,16 @@ impl Tool for TeamTool {
             let focus = member["focus"].as_str().unwrap_or(task);
 
             // Block until a permit is available (backpressure instead of unlimited spawn)
-            let permit = semaphore.clone().acquire_owned().await
+            let permit = semaphore
+                .clone()
+                .acquire_owned()
+                .await
                 .expect("semaphore closed");
             let id = self.dispatch_one(focus, role, task, max_turns, permit);
-            member_ids.push((id, format!("- **{}**: {}", role.as_str(), role.description())));
+            member_ids.push((
+                id,
+                format!("- **{}**: {}", role.as_str(), role.description()),
+            ));
             dispatched.push(member_ids.last().unwrap().1.clone());
         }
 
@@ -459,12 +469,12 @@ impl Tool for TeamTool {
                 .and_then(|(id, _)| results.get(&id.to_string()))
                 .cloned()
                 .unwrap_or_else(|| {
-                if self.pending.load(std::sync::atomic::Ordering::Acquire) > 0 {
-                    "(still running...)".into()
-                } else {
-                    "(no result)".into()
-                }
-            });
+                    if self.pending.load(std::sync::atomic::Ordering::Acquire) > 0 {
+                        "(still running...)".into()
+                    } else {
+                        "(no result)".into()
+                    }
+                });
 
             // Truncate very long results
             let truncated = if result_text.len() > 3000 {
@@ -479,6 +489,7 @@ impl Tool for TeamTool {
         Ok(ToolOutput {
             content: synthesis,
             is_error: false,
+            ..Default::default()
         })
     }
 }
@@ -502,7 +513,13 @@ mod tests {
 
     #[test]
     fn test_team_role_has_prompt() {
-        for role in &[TeamRole::Reviewer, TeamRole::Researcher, TeamRole::Coder, TeamRole::Tester, TeamRole::General] {
+        for role in &[
+            TeamRole::Reviewer,
+            TeamRole::Researcher,
+            TeamRole::Coder,
+            TeamRole::Tester,
+            TeamRole::General,
+        ] {
             assert!(!role.system_prompt().is_empty());
             assert!(!role.description().is_empty());
         }

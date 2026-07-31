@@ -22,7 +22,11 @@ pub struct MemoryTool {
 
 impl MemoryTool {
     pub fn new(manager: Arc<FactManager>) -> Self {
-        Self { manager, db: None, kg: None }
+        Self {
+            manager,
+            db: None,
+            kg: None,
+        }
     }
     pub fn with_db(mut self, db: everevo_db::Database) -> Self {
         self.db = Some(db);
@@ -106,10 +110,12 @@ impl MemoryTool {
             Ok(()) => Ok(ToolOutput {
                 content: format!("Memory saved: {name}"),
                 is_error: false,
+                ..Default::default()
             }),
             Err(e) => Ok(ToolOutput {
                 content: format!("Failed: {e}"),
                 is_error: true,
+                ..Default::default()
             }),
         }
     }
@@ -128,6 +134,7 @@ impl MemoryTool {
                     return Ok(ToolOutput {
                         content: format!("{} memories:\n{}", rows.len(), lines.join("\n")),
                         is_error: false,
+                        ..Default::default()
                     });
                 }
                 Ok(_) => { /* fall through to linear scan */ }
@@ -160,6 +167,7 @@ impl MemoryTool {
                     format!("No memories matching '{query}'.")
                 },
                 is_error: false,
+                ..Default::default()
             });
         }
         let lines: Vec<String> = matched
@@ -176,6 +184,7 @@ impl MemoryTool {
         Ok(ToolOutput {
             content: format!("{} memories:\n{}", matched.len(), lines.join("\n")),
             is_error: false,
+            ..Default::default()
         })
     }
 
@@ -185,10 +194,12 @@ impl MemoryTool {
             Ok(()) => Ok(ToolOutput {
                 content: format!("Deleted: {name}"),
                 is_error: false,
+                ..Default::default()
             }),
             Err(e) => Ok(ToolOutput {
                 content: format!("Failed: {e}"),
                 is_error: true,
+                ..Default::default()
             }),
         }
     }
@@ -196,9 +207,15 @@ impl MemoryTool {
     async fn kg_search(&self, p: &serde_json::Value) -> Result<ToolOutput, EverEvoError> {
         let query = p["query"].as_str().unwrap_or("");
         if query.is_empty() {
-            return Ok(ToolOutput { content: "query is required for kg_search".into(), is_error: true });
+            return Ok(ToolOutput {
+                content: "query is required for kg_search".into(),
+                is_error: true,
+                ..Default::default()
+            });
         }
-        let kg = self.kg.as_ref()
+        let kg = self
+            .kg
+            .as_ref()
             .ok_or_else(|| EverEvoError::Internal("Knowledge graph not available".into()))?;
         let kg = kg.read().unwrap_or_else(|e| e.into_inner());
 
@@ -207,6 +224,7 @@ impl MemoryTool {
             return Ok(ToolOutput {
                 content: format!("No entities found matching '{query}' in knowledge graph."),
                 is_error: false,
+                ..Default::default()
             });
         }
 
@@ -214,12 +232,19 @@ impl MemoryTool {
         for entity in entities.iter().take(8) {
             let outgoing = kg.outgoing(&entity.id);
             if outgoing.is_empty() {
-                lines.push(format!("- `{}` ({})", entity.label, entity.entity_type.as_str()));
+                lines.push(format!(
+                    "- `{}` ({})",
+                    entity.label,
+                    entity.entity_type.as_str()
+                ));
             } else {
                 for rel in outgoing.iter().take(3) {
                     lines.push(format!(
                         "- `{}` ({}) → {} → `{}`",
-                        entity.label, entity.entity_type.as_str(), rel.predicate, rel.to
+                        entity.label,
+                        entity.entity_type.as_str(),
+                        rel.predicate,
+                        rel.to
                     ));
                 }
             }
@@ -232,7 +257,11 @@ impl MemoryTool {
             query,
             lines.join("\n")
         );
-        Ok(ToolOutput { content, is_error: false })
+        Ok(ToolOutput {
+            content,
+            is_error: false,
+            ..Default::default()
+        })
     }
 }
 

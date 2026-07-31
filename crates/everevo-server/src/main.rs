@@ -230,10 +230,12 @@ async fn cmd_serve(config: everevo_core::AppConfig, host: &str, port: u16) {
     }
 
     // ── Dreaming Scheduler ─────────────────────────────────────
+    let persona_profile = state.config.data_dir.join("memory").join("persona").join("profile.json");
     let scheduler_handle = state.scheduler.start_background(
         Arc::clone(&state.dreaming_engine),
         Arc::clone(&state.fact_manager),
         Arc::clone(&state.wiki_generator),
+        Some(persona_profile),
     );
     tracing::info!("Dreaming scheduler started");
 
@@ -245,7 +247,8 @@ async fn cmd_serve(config: everevo_core::AppConfig, host: &str, port: u16) {
     let _domain_watcher_handle = tokio::spawn(async move {
         // Load once with ONNX embedder (non-fatal if models unavailable).
         let mut mgr = match everevo_agent::knowledge::domain::DomainManager::load_with_onnx(
-            &domain_root, &models_dir,
+            &domain_root,
+            &models_dir,
         ) {
             Ok(m) => m,
             Err(e) => {
@@ -291,19 +294,50 @@ async fn cmd_serve(config: everevo_core::AppConfig, host: &str, port: u16) {
     // ── Startup diagnostic summary ───────────────────────────────
     {
         let mcp_count = state.mcp_clients.read().await.len();
-        let mcp: Vec<_> = state.mcp_clients.read().await.iter().map(|(n, c)| {
-            let tools = c.try_lock().map(|g| g.tools.len()).unwrap_or(0);
-            format!("{n}({tools}t)")
-        }).collect();
+        let mcp: Vec<_> = state
+            .mcp_clients
+            .read()
+            .await
+            .iter()
+            .map(|(n, c)| {
+                let tools = c.try_lock().map(|g| g.tools.len()).unwrap_or(0);
+                format!("{n}({tools}t)")
+            })
+            .collect();
         let llm = state.llm.read().await;
         let primary = llm.get("primary").and_then(|c| c.as_ref()).is_some();
 
         println!("╔══════════════════════════════════════════╗");
-        println!("║        EverEvo Server v{}           ║", env!("CARGO_PKG_VERSION"));
+        println!(
+            "║        EverEvo Server v{}           ║",
+            env!("CARGO_PKG_VERSION")
+        );
         println!("╠══════════════════════════════════════════╣");
-        println!("║ DB:    {}  ║", if std::path::Path::new(&format!("{}/everevo.db", config.data_dir.display())).exists() { "connected" } else { "new" });
-        println!("║ LLM:   {}  ║", if primary { "primary configured" } else { "unconfigured" });
-        println!("║ MCP:   {} server(s) {}  ║", mcp_count, if mcp.is_empty() { "(none)".to_string() } else { mcp.join(", ") });
+        println!(
+            "║ DB:    {}  ║",
+            if std::path::Path::new(&format!("{}/everevo.db", config.data_dir.display())).exists() {
+                "connected"
+            } else {
+                "new"
+            }
+        );
+        println!(
+            "║ LLM:   {}  ║",
+            if primary {
+                "primary configured"
+            } else {
+                "unconfigured"
+            }
+        );
+        println!(
+            "║ MCP:   {} server(s) {}  ║",
+            mcp_count,
+            if mcp.is_empty() {
+                "(none)".to_string()
+            } else {
+                mcp.join(", ")
+            }
+        );
         println!("║ Tools: {} built-in         ║", 17);
         println!("║ Addr:  http://{addr}     ║");
         println!("╚══════════════════════════════════════════╝");

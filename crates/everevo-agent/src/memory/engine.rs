@@ -100,7 +100,10 @@ impl DreamingEngine {
     }
 
     /// Attach the shared knowledge graph for entity extraction during DEEP.
-    pub fn set_knowledge_graph(&mut self, kg: Arc<std::sync::RwLock<crate::knowledge::graph::KnowledgeGraph>>) {
+    pub fn set_knowledge_graph(
+        &mut self,
+        kg: Arc<std::sync::RwLock<crate::knowledge::graph::KnowledgeGraph>>,
+    ) {
         self.knowledge_graph = Some(kg);
     }
 
@@ -130,15 +133,16 @@ impl DreamingEngine {
     /// Group drained messages by session_id for per-session diary entries.
     #[allow(clippy::type_complexity)]
     fn group_by_session(
-        messages: &[(String, String, String, String)]
+        messages: &[(String, String, String, String)],
     ) -> Vec<(String, Vec<(String, String, String)>)> {
         let mut groups: std::collections::HashMap<String, Vec<(String, String, String)>> =
             std::collections::HashMap::new();
         for (role, content, msg_id, session_id) in messages {
-            groups
-                .entry(session_id.clone())
-                .or_default()
-                .push((role.clone(), content.clone(), msg_id.clone()));
+            groups.entry(session_id.clone()).or_default().push((
+                role.clone(),
+                content.clone(),
+                msg_id.clone(),
+            ));
         }
         let mut result: Vec<_> = groups.into_iter().collect();
         result.sort_by_key(|(sid, _)| sid.clone());
@@ -310,7 +314,10 @@ impl DreamingEngine {
                                 timestamp: chrono::Utc::now().to_rfc3339(),
                                 session_id: session_id.clone(),
                                 content: distilled,
-                                source_message_ids: msgs.iter().map(|(_, _, id)| id.clone()).collect(),
+                                source_message_ids: msgs
+                                    .iter()
+                                    .map(|(_, _, id)| id.clone())
+                                    .collect(),
                             });
                         }
                         Err(e) => {
@@ -320,11 +327,15 @@ impl DreamingEngine {
                 }
 
                 if entries.is_empty() {
-                    tracing::info!("LIGHT phase — no substantive content across {} sessions", session_groups.len());
+                    tracing::info!(
+                        "LIGHT phase — no substantive content across {} sessions",
+                        session_groups.len()
+                    );
                     return Ok(());
                 }
 
-                self.diary_manager.append_entries_to_date(&today, &entries)?;
+                self.diary_manager
+                    .append_entries_to_date(&today, &entries)?;
                 tracing::info!(
                     entries = entries.len(),
                     sessions = session_groups.len(),

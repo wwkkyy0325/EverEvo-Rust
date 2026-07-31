@@ -1,11 +1,13 @@
 <#
 .SYNOPSIS
-  EverEvo build & dev script — one command for everything.
+  EverEvo build & dev script
 
 .PARAMETER Command
-  dev     Start backend + frontend hot-reload (browser or Tauri shell)
+  dev     Start backend + frontend hot-reload (browser or Tauri)
   build   Compile backend + frontend (debug)
   release Build release binary + embedded frontend (distributable)
+  clean   Purge build caches (target/, dist/) and report savings
+  cache   Show disk usage of build caches
 
 .EXAMPLE
   ./build.ps1 dev               # Browser mode
@@ -13,18 +15,20 @@
   ./build.ps1 dev -NoFrontend    # Backend only
   ./build.ps1 build              # Debug build
   ./build.ps1 build -Release     # Release build
-  ./build.ps1 release            # Full release: frontend + backend release
+  ./build.ps1 release            # Full release
+  ./build.ps1 clean              # Free disk space
+  ./build.ps1 cache              # Check cache sizes
 #>
 
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("dev", "build", "release")]
+    [ValidateSet("dev", "build", "release", "clean", "cache")]
     [string]$Command = "dev",
 
     [switch]$Tauri,
     [switch]$NoFrontend,
     [switch]$Release,
-    [switch]$Open           # Auto-open browser after build
+    [switch]$Open
 )
 
 $ErrorActionPreference = "Continue"
@@ -32,8 +36,6 @@ $root = $PSScriptRoot
 Set-Location $root
 
 $env:RUST_LOG = if ($env:RUST_LOG) { $env:RUST_LOG } else { "everevo=debug,info" }
-
-# ── Pre-flight: cargo check --workspace --offline ─────────────────────
 
 function Invoke-PreflightCheck {
     Write-Host "[check] cargo check --workspace --offline..." -ForegroundColor DarkGray -NoNewline
@@ -60,21 +62,14 @@ function Start-Frontend {
 }
 
 function Start-Tauri {
-    # Force offline mode so Tauri's internal cargo invocations don't hit
-    # the unreachable mirror. Cache must be warm (run once with network first).
     $env:CARGO_NET_OFFLINE = "true"
-    # Find ONNX Runtime lib — flat or versioned subdirectory
     $ortBase = "$root\data\runtime\onnxruntime"
     $ortLib = if (Test-Path "$ortBase\lib\onnxruntime.lib") { "$ortBase\lib" }
               else { Get-ChildItem "$ortBase\*\lib\onnxruntime.lib" -ErrorAction SilentlyContinue | Select-Object -First 1 | Split-Path -Parent }
     if ($ortLib) { $env:ORT_LIB_PATH = $ortLib }
-
-    # Set ORT_DYLIB_PATH so the ort crate loads the correct onnxruntime.dll at runtime
-    # instead of falling back to C:\Windows\System32\onnxruntime.dll (Windows ML, v1.17.1).
     $ortDll = if (Test-Path "$ortBase\lib\onnxruntime.dll") { "$ortBase\lib\onnxruntime.dll" }
               else { Get-ChildItem "$ortBase\*\lib\onnxruntime.dll" -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object { $_.FullName } }
     if ($ortDll) { $env:ORT_DYLIB_PATH = $ortDll }
-
     Write-Host "[tauri] Desktop shell (offline)" -ForegroundColor Magenta
     & cmd /c "npx tauri dev"
     exit 0
@@ -148,5 +143,47 @@ switch ($Command) {
         taskkill /f /im everevo-server.exe 2>$null *>$null
         $NoFrontend = $false
         Invoke-Build -isRelease $true
+    }
+
+    "clean" {
+        Write-Host "=== Cache Cleanup ===" -ForegroundColor Cyan
+        $dirs = @(
+            "$root\target",
+            "$root\src-tauri\target",
+            "$root\frontend\dist",
+            "$root\frontend\node_modules\.vite"
+        )
+        $total = 0
+        foreach ($d in $dirs) {
+            if (Test-Path $d) {
+                $size = (Get-ChildItem $d -Recurse -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+                $total += $size
+                Remove-Item -Recurse -Force $d -ErrorAction SilentlyContinue
+                Write-Host ("  Removed {0} ({1:N1} MB)" -f $d, ($size/1MB)) -ForegroundColor Green
+            }
+        }
+        Write-Host ("Total freed: {0:N1} MB" -f ($total/1MB)) -ForegroundColor Cyan
+    }
+
+    "cache" {
+        Write-Host "=== Cache Sizes ===" -ForegroundColor Cyan
+        $dirs = @(
+            @{n="target (workspace)"; p="$root\target"},
+            @{n="target (tauri)";     p="$root\src-tauri\target"},
+            @{n="frontend dist";      p="$root\frontend\dist"},
+            @{n="frontend node_modules"; p="$root\frontend\node_modules"},
+            @{n="data runtime";       p="$root\data\runtime"},
+            @{n="data models";        p="$root\data\models"},
+            @{n="data downloads";     p="$root\data\downloads"},
+            @{n="data db";            p="$root\data\db"}
+        )
+        foreach ($d in $dirs) {
+            if (Test-Path $d.p) {
+                $size = (Get-ChildItem $d.p -Recurse -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+                Write-Host ("  {0,-25} {1,8:N1} MB" -f $d.n, ($size/1MB))
+            } else {
+                Write-Host ("  {0,-25}       --" -f $d.n)
+            }
+        }
     }
 }

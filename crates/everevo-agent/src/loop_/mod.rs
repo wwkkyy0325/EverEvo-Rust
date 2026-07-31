@@ -159,35 +159,46 @@ impl ProactivityState {
             EscalationLevel::Hint => Some(
                 "\
 [SYSTEM NOTE] Your last attempt with the same approach failed. \
-If you try the same tool with only minor parameter changes, you are likely \
-to fail again. Consider: is there a DIFFERENT tool, library, or strategy \
-you can use instead?".into(),
+Do NOT retry with minor parameter changes — it will fail again. \
+Consider: is there a DIFFERENT tool or strategy? \
+(SSH failing? Use HTTPS + token. API call failing? Use a different library. \
+Command not found? Check what's installed with `which`.)"
+                    .into(),
             ),
             EscalationLevel::ResearchRequired => Some(
                 "\
 ## [REQUIRED] Research Before Retrying\n\n\
-You have attempted the same approach twice and both attempts failed. \
-Before your next coding attempt you MUST:\n\
-1. Call web_search for at least 2 relevant queries about this problem\n\
-2. Read any promising results\n\
-3. Formulate an approach that is FUNDAMENTALLY different from what you tried \
-(different library, different algorithm, different architecture — NOT just \
-different parameter values)\n\
-4. Explain your new approach before executing it.".into(),
+You have attempted the same approach twice and both failed. \
+Before your next attempt you MUST:\n\
+1. Call web_search for at least 2 relevant queries (include the exact error)\n\
+2. Read the results and identify root causes\n\
+3. Choose a FUNDAMENTALLY different approach — not just parameter tweaks\n\
+   (e.g., SSH→HTTPS, one library→another, direct call→CLI tool)\n\
+4. Explain your NEW approach before executing it\n\n\
+If this is a connectivity issue (SSH, network), check: do you have a token \
+configured? Use HTTPS with the token — it's already in the sandbox env."
+                    .into(),
             ),
             EscalationLevel::ForcedDivergence => Some(
                 "\
 ## [REQUIRED] Forced Divergence — Same Approach Failed 3+ Times\n\n\
-You are stuck in a fixation loop. Complete ALL of these before retrying:\n\
+You are stuck in a fixation loop. STOP retrying immediately.\n\n\
+Complete ALL of these before ANY further action:\n\
 - [ ] Re-read the LAST error message word-for-word — what EXACTLY failed?\n\
-- [ ] web_search: the exact error message\n\
-- [ ] web_search: \"{your task} alternative approach\" or \"{your task} library\"\n\
-- [ ] List 3 DISTINCT hypotheses for why the current approach fails\n\
-- [ ] Choose the most promising alternative and explain WHY it should work\n\
-- [ ] Your next attempt MUST use a fundamentally different approach\n\n\
-Parameter tweaks, retry loops, and \"let me try one more time\" are NOT \
-acceptable at this stage. If you genuinely cannot find an alternative, \
-spawn a sub-agent with fresh context to review the problem.".into(),
+- [ ] web_search: the exact error message (copy-paste it)\n\
+- [ ] web_search: alternative approaches to {your task}\n\
+- [ ] List 3 DISTINCT hypotheses for why this fails\n\
+- [ ] Choose the best alternative and explain WHY it will work\n\n\
+**Common root causes for persistent failures**:\n\
+- SSH to GitHub fails → use HTTPS + GH_TOKEN (it's in sandbox env)\n\
+- Package install fails → check if the runtime is available (`which python`)\n\
+- Build fails → read the ACTUAL error line, not the summary\n\
+- Connection refused → the service may not be running; check with curl\n\
+- Permission denied → you're in a sandbox; explain what you need\n\n\
+Your NEXT action MUST be fundamentally different. If you truly cannot find \
+an alternative, say: \"I've tried X, Y, Z. Here's what failed and what I need.\" \
+Honesty about failure is better than an infinite retry loop."
+                    .into(),
             ),
         }
     }
@@ -488,6 +499,7 @@ impl AgentLoop {
                 },
                 tool_calls: Some(tool_calls.clone()),
                 tool_call_id: None,
+                images: Vec::new(),
             });
             text.push_str(&turn_text);
 
@@ -606,7 +618,10 @@ async fn run_loop(
         //   1. Force emergency compaction → retry
         //   2. Force aggressive trim → retry
         //   3. Give up → propagate error to user
-        let token_rx = match llm.stream_chat(messages, tool_schemas, cancel.cloned()).await {
+        let token_rx = match llm
+            .stream_chat(messages, tool_schemas, cancel.cloned())
+            .await
+        {
             Ok(rx) => rx,
             Err(e) => {
                 let err_str = e.to_string();
@@ -731,11 +746,12 @@ async fn run_loop(
             thinking,
             tool_calls: Some(tool_calls.clone()),
             tool_call_id: None,
+            images: Vec::new(),
         };
         messages.push(assistant_msg);
 
         // ── 3. Execute tools ────────────────────────────────────────
-        let mut tool_result_pairs: Vec<(String, String)> = Vec::new();
+        let mut tool_result_pairs: Vec<(String, String, Vec<everevo_core::ImageData>)> = Vec::new();
         let mut tool_calls_success = 0i32;
 
         for tc in &tool_calls {
@@ -749,9 +765,10 @@ async fn run_loop(
                             name: tc.name.clone(),
                             content: skip_msg.clone(),
                             is_error: true,
+                            images: Vec::new(),
                         })
                         .await;
-                    tool_result_pairs.push((tc.id.clone(), skip_msg));
+                    tool_result_pairs.push((tc.id.clone(), skip_msg, Vec::new()));
                     continue;
                 }
             }
@@ -775,9 +792,14 @@ async fn run_loop(
                                     name: tc.name.clone(),
                                     content: format!("Tool blocked: {e}"),
                                     is_error: true,
+                                    images: Vec::new(),
                                 })
                                 .await;
-                            tool_result_pairs.push((tc.id.clone(), format!("Tool blocked: {e}")));
+                            tool_result_pairs.push((
+                                tc.id.clone(),
+                                format!("Tool blocked: {e}"),
+                                Vec::new(),
+                            ));
                             continue;
                         }
                     }
@@ -798,6 +820,7 @@ async fn run_loop(
                             name: tc.name.clone(),
                             content: truncated.clone(),
                             is_error: output.is_error,
+                            images: output.images.clone(),
                         })
                         .await;
                     if output.is_error {
@@ -820,7 +843,7 @@ async fn run_loop(
                     } else {
                         tool_calls_success += 1;
                     }
-                    tool_result_pairs.push((tc.id.clone(), truncated));
+                    tool_result_pairs.push((tc.id.clone(), truncated, output.images.clone()));
                 }
                 Err(e) => {
                     let err_msg = format!("Tool execution failed: {e}");
@@ -830,9 +853,10 @@ async fn run_loop(
                             name: tc.name.clone(),
                             content: err_msg.clone(),
                             is_error: true,
+                            images: Vec::new(),
                         })
                         .await;
-                    tool_result_pairs.push((tc.id.clone(), err_msg));
+                    tool_result_pairs.push((tc.id.clone(), err_msg, Vec::new()));
                 }
             }
         }
@@ -840,20 +864,35 @@ async fn run_loop(
         // ── 4. Merge tool results into ONE user message ─────────────
         if !tool_result_pairs.is_empty() {
             if tool_result_pairs.len() == 1 {
-                let (id, content) = tool_result_pairs.into_iter().next().unwrap_or_default();
-                messages.push(LlmMessage::tool(&content, &id));
+                let (id, content, images) =
+                    tool_result_pairs.into_iter().next().unwrap_or_default();
+                let mut msg = LlmMessage::tool(&content, &id);
+                if !images.is_empty() {
+                    msg.images = images;
+                }
+                messages.push(msg);
             } else {
-                let ids: Vec<String> = tool_result_pairs.iter().map(|(id, _)| id.clone()).collect();
+                let ids: Vec<String> = tool_result_pairs
+                    .iter()
+                    .map(|(id, _, _)| id.clone())
+                    .collect();
+                let all_images: Vec<_> = tool_result_pairs
+                    .iter()
+                    .flat_map(|(_, _, imgs)| imgs.clone())
+                    .collect();
                 let payload = serde_json::to_string(
                     &tool_result_pairs
                         .iter()
-                        .map(|(id, content)| serde_json::json!({"i": id, "c": content}))
+                        .map(|(id, content, _)| serde_json::json!({"i": id, "c": content}))
                         .collect::<Vec<_>>(),
                 )
                 .unwrap_or_default();
                 let ids_joined = ids.join("|");
                 let mut msg = LlmMessage::tool(&payload, &ids_joined);
                 msg.tool_call_id = Some(ids_joined);
+                if !all_images.is_empty() {
+                    msg.images = all_images;
+                }
                 messages.push(msg);
             }
         }
@@ -861,9 +900,9 @@ async fn run_loop(
         // ── 4.5 Proactivity: detect fixation and inject intervention ─
         if let Some(ref state) = proactivity {
             // Collect first-tool info for this turn's fixation tracking.
-            let this_tool = tool_calls.first().map(|tc| {
-                (tc.name.clone(), hash_args(&tc.arguments))
-            });
+            let this_tool = tool_calls
+                .first()
+                .map(|tc| (tc.name.clone(), hash_args(&tc.arguments)));
             // Determine if this turn had any error.
             let has_error = (tool_calls_success as usize) < tool_calls.len();
 
@@ -959,6 +998,7 @@ mod tests {
             Ok(ToolOutput {
                 content: format!("echo: {text}"),
                 is_error: false,
+                ..Default::default()
             })
         }
     }

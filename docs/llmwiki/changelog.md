@@ -4,6 +4,197 @@ All notable changes to EverEvo-Rust. Append-only, newest first.
 
 ---
 
+## 2026-07-30 — Self-Evolving Agent（反思 + 总结 + 元 + skill 融合）
+
+让 agent 越用越聪明。调研确认 EverEvo 已有自进化全部零件，缺的是闭环 + 两个 write 路径。
+基于业界最佳实践（[arXiv 自进化 survey](https://arxiv.org/html/2507.21046v1)、
+[三层 loop](https://medium.com/@Micheal-Lanham/stop-debugging-your-agent-as-one-loop-its-three-d10013fa3a7e)、
+Reflexion/AWM、[MUSE-Autoskill](https://arxiv.org/html/2605.27366v2)）融合，**不建孤岛，全挂现有链路**。
+
+### Phase 1 — 反思 agent（Reflexion 模式）
+新 `memory/reflection.rs::reflect_on_turn`（克隆 extractor 的 `llm.chat→JSON` 模式），
+挂 `chat.rs` post-turn spawn。自评「目标达成/浪费/教训」→ `FactType::Feedback` fact →
+`FactManager.save` 三写。**下次同类任务 MemoryStage 零接线检索注入**（recall 自动晋升 T1）。
+
+### Phase 2 — 总结 agent + workflow auto-compose
+- 补 workflow write 缺口：`WorkflowRunnerTool::save_workflow` + `SaveWorkflowTool`（LLM 主动沉淀）。
+- `compose_workflow_if_reusable`（post-turn）：检测可复用多步流程 → LLM 生成
+  `WorkflowDefinition` → 自动存 `data/workflows/`。门槛从"手写 DSL"降到"自动捕获"。
+
+### Phase 3 — 元 agent（经验驱动编排）
+SYSTEM_PROMPT 新增 `## Self-Evolution` 段：复杂任务前先 `list_workflows`+查 memory，
+有匹配则 `workflow_run name=`；解决的可复用问题 `save_workflow`。让经验主动影响"怎么干"。
+
+### Phase 4 — skill promotion
+`promote_to_skill`（写 `data/skills/<name>/SKILL.md`，含 `when_to_use` 触发词）→
+`SkillStage` 下次启动自动发现。LLM 可把高频流程提升为自动触发的技能。
+
+### 闭环数据流
+```
+任务完成 → 反思(教训→Feedback) + 总结(可复用→workflow) + 提升(高频→skill)
+   ↓ 沉淀（复用现有 FactManager/workflow 库/skills）
+下次任务 → MemoryStage 注入教训 + SkillStage 列出技能 + 系统提示引导查 workflow
+```
+
+### 验证
+`cargo clippy --workspace -- -D warnings` ✅；`cargo test --workspace --lib` ✅ 438 tests,
+0 failed（+12 新测试：reflection/slugify/compose-prompt/save-workflow-round-trip/promote-skill）。
+
+## 2026-07-30 — Agent Autonomy Enhancements (A–E)
+
+让 agent 从"总自己单干"升级为"可协作、可控、可编排、会判断何时委派"。基于业界最佳
+实践（Claude Code hooks/guardrails、Anthropic 委派决策表、Agentflow/AWM 工作流复用）。
+
+- **A — `cancel_task` 工具**：LLM 此前只能生、不能杀（cancel 全是用户 HTTP 触发）。新增
+  `cancel_task`，按 task_id 取消正在跑的子 agent（共享 TaskTool 的 handles/pending/statuses
+  Arc → 触发 CancellationToken + 标记 cancelled + 减 pending）。`task` 工具现在返回 task_id。
+- **B1 — 修 TodoWrite session_id bug**：session_id 此前没接进 schema（LLM 写的 todo 全落
+  `Uuid::nil`，和读路径对不上）。现在 registry 构建时注入真 session_id。
+- **B2 — 跨对话全局任务**：TodoWrite 加 `scope`（session/global）。global 任务存固定
+  `GLOBAL_TASK_KEY`、持久化 `tasks/global.json`，每个新对话自动合并展示——支持跨对话长期项目。
+- **C — Workflow 脚手架**：`workflow_run` 加 `name`（从 `data/workflows/` 加载，防路径穿越）
+  + 新增 `list_workflows`（发现可复用 workflow）+ 内置示例。门槛从"手写多步 DSL"降到"按名调用"。
+- **D — 系统提示委派决策表**：SYSTEM_PROMPT 新增 "When to Delegate / Collaborate"
+  （何时用 Task/team/cluster/workflow_run/cancel_task）+ "别委派 trivial 单步"反引导。
+- **E — `Workflow`→`parallel_agents` 改名**：消除和 `workflow_run`（JSON 引擎）的概念冲突。
+
+验证：`cargo clippy --workspace -- -D warnings` ✅；`cargo test --workspace --lib` ✅ 430 tests,
+0 failed（+6 新测试）。
+
+## 2026-07-30 — Playwright MCP + Browser Vision (截图识图)
+
+把 web_search 被反爬封死的痛点，升级为业界最强的浏览器自动化 + 多模态识图能力。
+
+### Part 1 — Playwright MCP 接入（零 Rust 浏览器控制代码）
+微软官方 Playwright MCP（2026 业界标准，40+ 工具）通过现有 MCP 基础设施自动注入 agent。
+- **修复 MCP 配置加载**：`AppConfig::load()` 此前从不解析 `[[mcp_servers]]`（只读 env）；
+  新增 `load_mcp_servers()` 从 `data/config.toml` 加载；`put_config` round-trip MCP 配置
+  （UI 保存不再吞掉手写的 mcp 配置）。
+- **Node PATH 注入**：bootstrapped 的 Node 此前不在 server 进程 PATH 上，`npx` 在干净机器
+  上找不到。`inject_runtime_path()` 把 `runtime_env.paths` prepend 到 stdio MCP 子进程 PATH。
+- **默认配置**：`config_center` defaults 写入注释的 `[[mcp_servers]] playwright` 示例。
+- 配置后 agent 自动获得 `browser_navigate`/`browser_click`/`browser_evaluate`/
+  `browser_snapshot`/`browser_screenshot` 等工具。
+
+### Part 2 — 多模态：截图喂给 vision LLM（完整 image content block 链路）
+此前图片在 `McpClient::call_tool` 第一跳就被丢弃（`_ => None`），整条链路全是 String。
+- **additive `images` 字段**（不改 `content` 类型）：`ImageData` 类型 + `LlmMessage.images` +
+  `ToolOutput.images`（derive Default）。调研证明这比改 `content` 成 enum 少 ~15 个破坏点。
+- **全链路流转**：`call_tool` 返回 `(text, images)` → `McpTool::execute` 填 images →
+  `AgentEvent::ToolCallEnd` 携带 → agent loop 注入 `LlmMessage.images`。
+- **序列化**：Anthropic `tool_result.content` 用 array（text + image base64 block）；
+  OpenAI tool 消息不能带图，追加一条 `image_url` user 消息。
+- **图片不持久化**：截图只在当前 turn 喂 vision LLM，不进 DB（避免撑爆 content_hash），
+  刷新会话后历史截图不回放（合理，时效性强）。
+- 约 90 处 `ToolOutput` 字面量用括号平衡脚本批量补 `..Default::default()`。
+
+### 验证
+`cargo check --workspace` ✅；`cargo clippy --workspace -- -D warnings` ✅ 零警告；
+`cargo test --workspace --lib` ✅ 417 tests, 0 failed。
+
+### 使用
+1. `data/config/config.toml` 取消注释 `[[mcp_servers]] playwright` 段。
+2. 首次在 EverEvo shell 跑 `npx playwright install chromium`（sandbox PATH 已有 Node）。
+3. 让 agent 用 vision 模型时 `browser_screenshot`，截图会作为 image block 喂给 LLM。
+
+---
+
+## 2026-07-30 — Web Search Reliability (Multi-Endpoint + Anti-Bot + Proxy)
+
+### Problem
+`web_search` was hard-wired to a single DuckDuckGo endpoint
+(`html.duckduckgo.com/html/`) with no fallback, bare browser headers, and
+network errors misclassified as `EverEvoError::LlmProvider`. Datacenter/proxy
+IPs get 403'd by DDG's anti-bot filter, making the tool effectively dead.
+
+### Fixes (all P0/P1/P2 from the audit)
+- **Bing as default engine (mainland-friendly)**: DuckDuckGo is unreachable in
+  mainland China without a proxy. `web_search` now tries **Bing (cn.bing.com)
+  first** — directly reachable, no proxy needed, and returns real result URLs
+  (no `uddg=` redirect wrapper). DDG `lite`/`html` remain as fallback. Browser
+  fallback default also switched to Bing (`EVEREVO_SEARCH_BROWSER_URL` override).
+- **Multi-engine fallback** (`web_search.rs`): `SearchEngine` enum + `ENGINES`
+  list; first engine returning parseable results wins. Bing→DDG-lite→DDG-html.
+- **Parser rewrite (fixes phantom results)**: DDG wraps real URLs in
+  `//duckduckgo.com/l/?uddg=<encoded>` redirect links — the old parser matched
+  CSS classes (`result-link`) that DDG no longer emits, and fell for the
+  anti-bot challenge page's footer "here" link (returning 1 fake result, which
+  also suppressed the `lite` fallback). Now: challenge-page detection
+  (`anomaly.js` / "Get the full-JS version here") returns empty → next engine
+  tried; `resolve_real_url` unwraps the `uddg` param via percent-decode; DDG
+  internal/`here`/Bing-internal links filtered. 7 new unit tests cover the
+  Bing + redirect + challenge paths.
+- **Parser rewrite (fixes phantom results)**: DDG wraps real URLs in
+  `//duckduckgo.com/l/?uddg=<encoded>` redirect links — the old parser matched
+  CSS classes (`result-link`) that DDG no longer emits, and fell for the
+  anti-bot challenge page's footer "here" link (returning 1 fake result, which
+  also suppressed the `lite` fallback). Now: challenge-page detection
+  (`anomaly.js` / "Get the full-JS version here") returns empty → next endpoint
+  tried; `resolve_real_url` unwraps the `uddg` param via percent-decode; DDG
+  internal/`here` links filtered. 5 new unit tests cover the redirect + challenge paths.
+- **Browser-grade client** (new `http_util.rs`): full Chrome header set
+  (Accept, Accept-Language, Accept-Encoding, Sec-Fetch-*, Upgrade-Insecure-
+  Requests) + realistic UA — the highest-leverage free anti-bot mitigation
+  (Scrapfly/ZenRows/Bright Data). Shared by `web_search` and `web_fetch`.
+- **POST over GET**: DDG `q` field posted as form data instead of query string
+  — less likely to be flagged as a crawler.
+- **Proxy awareness**: `EVEREVO_HTTP_PROXY` env var forces all web-tool traffic
+  through a residential/VPN proxy to escape a blocked IP; falls back to
+  standard `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` auto-detection. No `.no_proxy()`.
+- **Error semantics**: new `EverEvoError::Network` variant — search failures no
+  longer masquerade as LLM-provider errors.
+- **Actionable failure message**: when all endpoints fail, tells the user the
+  probable cause (IP blocked) and the exact env vars to set.
+- **Browser fallback (most reliable)**: when every direct endpoint is blocked,
+  `open::that()` launches the user's real default browser to the search page.
+  A real browser carries cookies, a genuine fingerprint, and honors the system
+  proxy/VPN — sidestepping the datacenter-IP block entirely. Override the
+  search engine via `EVEREVO_SEARCH_BROWSER_URL` (default: DuckDuckGo).
+
+### References
+- [How to scrape DuckDuckGo](https://roundproxies.com/blog/scrape-duckduckgo/)
+- [DuckDuckGo API guide 2026](https://iproyal.com/blog/duckduckgo-api/)
+- [403 bypass (Scrapfly)](https://scrapfly.io/blog/posts/403-forbidden-web-scraping)
+
+---
+
+## 2026-07-30 — Credential Vault Removal + Serialized FTS5 Writer
+
+### Credential vault removed — sandbox reuses global git config
+Removed the per-session credential isolation layer that stored tokens in
+`data/config/credentials.toml` and injected them into an isolated sandbox HOME.
+The sandbox now inherits the host `HOME` + `~/.gitconfig` + `~/.ssh` directly,
+eliminating ambiguity between host and sandbox git/ssh behavior.
+- Deleted `CredentialsConfig` (+ 3 sub-structs) from `everevo-core/config.rs`
+- Removed sandbox `.sandbox-home/` creation, `HOME`/`GIT_CONFIG_NOSYSTEM` injection
+- Removed `/credential` slash command, `GET/PUT /api/credentials` endpoints
+- Removed `credential_summary` from `ContextBuildContext` + `SessionMetadataStage`
+
+### Serialized FTS5 fact writer (fixes "SQL logic error" under burst saves)
+**Root cause:** `FactManager::save()` fired-and-forgot each SQLite FTS5 upsert
+via an unbounded `tokio::spawn`. When multiple facts were saved within the same
+millisecond (e.g. Mem0-style turn extraction), concurrent writes to the FTS5
+external-content table triggered trigger conflicts → `SQLITE_ERROR` (code 1).
+
+**Fix:** Single-writer actor pattern (community-standard for SQLite + sqlx + tokio).
+- `FactManager` gains a `write_queue` channel; `save()` enqueues instead of spawning
+- `AppState::spawn_fact_writer()` runs one consumer task that processes upserts
+  strictly in order, with exponential-backoff retry (50ms, 100ms) for transient
+  `SQLITE_BUSY`
+- Falls back to the old fire-and-forget path when no queue is attached (tests)
+- Reference: https://emschwartz.me/psa-your-sqlite-connection-pool-might-be-ruining-your-write-performance/
+
+### ONNX integration test
+Added a real-model smoke test in `everevo-vector/src/onnx_embedder.rs` that loads
+`all-MiniLM-L6-v2` from `data/models/` and verifies a non-zero 384-dim embedding,
+confirming the ONNX → HNSW → semantic-search chain is live.
+
+### Cleanup
+- Deleted stale `data/vector/memory.json` (zero-vector DummyEmbedder dump)
+- Removed old empty `data/memory/vector/` directory (superseded by `data/vector/`)
+
+---
+
 ## 2026-07-27 — Server Integration Tests, RAG Runtime Fix, Live API Validation
 
 ### everevo-server integration tests (+19 tests)

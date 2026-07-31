@@ -50,7 +50,9 @@ impl SessionSandbox {
 
         let audit = Arc::new(AuditWriter::open(&sandbox_dir).map_err(EverEvoError::Sandbox)?);
 
-        // Each session gets its own TieredSandbox scoped to its sandbox root
+        // Sandbox inherits host HOME + git config directly — no isolation.
+        // This eliminates ambiguity: git, ssh, and other tools behave exactly
+        // as they do in the host terminal.
         let sess_config = SandboxConfig {
             sandbox_root: sandbox_dir.clone(),
             ..base_config.clone()

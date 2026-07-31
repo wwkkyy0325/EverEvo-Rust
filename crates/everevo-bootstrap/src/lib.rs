@@ -580,7 +580,11 @@ fn unix_runtimes(pbs_target: &str) -> Vec<Asset> {
     } else {
         ("linux", "tar.xz")
     };
-    let node_arch = if pbs_target.contains("aarch64") { "arm64" } else { "x64" };
+    let node_arch = if pbs_target.contains("aarch64") {
+        "arm64"
+    } else {
+        "x64"
+    };
 
     let (ort_os, ort_ext) = if pbs_target.contains("apple") {
         ("osx-universal2", "tgz")

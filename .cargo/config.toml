@@ -1,0 +1,7 @@
+# EverEvo build config — shared target directory so the workspace
+# and src-tauri don't produce two separate 100 GB caches.
+
+[build]
+# Single target dir — workspace `cargo build` and Tauri's internal
+# `cargo build` write to the same place, halving disk usage.
+target-dir = "target"

@@ -46,10 +46,24 @@ pub trait Tool: Send + Sync {
 }
 
 /// Result of executing a tool — returned to the LLM as context.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ToolOutput {
     pub content: String,
     pub is_error: bool,
+    /// Image attachments (e.g. from `browser_screenshot`). Empty for text-only
+    /// tools. Carried in-memory to the LLM; not persisted to DB.
+    pub images: Vec<crate::llm::ImageData>,
+}
+
+impl ToolOutput {
+    /// Convenience: a text-only successful output (most common case).
+    pub fn text(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: false,
+            images: Vec::new(),
+        }
+    }
 }
 
 // ── Tool Hooks (PreToolUse / PostToolUse) ───────────────────────────────
@@ -180,6 +194,7 @@ mod tests {
             Ok(ToolOutput {
                 content: "ok".into(),
                 is_error: false,
+                ..Default::default()
             })
         }
     }

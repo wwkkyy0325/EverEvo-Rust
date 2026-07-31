@@ -12,8 +12,8 @@ use async_trait::async_trait;
 use everevo_core::tool::{Tool, ToolOutput};
 use everevo_core::types::RiskLevel;
 use everevo_core::EverEvoError;
-use tokio_util::sync::CancellationToken;
 use std::sync::{Arc, Mutex};
+use tokio_util::sync::CancellationToken;
 
 pub struct CompactTool {
     /// Shared focus hint — written here, read by agent loop's autocompact.
@@ -24,7 +24,10 @@ pub struct CompactTool {
 
 impl CompactTool {
     pub fn new() -> Self {
-        Self { compact_focus: None, dreaming_engine: None }
+        Self {
+            compact_focus: None,
+            dreaming_engine: None,
+        }
     }
 
     /// Wire the compact focus channel between this tool and the agent loop.
@@ -34,7 +37,10 @@ impl CompactTool {
     }
 
     /// Wire the dreaming engine for pre-compaction memory flush.
-    pub fn with_dreaming_engine(mut self, engine: Arc<crate::memory::engine::DreamingEngine>) -> Self {
+    pub fn with_dreaming_engine(
+        mut self,
+        engine: Arc<crate::memory::engine::DreamingEngine>,
+    ) -> Self {
         self.dreaming_engine = Some(engine);
         self
     }
@@ -99,7 +105,8 @@ impl Tool for CompactTool {
 
         let msg = if focus.is_empty() {
             "Compaction triggered. Memory flushed, older messages will be summarized \
-             on the next turn. Continue your work.".into()
+             on the next turn. Continue your work."
+                .into()
         } else {
             format!(
                 "Compaction triggered (focus: '{focus}'). Memory flushed, agent will \
@@ -109,6 +116,7 @@ impl Tool for CompactTool {
         Ok(ToolOutput {
             content: msg,
             is_error: false,
+            ..Default::default()
         })
     }
 }

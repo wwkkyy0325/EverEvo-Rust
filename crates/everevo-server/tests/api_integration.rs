@@ -23,9 +23,18 @@ async fn setup() -> (axum::Router, Arc<everevo_server::app_state::AppState>) {
     let data_dir = tmp.path().to_path_buf();
 
     for sub in &[
-        "db", "sandbox", "memory/facts", "memory/diary",
-        "memory/wiki", "memory/.dreams", "memory/vector",
-        "skills", "domain", "domain/inbox", "models", "runtime",
+        "db",
+        "sandbox",
+        "memory/facts",
+        "memory/diary",
+        "memory/wiki",
+        "memory/.dreams",
+        "memory/vector",
+        "skills",
+        "domain",
+        "domain/inbox",
+        "models",
+        "runtime",
     ] {
         let _ = std::fs::create_dir_all(data_dir.join(sub));
     }
@@ -45,16 +54,21 @@ fn req(method: Method, uri: &str, body: Option<Value>) -> Request<Body> {
     if body.is_some() {
         b = b.header(header::CONTENT_TYPE, "application/json");
     }
-    b.body(Body::from(
-        body.map(|v| v.to_string()).unwrap_or_default(),
-    ))
-    .unwrap()
+    b.body(Body::from(body.map(|v| v.to_string()).unwrap_or_default()))
+        .unwrap()
 }
 
-async fn send(app: &axum::Router, method: Method, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
+async fn send(
+    app: &axum::Router,
+    method: Method,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
     let resp = app.clone().oneshot(req(method, uri, body)).await.unwrap();
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, body)
 }
@@ -146,8 +160,11 @@ async fn sessions_create_and_list() {
 #[tokio::test]
 async fn session_not_found_returns_error() {
     let (app, _) = setup().await;
-    let (_, body) =
-        ok!(&app, GET, "/api/sessions/00000000-0000-0000-0000-000000000000");
+    let (_, body) = ok!(
+        &app,
+        GET,
+        "/api/sessions/00000000-0000-0000-0000-000000000000"
+    );
     assert!(body.get("error").is_some());
 }
 

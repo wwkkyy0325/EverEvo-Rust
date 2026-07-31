@@ -196,9 +196,11 @@ impl SubAgentContext {
                 prompt.push_str("## Parent Agent Task State\n\n");
                 prompt.push_str(ts);
                 prompt.push_str("\n\n");
-                prompt.push_str("Align your work with the parent's pending tasks. \
+                prompt.push_str(
+                    "Align your work with the parent's pending tasks. \
                      If the user says \"继续\" (continue), they mean resume the oldest \
-                     PENDING task — not redo completed work.\n\n");
+                     PENDING task — not redo completed work.\n\n",
+                );
             }
         }
 
@@ -216,10 +218,14 @@ impl SubAgentContext {
         // ── Understanding User Intent ──────────────────────────
         prompt.push_str("## Understanding User Intent\n\n");
         prompt.push_str("- If the user reports they already did something: VERIFY, do NOT redo.\n");
-        prompt.push_str("- If the user says \"继续\" / \"continue\": resume the oldest \
-             PENDING task, not the most recently discussed topic.\n");
-        prompt.push_str("- Distinguish: \"I did X\" (verify) vs \"Do X\" (execute) vs \
-             \"继续\" (resume pending).\n");
+        prompt.push_str(
+            "- If the user says \"继续\" / \"continue\": resume the oldest \
+             PENDING task, not the most recently discussed topic.\n",
+        );
+        prompt.push_str(
+            "- Distinguish: \"I did X\" (verify) vs \"Do X\" (execute) vs \
+             \"继续\" (resume pending).\n",
+        );
         prompt.push_str("- Never repeat work the user states they completed.\n\n");
 
         // ── Rules ──────────────────────────────────────────────
@@ -274,6 +280,9 @@ pub async fn assemble_subagent_context(
         plan_mode: false,
         escalation_level: None,
         fixation_detail: None,
+        runtime_summary: None,
+        sandbox_root: None,
+        startup_verified: false,
     };
 
     let mut sub_ctx = SubAgentContext::default();

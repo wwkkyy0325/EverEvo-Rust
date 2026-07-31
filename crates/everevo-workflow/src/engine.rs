@@ -12,7 +12,11 @@ use crate::types::*;
 /// callbacks provide the actual execution environment.
 #[async_trait::async_trait]
 pub trait WorkflowCallbacks: Send + Sync {
-    async fn shell_exec(&self, command: &str, working_dir: Option<&str>) -> Result<(String, String, i32), String>;
+    async fn shell_exec(
+        &self,
+        command: &str,
+        working_dir: Option<&str>,
+    ) -> Result<(String, String, i32), String>;
     async fn fetch_url(&self, url: &str) -> Result<String, String>;
     async fn memory_save(&self, key: &str, content: &str) -> Result<(), String>;
     async fn memory_search(&self, query: &str) -> Result<Vec<String>, String>;
@@ -25,7 +29,11 @@ pub struct NoopCallbacks;
 
 #[async_trait::async_trait]
 impl WorkflowCallbacks for NoopCallbacks {
-    async fn shell_exec(&self, cmd: &str, _wd: Option<&str>) -> Result<(String, String, i32), String> {
+    async fn shell_exec(
+        &self,
+        cmd: &str,
+        _wd: Option<&str>,
+    ) -> Result<(String, String, i32), String> {
         Ok((format!("[noop shell: {cmd}]"), String::new(), 0))
     }
     async fn fetch_url(&self, url: &str) -> Result<String, String> {
@@ -51,18 +59,32 @@ pub struct WorkflowEngine<C: WorkflowCallbacks> {
 /// Blanket impl: delegate trait methods through Arc for dyn dispatch.
 #[async_trait::async_trait]
 impl WorkflowCallbacks for Arc<dyn WorkflowCallbacks> {
-    async fn shell_exec(&self, c: &str, wd: Option<&str>) -> Result<(String, String, i32), String> { self.as_ref().shell_exec(c, wd).await }
-    async fn fetch_url(&self, url: &str) -> Result<String, String> { self.as_ref().fetch_url(url).await }
-    async fn memory_save(&self, k: &str, c: &str) -> Result<(), String> { self.as_ref().memory_save(k, c).await }
-    async fn memory_search(&self, q: &str) -> Result<Vec<String>, String> { self.as_ref().memory_search(q).await }
-    async fn agent_run(&self, p: &str, mt: usize) -> Result<String, String> { self.as_ref().agent_run(p, mt).await }
+    async fn shell_exec(&self, c: &str, wd: Option<&str>) -> Result<(String, String, i32), String> {
+        self.as_ref().shell_exec(c, wd).await
+    }
+    async fn fetch_url(&self, url: &str) -> Result<String, String> {
+        self.as_ref().fetch_url(url).await
+    }
+    async fn memory_save(&self, k: &str, c: &str) -> Result<(), String> {
+        self.as_ref().memory_save(k, c).await
+    }
+    async fn memory_search(&self, q: &str) -> Result<Vec<String>, String> {
+        self.as_ref().memory_search(q).await
+    }
+    async fn agent_run(&self, p: &str, mt: usize) -> Result<String, String> {
+        self.as_ref().agent_run(p, mt).await
+    }
 }
 
 impl WorkflowEngine<NoopCallbacks> {
     pub fn new_noop() -> Self {
-        Self { callbacks: NoopCallbacks }
+        Self {
+            callbacks: NoopCallbacks,
+        }
     }
-    pub fn with_callbacks(cb: Arc<dyn WorkflowCallbacks>) -> WorkflowEngine<Arc<dyn WorkflowCallbacks>> {
+    pub fn with_callbacks(
+        cb: Arc<dyn WorkflowCallbacks>,
+    ) -> WorkflowEngine<Arc<dyn WorkflowCallbacks>> {
         WorkflowEngine { callbacks: cb }
     }
 }
@@ -137,7 +159,10 @@ impl<C: WorkflowCallbacks> WorkflowEngine<C> {
             vars.insert(step.id.clone(), result.output.clone());
 
             let duration = step_start.elapsed().as_millis() as u64;
-            results.push(StepResult { duration_ms: duration, ..result });
+            results.push(StepResult {
+                duration_ms: duration,
+                ..result
+            });
         }
 
         let total = start.elapsed().as_millis() as u64;
@@ -164,7 +189,11 @@ impl<C: WorkflowCallbacks> WorkflowEngine<C> {
                 let cmd = resolve_vars(step.params["command"].as_str().unwrap_or(""), vars);
                 let wd = step.params["working_dir"].as_str();
                 let (stdout, stderr, code) = self.callbacks.shell_exec(&cmd, wd).await?;
-                let out = if code == 0 { stdout.clone() } else { format!("exit {code}\n{stdout}\n{stderr}") };
+                let out = if code == 0 {
+                    stdout.clone()
+                } else {
+                    format!("exit {code}\n{stdout}\n{stderr}")
+                };
                 let mut exports = HashMap::new();
                 exports.insert("stdout".into(), stdout);
                 exports.insert("stderr".into(), stderr);
@@ -226,7 +255,9 @@ impl<C: WorkflowCallbacks> WorkflowEngine<C> {
                 let if_steps: Vec<Step> = serde_json::from_value(step.params["if"].clone())
                     .map_err(|e| format!("Invalid 'if' steps: {e}"))?;
                 let condition = step.condition.as_deref().unwrap_or("true");
-                let else_steps: Vec<Step> = step.params.get("else")
+                let else_steps: Vec<Step> = step
+                    .params
+                    .get("else")
                     .and_then(|e| serde_json::from_value(e.clone()).ok())
                     .unwrap_or_default();
                 let branch = if self.eval_condition(condition, vars) {
@@ -419,7 +450,11 @@ mod tests {
         struct FailingCallbacks;
         #[async_trait::async_trait]
         impl WorkflowCallbacks for FailingCallbacks {
-            async fn shell_exec(&self, _cmd: &str, _wd: Option<&str>) -> Result<(String, String, i32), String> {
+            async fn shell_exec(
+                &self,
+                _cmd: &str,
+                _wd: Option<&str>,
+            ) -> Result<(String, String, i32), String> {
                 Err("simulated failure".into())
             }
             async fn fetch_url(&self, _url: &str) -> Result<String, String> {

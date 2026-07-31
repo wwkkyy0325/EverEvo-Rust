@@ -194,9 +194,7 @@ impl RuntimeManager {
         // SystemProvided fallback: on macOS/Linux, check system Git if not bundled
         #[cfg(not(windows))]
         if !env.installed.contains(&"git".to_string()) {
-            let git_check = std::process::Command::new("which")
-                .arg("git")
-                .output();
+            let git_check = std::process::Command::new("which").arg("git").output();
             if let Ok(out) = git_check {
                 if out.status.success() {
                     let path = String::from_utf8_lossy(&out.stdout).trim().to_string();

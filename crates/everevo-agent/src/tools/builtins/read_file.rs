@@ -4,7 +4,7 @@
 //! returns content with line numbers. Scoped to workspace — refuses absolute
 //! paths outside workspace.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use everevo_core::tool::{Tool, ToolOutput};
@@ -17,6 +17,47 @@ const MAX_LINES: usize = 2000;
 /// Reads file content from the workspace.
 pub struct ReadFileTool {
     workspace_root: PathBuf,
+}
+
+/// Resolve a user-supplied relative path against the workspace root and verify
+/// it stays within bounds (no `../` escape). Returns the resolved path or an
+/// error describing the escape attempt.
+fn resolve_workspace_path(workspace_root: &Path, rel_path: &str) -> Result<PathBuf, String> {
+    let joined =
+        workspace_root.join(rel_path.trim_start_matches('/').trim_start_matches('\\'));
+
+    // Normalize: walk components to squash `.` and `..` so we can compare
+    // against the (also-normalized) root.  No filesystem access needed.
+    let normalized = normalize_path(&joined);
+    let normalized_root = normalize_path(workspace_root);
+
+    if !normalized.starts_with(&normalized_root) {
+        return Err(format!(
+            "Path traversal blocked: '{}' is outside the workspace",
+            rel_path
+        ));
+    }
+    Ok(joined)
+}
+
+/// Squash `.` and `..` components without touching the filesystem.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut components: Vec<std::path::Component<'_>> = Vec::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                // Popping the last non-ParentDir component neutralises `../`.
+                if matches!(components.last(), Some(std::path::Component::Normal(_))) {
+                    components.pop();
+                } else {
+                    components.push(c);
+                }
+            }
+            std::path::Component::CurDir => { /* skip */ }
+            other => components.push(other),
+        }
+    }
+    components.iter().collect()
 }
 
 impl ReadFileTool {
@@ -72,32 +113,47 @@ impl Tool for ReadFileTool {
     ) -> Result<ToolOutput, EverEvoError> {
         let rel_path = params["path"].as_str().unwrap_or("");
         if rel_path.is_empty() {
-            return Ok(ToolOutput { content: "path is required".into(), is_error: true });
+            return Ok(ToolOutput {
+                content: "path is required".into(),
+                is_error: true,
+                ..Default::default()
+            });
         }
 
-        // Resolve path relative to workspace; reject absolute paths
-        let target = if std::path::Path::new(rel_path).is_absolute() {
+        // Resolve path relative to workspace; reject absolute paths and traversal
+        if std::path::Path::new(rel_path).is_absolute() {
             return Ok(ToolOutput {
                 content: format!(
                     "Absolute paths are not allowed. Use a path relative to workspace: {}",
                     self.workspace_root.display()
                 ),
                 is_error: true,
+                ..Default::default()
             });
-        } else {
-            self.workspace_root.join(rel_path.trim_start_matches('/').trim_start_matches('\\'))
+        }
+        let target = match resolve_workspace_path(&self.workspace_root, rel_path) {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(ToolOutput {
+                    content: e,
+                    is_error: true,
+                    ..Default::default()
+                });
+            }
         };
 
         if !target.exists() {
             return Ok(ToolOutput {
                 content: format!("File not found: {}", target.display()),
                 is_error: true,
+                ..Default::default()
             });
         }
         if !target.is_file() {
             return Ok(ToolOutput {
                 content: format!("Not a file: {}", target.display()),
                 is_error: true,
+                ..Default::default()
             });
         }
 
@@ -107,6 +163,7 @@ impl Tool for ReadFileTool {
                 return Ok(ToolOutput {
                     content: format!("Failed to read {}: {e}", target.display()),
                     is_error: true,
+                    ..Default::default()
                 });
             }
         };
@@ -130,6 +187,7 @@ impl Tool for ReadFileTool {
                     target.display()
                 ),
                 is_error: false,
+                ..Default::default()
             });
         }
 
@@ -149,6 +207,7 @@ impl Tool for ReadFileTool {
         Ok(ToolOutput {
             content: header + &numbered.join("\n"),
             is_error: false,
+            ..Default::default()
         })
     }
 }

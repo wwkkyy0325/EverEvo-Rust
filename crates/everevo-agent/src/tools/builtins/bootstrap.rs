@@ -95,6 +95,7 @@ impl Tool for BootstrapTool {
         Ok(ToolOutput {
             content: lines.join("\n"),
             is_error: false,
+            ..Default::default()
         })
     }
 }

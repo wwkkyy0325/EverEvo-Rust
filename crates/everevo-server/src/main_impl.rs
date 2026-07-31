@@ -24,11 +24,7 @@ pub async fn run_init_llm_phase(state: &Arc<AppState>, data_dir: &std::path::Pat
     // ── Run startup self-checks ────────────────────────────────────
     println!("[init] Running startup checks (phase → Checking)");
     *state.init_phase.write().await = InitPhase::Checking;
-    let report = crate::startup_check::run_startup_check(
-        data_dir,
-        state.config.server_port,
-    )
-    .await;
+    let report = crate::startup_check::run_startup_check(data_dir, state.config.server_port).await;
     if report.fail > 0 {
         tracing::error!(fail = report.fail, "Startup check found critical issues");
     }

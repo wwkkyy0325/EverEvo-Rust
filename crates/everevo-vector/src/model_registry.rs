@@ -45,7 +45,10 @@ impl ModelRegistry {
     ///
     /// `preferred` — if Some, try to activate this model. If None or not found,
     /// falls back to the first discovered model.
-    pub fn discover(models_dir: impl Into<PathBuf>, preferred: Option<&str>) -> Result<Self, EverEvoError> {
+    pub fn discover(
+        models_dir: impl Into<PathBuf>,
+        preferred: Option<&str>,
+    ) -> Result<Self, EverEvoError> {
         let models_dir: PathBuf = models_dir.into();
         let mut models = HashMap::new();
 
@@ -53,7 +56,9 @@ impl ModelRegistry {
             if let Ok(entries) = std::fs::read_dir(&models_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if !path.is_dir() { continue; }
+                    if !path.is_dir() {
+                        continue;
+                    }
                     if let Some(meta) = Self::try_read_model(&path) {
                         models.insert(meta.name.clone(), meta);
                     }
@@ -62,9 +67,10 @@ impl ModelRegistry {
         }
 
         if models.is_empty() {
-            return Err(EverEvoError::Config(
-                format!("No ONNX models found under {}", models_dir.display())
-            ));
+            return Err(EverEvoError::Config(format!(
+                "No ONNX models found under {}",
+                models_dir.display()
+            )));
         }
 
         // Determine active model.
@@ -106,7 +112,10 @@ impl ModelRegistry {
     /// Activate a model by name. Returns the new active model metadata.
     pub fn activate(&mut self, name: &str) -> Result<ModelMeta, EverEvoError> {
         if !self.models.contains_key(name) {
-            return Err(EverEvoError::InvalidInput(format!("Model '{}' not found", name)));
+            return Err(EverEvoError::InvalidInput(format!(
+                "Model '{}' not found",
+                name
+            )));
         }
         // Deactivate previous.
         let old_name = self.active.clone();
@@ -131,7 +140,9 @@ impl ModelRegistry {
 
     fn try_read_model(dir: &Path) -> Option<ModelMeta> {
         let onnx = dir.join("model_quantized.onnx");
-        if !onnx.exists() { return None; }
+        if !onnx.exists() {
+            return None;
+        }
 
         let config_path = dir.join("config.json");
         let dim = Self::read_dim(&config_path)?;
@@ -193,7 +204,11 @@ mod tests {
         let model_dir = dir.path().join("test-model");
         std::fs::create_dir_all(&model_dir).unwrap();
         std::fs::write(model_dir.join("model_quantized.onnx"), b"fake").unwrap();
-        std::fs::write(model_dir.join("config.json"), r#"{"hidden_size": 768, "_name_or_path": "test/model"}"#).unwrap();
+        std::fs::write(
+            model_dir.join("config.json"),
+            r#"{"hidden_size": 768, "_name_or_path": "test/model"}"#,
+        )
+        .unwrap();
 
         let reg = ModelRegistry::discover(dir.path(), None).unwrap();
         assert_eq!(reg.list().len(), 1);
@@ -208,7 +223,11 @@ mod tests {
             let md = dir.path().join(name);
             std::fs::create_dir_all(&md).unwrap();
             std::fs::write(md.join("model_quantized.onnx"), b"fake").unwrap();
-            std::fs::write(md.join("config.json"), format!(r#"{{"hidden_size": {}}}"#, dim)).unwrap();
+            std::fs::write(
+                md.join("config.json"),
+                format!(r#"{{"hidden_size": {}}}"#, dim),
+            )
+            .unwrap();
         }
 
         let reg = ModelRegistry::discover(dir.path(), Some("b")).unwrap();

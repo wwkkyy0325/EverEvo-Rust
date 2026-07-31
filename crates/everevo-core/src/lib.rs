@@ -27,7 +27,7 @@ pub use context::{
 };
 pub use error::EverEvoError;
 pub use llm::{
-    FinishReason, LlmMessage, LlmProvider, LlmResponse, LlmRole, StreamEvent, ToolSchema,
+    FinishReason, ImageData, LlmMessage, LlmProvider, LlmResponse, LlmRole, StreamEvent, ToolSchema,
 };
 pub use memory::{FactType, MemoryFact, MemoryIndexEntry, ProjectionMetadata, SourcePointer};
 pub use provider::{BootstrapProvider, BootstrapStatus};

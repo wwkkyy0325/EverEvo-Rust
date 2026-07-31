@@ -184,13 +184,12 @@ impl ResourceExtractor {
             .map_err(crate::BootstrapError::Io)?;
 
         // Open the archive file
-        let archive_file = std::fs::File::open(&asset.archive_path)
-            .map_err(|e| {
-                crate::BootstrapError::Extract(format!(
-                    "Cannot open archive {}: {e}",
-                    asset.archive_path.display()
-                ))
-            })?;
+        let archive_file = std::fs::File::open(&asset.archive_path).map_err(|e| {
+            crate::BootstrapError::Extract(format!(
+                "Cannot open archive {}: {e}",
+                asset.archive_path.display()
+            ))
+        })?;
 
         // zstd streaming decoder
         let decoder = zstd::stream::Decoder::new(BufReader::new(archive_file))
@@ -205,7 +204,8 @@ impl ResourceExtractor {
             .canonicalize()
             .unwrap_or_else(|_| target_dir.clone());
 
-        for entry_result in archive.entries()
+        for entry_result in archive
+            .entries()
             .map_err(|e| crate::BootstrapError::Extract(format!("tar read error: {e}")))?
         {
             let mut entry = entry_result
@@ -334,9 +334,7 @@ impl ResourceExtractor {
         &self,
         event_tx: &broadcast::Sender<InitEvent>,
     ) -> Result<Vec<ExtractionResult>, crate::BootstrapError> {
-        let assets = self
-            .list_assets()
-            .map_err(crate::BootstrapError::Io)?;
+        let assets = self.list_assets().map_err(crate::BootstrapError::Io)?;
 
         if assets.is_empty() {
             tracing::info!("No bundled assets found — will fall back to downloader");
@@ -375,11 +373,7 @@ impl ResourceExtractor {
             }
         }
 
-        tracing::info!(
-            ok = results.len(),
-            total,
-            "Bundle extraction complete"
-        );
+        tracing::info!(ok = results.len(), total, "Bundle extraction complete");
         Ok(results)
     }
 }
@@ -498,10 +492,7 @@ mod tests {
         // Verify sentinel
         let sentinel = target.join(".extracted");
         assert!(sentinel.exists());
-        assert_eq!(
-            std::fs::read_to_string(&sentinel).unwrap().trim(),
-            "3.12.8"
-        );
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap().trim(), "3.12.8");
 
         // Verify manifest was written
         let manifest_path = data_dir.join("runtime").join(".manifest.json");
@@ -549,8 +540,7 @@ mod tests {
 
     #[test]
     fn test_has_bundled_assets_missing_dir() {
-        let extractor =
-            ResourceExtractor::new("/nonexistent/path/12345", "/tmp/data");
+        let extractor = ResourceExtractor::new("/nonexistent/path/12345", "/tmp/data");
         assert!(!extractor.has_bundled_assets());
     }
 }

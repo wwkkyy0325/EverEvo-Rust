@@ -53,9 +53,7 @@ pub async fn load_persisted_tasks(store: &TodoStore, data_dir: &std::path::Path)
             let path = entry.path();
             if path.extension().map(|e| e == "json").unwrap_or(false) {
                 // Extract session ID from filename (e.g., "abc-123.json" → "abc-123")
-                let session_id_str = path.file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("");
+                let session_id_str = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
                 if let Ok(id) = Uuid::parse_str(session_id_str) {
                     if let Ok(content) = std::fs::read_to_string(&path) {
                         if let Ok(todos) = serde_json::from_str::<Vec<TodoItem>>(&content) {
@@ -72,6 +70,11 @@ pub async fn load_persisted_tasks(store: &TodoStore, data_dir: &std::path::Path)
     }
 }
 
+/// Sentinel key for the cross-conversation ("global") task list. Todos written
+/// with `scope="global"` land here and are surfaced in every new session's
+/// context — use for long-running project tasks that span conversations.
+pub const GLOBAL_TASK_KEY: Uuid = Uuid::nil();
+
 // ── Tool ──────────────────────────────────────────────────────────────
 
 pub struct TodoWriteTool {
@@ -79,17 +82,32 @@ pub struct TodoWriteTool {
     /// Directory for persisting task lists to disk. When set, every update
     /// auto-saves the session's todo list to `persist_dir/<session_id>.json`.
     persist_dir: Option<PathBuf>,
+    /// The session this tool instance is scoped to. Injected at registry-build
+    /// time so the LLM doesn't have to pass `session_id` (which it can't know).
+    /// Defaults to nil only in tests / the shared CLI path.
+    session_id: Uuid,
 }
 
 impl TodoWriteTool {
     pub fn new(store: TodoStore) -> Self {
-        Self { store, persist_dir: None }
+        Self {
+            store,
+            persist_dir: None,
+            session_id: Uuid::nil(),
+        }
     }
 
     /// Enable disk persistence. Task lists are auto-saved to
     /// `<persist_dir>/<session_id>.json` on every update.
     pub fn with_persistence(mut self, dir: PathBuf) -> Self {
         self.persist_dir = Some(dir);
+        self
+    }
+
+    /// Bind this tool instance to a specific session — its todos are then
+    /// keyed correctly even though the LLM never supplies `session_id`.
+    pub fn with_session_id(mut self, session_id: Uuid) -> Self {
+        self.session_id = session_id;
         self
     }
 }
@@ -101,11 +119,14 @@ impl Tool for TodoWriteTool {
     }
 
     fn description(&self) -> &str {
-        "Use this tool to create and manage a structured task list for your current \
-         session. Track progress, organize complex tasks, and demonstrate thoroughness. \
-         Use proactively for multi-step tasks. Each todo needs: content (imperative form), \
-         status (pending/in_progress/completed), activeForm (present continuous form). \
-         Only ONE task in_progress at a time. Mark complete IMMEDIATELY after finishing."
+        "Use this tool to create and manage a structured task list. Track progress, \
+         organize complex tasks, and demonstrate thoroughness. Use proactively for \
+         multi-step tasks. Each todo needs: content (imperative form), status \
+         (pending/in_progress/completed), activeForm (present continuous form). \
+         Only ONE task in_progress at a time. Mark complete IMMEDIATELY after finishing. \
+         Use scope='global' for long-running project tasks that should persist across \
+         conversations (new sessions will see them); scope='session' (default) for the \
+         current conversation only."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -134,6 +155,11 @@ impl Tool for TodoWriteTool {
                         },
                         "required": ["content", "status", "activeForm"]
                     }
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["session", "global"],
+                    "description": "Where this list applies: 'session' (default, this conversation) or 'global' (persists across conversations)"
                 }
             },
             "required": ["todos"]
@@ -153,11 +179,17 @@ impl Tool for TodoWriteTool {
         let todos: Vec<TodoItem> = serde_json::from_value(params["todos"].clone())
             .map_err(|e| EverEvoError::InvalidInput(format!("Invalid todos: {e}")))?;
 
-        // Use session_id from params if provided, else default to global key
-        let session_id = params["session_id"]
-            .as_str()
-            .and_then(|s| Uuid::parse_str(s).ok())
-            .unwrap_or_else(Uuid::nil);
+        // scope: "session" (default) writes to this session's list;
+        //        "global" writes to the shared cross-conversation list.
+        let scope = params["scope"].as_str().unwrap_or("session");
+        let session_id = if scope == "global" {
+            GLOBAL_TASK_KEY
+        } else {
+            params["session_id"]
+                .as_str()
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .unwrap_or(self.session_id)
+        };
 
         let mut store = self.store.write().await;
 
@@ -196,6 +228,7 @@ impl Tool for TodoWriteTool {
                 new_todos.iter().filter(|t| t.status == "pending").count(),
             ),
             is_error: false,
+            ..Default::default()
         })
     }
 }

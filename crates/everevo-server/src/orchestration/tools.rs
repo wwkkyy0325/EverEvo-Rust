@@ -87,16 +87,21 @@ pub async fn assemble(
     ));
     registry.register(Arc::new(
         everevo_agent::tools::builtins::TodoWriteTool::new(state.todo_store.clone())
-            .with_persistence(state.config.data_dir.join("tasks")),
+            .with_persistence(state.config.data_dir.join("tasks"))
+            .with_session_id(session_id),
     ));
-    registry.register(Arc::new(everevo_agent::tools::builtins::EnterPlanModeTool::new(
-        Arc::clone(&plan_state),
-        state.config.data_dir.clone(),
-    )));
-    registry.register(Arc::new(everevo_agent::tools::builtins::ExitPlanModeTool::new(
-        Arc::clone(&plan_state),
-        state.config.data_dir.clone(),
-    )));
+    registry.register(Arc::new(
+        everevo_agent::tools::builtins::EnterPlanModeTool::new(
+            Arc::clone(&plan_state),
+            state.config.data_dir.clone(),
+        ),
+    ));
+    registry.register(Arc::new(
+        everevo_agent::tools::builtins::ExitPlanModeTool::new(
+            Arc::clone(&plan_state),
+            state.config.data_dir.clone(),
+        ),
+    ));
     registry.register(Arc::new(everevo_agent::tools::builtins::SkillTool::new(
         state.config.data_dir.join("skills"),
     )));
@@ -112,7 +117,11 @@ pub async fn assemble(
     // ── Team tool — wired with LLM + tools for real sub-agent dispatch ──
     // ── WorkflowRunner with real callbacks ──
     let wf_tool = {
-        let sandbox_provider = state.sandboxes.read().await.get(&session_id)
+        let sandbox_provider = state
+            .sandboxes
+            .read()
+            .await
+            .get(&session_id)
             .map(|sb| sb.provider());
         if let Some(sandbox) = sandbox_provider {
             // Build base_for_workflow before RealCallbacks so agent_run can use it
@@ -139,32 +148,63 @@ pub async fn assemble(
             }
             #[async_trait::async_trait]
             impl everevo_workflow::WorkflowCallbacks for RealCallbacks {
-                async fn shell_exec(&self, cmd: &str, wd: Option<&str>) -> Result<(String, String, i32), String> {
+                async fn shell_exec(
+                    &self,
+                    cmd: &str,
+                    wd: Option<&str>,
+                ) -> Result<(String, String, i32), String> {
                     let mut config = everevo_core::sandbox::ExecutionConfig::new(cmd);
-                    if let Some(dir) = wd { config = config.with_working_dir(std::path::PathBuf::from(dir)); }
-                    let result = self.sandbox.execute(&config).await.map_err(|e| e.to_string())?;
+                    if let Some(dir) = wd {
+                        config = config.with_working_dir(std::path::PathBuf::from(dir));
+                    }
+                    let result = self
+                        .sandbox
+                        .execute(&config)
+                        .await
+                        .map_err(|e| e.to_string())?;
                     Ok((result.stdout, result.stderr, result.exit_code))
                 }
                 async fn fetch_url(&self, url: &str) -> Result<String, String> {
-                    self.http.get(url).send().await.map_err(|e| format!("fetch: {e}"))?
-                        .text().await.map_err(|e| format!("read: {e}"))
+                    self.http
+                        .get(url)
+                        .send()
+                        .await
+                        .map_err(|e| format!("fetch: {e}"))?
+                        .text()
+                        .await
+                        .map_err(|e| format!("read: {e}"))
                 }
                 async fn memory_save(&self, key: &str, content: &str) -> Result<(), String> {
                     let fact = everevo_core::memory::MemoryFact {
-                        name: key.into(), description: String::new(), content: content.into(),
+                        name: key.into(),
+                        description: String::new(),
+                        content: content.into(),
                         fact_type: everevo_core::memory::FactType::Project,
-                        created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
-                        projection: everevo_core::memory::ProjectionMetadata::new("2.0.0", "workflow", vec![], 0.8),
+                        created_at: chrono::Utc::now(),
+                        updated_at: chrono::Utc::now(),
+                        projection: everevo_core::memory::ProjectionMetadata::new(
+                            "2.0.0",
+                            "workflow",
+                            vec![],
+                            0.8,
+                        ),
                         links: vec![],
                     };
                     self.facts.save(&fact).map_err(|e| e.to_string())
                 }
                 async fn memory_search(&self, query: &str) -> Result<Vec<String>, String> {
                     let facts = self.facts.load_all().map_err(|e| e.to_string())?;
-                    Ok(facts.iter().filter(|f| f.name.contains(query) || f.content.contains(query))
-                        .map(|f| format!("[{}] {}", f.name, f.description)).collect())
+                    Ok(facts
+                        .iter()
+                        .filter(|f| f.name.contains(query) || f.content.contains(query))
+                        .map(|f| format!("[{}] {}", f.name, f.description))
+                        .collect())
                 }
-                async fn agent_run(&self, prompt: &str, max_turns: usize) -> Result<String, String> {
+                async fn agent_run(
+                    &self,
+                    prompt: &str,
+                    max_turns: usize,
+                ) -> Result<String, String> {
                     let system_prompt = self.sub_ctx.build_system_prompt(prompt);
                     let messages = vec![
                         everevo_core::llm::LlmMessage::system(&system_prompt),
@@ -192,21 +232,53 @@ pub async fn assemble(
                 sub_ctx: wf_sub_ctx,
                 cancel: wf_cancel,
             });
-            everevo_agent::tools::builtins::WorkflowRunnerTool::new().with_callbacks(cb)
+            everevo_agent::tools::builtins::WorkflowRunnerTool::new()
+                .with_callbacks(cb)
+                .with_workflows_dir(state.config.data_dir.join("workflows"))
         } else {
             everevo_agent::tools::builtins::WorkflowRunnerTool::new()
+                .with_workflows_dir(state.config.data_dir.join("workflows"))
         }
     };
     registry.register(Arc::new(wf_tool));
-    let workspace = session_work_dir.clone().unwrap_or_else(|| state.config.data_dir.clone());
+
+    // ── list_workflows — lets the LLM discover saved workflows by name ──
+    registry.register(Arc::new(
+        everevo_agent::tools::builtins::ListWorkflowsTool::new(
+            state.config.data_dir.join("workflows"),
+        ),
+    ));
+
+    // ── save_workflow — lets the LLM sediment a repeatable procedure ──
+    registry.register(Arc::new(
+        everevo_agent::tools::builtins::SaveWorkflowTool::new(
+            state.config.data_dir.join("workflows"),
+        ),
+    ));
+
+    // ── promote_to_skill — lets the LLM promote a procedure into a skill ──
+    registry.register(Arc::new(everevo_agent::skill::PromoteSkillTool::new(
+        state.config.data_dir.join("skills"),
+    )));
+    let workspace = session_work_dir
+        .clone()
+        .unwrap_or_else(|| state.config.data_dir.clone());
     let code_search = everevo_agent::tools::builtins::CodeSearchTool::new(workspace.clone());
     // Start background indexing — first search will use pre-built index if ready
     code_search.start_background_index();
     registry.register(Arc::new(code_search));
-    registry.register(Arc::new(everevo_agent::tools::builtins::CodeMapTool::new(workspace.clone())));
-    registry.register(Arc::new(everevo_agent::tools::builtins::ListDirTool::new(workspace.clone())));
-    registry.register(Arc::new(everevo_agent::tools::builtins::ReadFileTool::new(workspace.clone())));
-    registry.register(Arc::new(everevo_agent::tools::builtins::WriteFileTool::new(workspace)));
+    registry.register(Arc::new(everevo_agent::tools::builtins::CodeMapTool::new(
+        workspace.clone(),
+    )));
+    registry.register(Arc::new(everevo_agent::tools::builtins::ListDirTool::new(
+        workspace.clone(),
+    )));
+    registry.register(Arc::new(everevo_agent::tools::builtins::ReadFileTool::new(
+        workspace.clone(),
+    )));
+    registry.register(Arc::new(
+        everevo_agent::tools::builtins::WriteFileTool::new(workspace),
+    ));
 
     // ── Cluster tool ──
     // Build a SubAgentPool for cluster patterns (fan_out, map_reduce, verify)
@@ -235,7 +307,11 @@ pub async fn assemble(
             Arc::clone(client),
             Arc::new(cluster_base),
             sub_ctx.clone(),
-            Arc::new(session_work_dir.clone().unwrap_or_else(|| state.config.data_dir.clone())),
+            Arc::new(
+                session_work_dir
+                    .clone()
+                    .unwrap_or_else(|| state.config.data_dir.clone()),
+            ),
         );
         Arc::new(pool)
     };
@@ -306,7 +382,14 @@ pub async fn assemble(
     // base_for_task gets a task tool clone; TaskTool itself gets a copy without it.
     let task_tool = if sub_ctx.depth < everevo_agent::subagent_context::MAX_RECURSION_DEPTH {
         let mut task_registry = ToolRegistry::new();
-        for name in &["shell", "memory", "code_map", "list_dir", "read_file", "code_search"] {
+        for name in &[
+            "shell",
+            "memory",
+            "code_map",
+            "list_dir",
+            "read_file",
+            "code_search",
+        ] {
             if let Some(tool) = base_for_task.get(name) {
                 task_registry.register(Arc::clone(tool));
             }
@@ -381,14 +464,27 @@ pub async fn assemble(
 
     registry.register(Arc::new(task_tool));
 
+    // ── cancel_task tool — lets the LLM proactively stop a sub-agent ──
+    // Shares the same handles/pending/statuses Arcs as the TaskTool above so
+    // cancellation propagates to the spawned sub-agent's CancellationToken.
+    registry.register(Arc::new(
+        everevo_agent::tools::builtins::CancelTaskTool::new(
+            task_handles.clone(),
+            task_statuses.clone(),
+            pending.clone(),
+        ),
+    ));
+
     // ── Workflow tool ──
     registry.register(Arc::new(
-        everevo_agent::tools::builtins::WorkflowTool::new(everevo_agent::tools::builtins::workflow::new_workflow_results())
-            .with_subagent_engine(
-                Arc::clone(client),
-                Arc::new(base_for_workflow),
-                Arc::new(session_work_dir.unwrap_or_else(|| state.config.data_dir.join("sandbox"))),
-            ),
+        everevo_agent::tools::builtins::WorkflowTool::new(
+            everevo_agent::tools::builtins::workflow::new_workflow_results(),
+        )
+        .with_subagent_engine(
+            Arc::clone(client),
+            Arc::new(base_for_workflow),
+            Arc::new(session_work_dir.unwrap_or_else(|| state.config.data_dir.join("sandbox"))),
+        ),
     ));
 
     // ── Team tool — wired with LLM + tools for real sub-agent dispatch ──

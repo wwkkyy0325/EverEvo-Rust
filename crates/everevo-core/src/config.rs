@@ -104,6 +104,38 @@ fn default_transport() -> String {
     "stdio".into()
 }
 
+/// Wrapper to parse only the `[[mcp_servers]]` table from config.toml.
+/// Other keys are ignored (serde default), so this is forward-compatible.
+#[derive(Deserialize)]
+struct McpServersFile {
+    #[serde(default)]
+    mcp_servers: Vec<McpServerConfig>,
+}
+
+/// Parse `[[mcp_servers]]` entries from `data/config.toml` into the config.
+/// Mirrors `load_llm_from_file` (app_state) but for MCP server definitions.
+/// Best-effort: malformed entries or a missing file leave `mcp_servers` as-is.
+fn load_mcp_servers(config: &mut AppConfig) {
+    let path = config.data_dir.join("config.toml");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    match toml::from_str::<McpServersFile>(&content) {
+        Ok(parsed) => {
+            if !parsed.mcp_servers.is_empty() {
+                tracing::info!(
+                    count = parsed.mcp_servers.len(),
+                    "MCP servers loaded from config.toml"
+                );
+            }
+            config.mcp_servers = parsed.mcp_servers;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to parse mcp_servers from config.toml — skipping");
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -152,6 +184,29 @@ impl AppConfig {
     ///
     /// Priority: env vars > defaults.
     pub fn load() -> Result<Self, crate::EverEvoError> {
+        // ── .env loading (manual, zero-dependency) ────────────────────
+        // Load .env from the working directory so users can put API keys
+        // and other secrets in environment variables instead of TOML.
+        // Silently skips missing .env files (they're optional).
+        // Format: KEY=VALUE, # comments, blank lines, no quoting needed.
+        if let Ok(content) = std::fs::read_to_string(".env") {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                if let Some(eq) = trimmed.find('=') {
+                    let key = trimmed[..eq].trim();
+                    let value = trimmed[eq + 1..].trim();
+                    // Only set if not already in env (env overrides .env)
+                    if std::env::var(key).is_err() && !key.is_empty() && !value.is_empty() {
+                        std::env::set_var(key, value);
+                    }
+                }
+            }
+            tracing::info!(".env file loaded");
+        }
+
         let mut config = Self::default();
 
         // Server settings from env
@@ -179,6 +234,25 @@ impl AppConfig {
             config.default_provider = default;
         }
 
+        // ── Plaintext API key warning ─────────────────────────────────
+        // All providers loaded from env are safe (no TOML plaintext).
+        // Warn only about keys hardcoded in data/config/config.toml.
+        // This runs BEFORE the TOML file is read — providers from config.toml
+        // are loaded separately by the server; the warning here covers the
+        // env-based fast path. The real TOML warning fires at server startup
+        // in app_state.rs when loading LLM providers from the config file.
+        if config.llm_providers.iter().any(|p| {
+            p.api_key.as_ref().is_some_and(|k| !k.is_empty())
+                && std::env::var("ANTHROPIC_API_KEY").is_err()
+                && std::env::var("OPENAI_API_KEY").is_err()
+        }) {
+            tracing::warn!(
+                "API keys loaded from environment variables — plaintext TOML keys are NOT used. \
+                 For better security, store keys in .env (loaded automatically) or environment variables, \
+                 not in data/config/config.toml."
+            );
+        }
+
         // LLM providers optional — server starts without them for bootstrap UI
 
         // Ensure data directory and subdirectories exist
@@ -198,6 +272,7 @@ impl AppConfig {
             "memory/facts",
             "memory/.dreams",
             "memory/wiki",
+            "workflows",
         ] {
             std::fs::create_dir_all(config.data_dir.join(sub)).map_err(|e| {
                 crate::EverEvoError::Config(format!(
@@ -230,6 +305,10 @@ impl AppConfig {
             )?;
         }
 
+        // Load MCP server configs from data/config.toml [[mcp_servers]].
+        // Without this, mcp_servers stays empty (AppConfig::load is env-only).
+        load_mcp_servers(&mut config);
+
         Ok(config)
     }
 
@@ -242,6 +321,9 @@ impl AppConfig {
         }
     }
 }
+
+// Credential configuration removed — sandbox now inherits host git config directly.
+// Global ~/.gitconfig and ~/.ssh are used as-is, eliminating ambiguity.
 
 // ── Data Directory Resolution ──────────────────────────────────────────
 

@@ -143,9 +143,7 @@ impl OnnxEmbedder {
     pub fn new(model_key: &str, models_dir: impl Into<PathBuf>) -> Result<Self, EverEvoError> {
         let models_dir: PathBuf = models_dir.into();
         let model_dir = models_dir.join(model_key);
-        let data_dir = models_dir
-            .parent()
-            .unwrap_or(std::path::Path::new("data"));
+        let data_dir = models_dir.parent().unwrap_or(std::path::Path::new("data"));
         let inner = if is_ort_compatible(data_dir) {
             match load_fastembed(model_key, &model_dir) {
                 Ok(e) => {
@@ -265,5 +263,47 @@ pub fn check_onnx_model(model_key: &str, models_dir: &std::path::Path) -> Option
             smoke_passed: false,
             error: Some(e.to_string()),
         }),
+    }
+}
+
+// ── Integration test — verifies real ONNX model loads and encodes ─────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::EmbeddingModel;
+
+    #[test]
+    fn test_onnx_real_model_loads_and_encodes() {
+        // Point ORT to the vendored DLL
+        let data_dir = std::path::Path::new("../../data");
+        let models_dir = data_dir.join("models");
+        let model_key = "all-MiniLM-L6-v2";
+
+        // Skip if model files are missing (CI / fresh checkout)
+        if !models_dir
+            .join(model_key)
+            .join("model_quantized.onnx")
+            .exists()
+        {
+            eprintln!("Model not found — skipping ONNX integration test");
+            return;
+        }
+
+        configure_ort_dylib(data_dir);
+        let embedder =
+            OnnxEmbedder::new(model_key, &models_dir).expect("Failed to create OnnxEmbedder");
+        assert!(embedder.is_loaded(), "ONNX model should be loaded");
+
+        // Smoke test: encode a short text, verify non-zero
+        let vec = embedder
+            .encode("hello world")
+            .expect("Encoding should succeed");
+        assert_eq!(vec.len(), 384, "Vector dim should match model hidden_size");
+        let has_nonzero = vec.iter().any(|&x| x.abs() > 1e-6);
+        assert!(
+            has_nonzero,
+            "Vector should not be all zeros (DummyEmbedder fallback)"
+        );
     }
 }

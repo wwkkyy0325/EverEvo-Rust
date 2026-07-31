@@ -320,8 +320,10 @@ impl InitPipeline {
 
         // ── Phase 1.5: Try bundled assets first (local extraction, seconds) ──
         if !self.resource_dir.as_os_str().is_empty() {
-            let extractor =
-                crate::resource_extractor::ResourceExtractor::new(&self.resource_dir, &self.data_dir);
+            let extractor = crate::resource_extractor::ResourceExtractor::new(
+                &self.resource_dir,
+                &self.data_dir,
+            );
             if extractor.has_bundled_assets() {
                 tracing::info!(
                     dir = %self.resource_dir.display(),

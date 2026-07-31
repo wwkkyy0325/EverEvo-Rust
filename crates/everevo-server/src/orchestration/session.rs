@@ -24,7 +24,7 @@ pub async fn resolve_and_load(
                 let level = super::super::routes::chat::resolve_permission(
                     &state.config.default_permission_level,
                 );
-                let _ = state.create_sandbox(id, level).await;
+                let _ = state.create_sandbox(id, level, None).await;
             }
             id
         }
@@ -37,7 +37,7 @@ pub async fn resolve_and_load(
             let level = super::super::routes::chat::resolve_permission(
                 &state.config.default_permission_level,
             );
-            let _ = state.create_sandbox(row.id, level).await;
+            let _ = state.create_sandbox(row.id, level, None).await;
             row.id
         }
     };

@@ -78,7 +78,10 @@ pub struct SessionMeta {
 
 impl Default for SessionMeta {
     fn default() -> Self {
-        Self { mode: SessionMode::Interactive, state: SessionState::Idle }
+        Self {
+            mode: SessionMode::Interactive,
+            state: SessionState::Idle,
+        }
     }
 }
 

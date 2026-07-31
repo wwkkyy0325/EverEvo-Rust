@@ -115,22 +115,42 @@ impl TieredSandbox {
             .current_dir(working_dir)
             .kill_on_drop(true)
             .stdin(std::process::Stdio::null());
+        // PATH: sandbox runtimes first (higher priority), host fallback last
+        let host_path = std::env::var("PATH").unwrap_or_default();
         let mut path_parts: Vec<String> = self
             .config
             .injected_paths
             .iter()
             .map(|p| p.display().to_string())
             .collect();
-        path_parts.push(std::env::var("PATH").unwrap_or_default());
+        // Also add sandbox-local bin for any per-session tools
+        let sandbox_bin = self.config.sandbox_root.join(".local").join("bin");
+        path_parts.push(sandbox_bin.display().to_string());
+        path_parts.push(host_path);
         cmd.env(
             "PATH",
             path_parts.join(if cfg!(windows) { ";" } else { ":" }),
         );
+        // Inject per-command and per-sandbox env vars
         for (k, v) in &ec.env_vars {
             cmd.env(k, v);
         }
         for (k, v) in &self.config.injected_env {
             cmd.env(k, v);
+        }
+        // ── Git / GitHub: prevent interactive prompts and pass tokens ──
+        // gh CLI on Windows sometimes fails with "keyring" errors when the
+        // credential manager is unreachable from a non-interactive process.
+        // Piping the host's GH_TOKEN / GITHUB_TOKEN through avoids the keyring
+        // lookup entirely.  Also disable prompting so a missing token fails
+        // fast instead of hanging.
+        cmd.env("GIT_TERMINAL_PROMPT", "0");
+        cmd.env("GIT_ASKPASS", "echo");
+        if let Ok(token) = std::env::var("GH_TOKEN") {
+            cmd.env("GH_TOKEN", &token);
+        }
+        if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+            cmd.env("GITHUB_TOKEN", &token);
         }
         cmd
     }

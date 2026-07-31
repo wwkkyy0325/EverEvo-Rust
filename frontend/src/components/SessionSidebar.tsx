@@ -195,6 +195,13 @@ function SessionRow({
       {/* Preview text */}
       <p className="text-[10px] text-muted-foreground truncate mt-0.5">{preview}</p>
 
+      {/* Workspace indicator */}
+      {(session as any).workspace_dir ? (
+        <p className="text-[9px] text-muted-foreground/50 truncate mt-0.5">📁 {(session as any).workspace_dir}</p>
+      ) : (
+        <p className="text-[9px] text-muted-foreground/40 mt-0.5">🏖️ sandbox</p>
+      )}
+
       {/* Time row */}
       <div className="flex gap-2 mt-1 text-[9px] text-muted-foreground/60">
         <span>{createdAt}</span>

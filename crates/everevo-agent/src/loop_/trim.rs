@@ -75,6 +75,20 @@ pub(crate) fn snip_low_value_messages(messages: &mut Vec<LlmMessage>) -> usize {
 
 // ── Layer 2: Tool output truncation ──────────────────────────────────────
 
+/// Floor a byte index to the nearest valid UTF-8 char boundary (≤ the
+/// requested position). Equivalent to `str::floor_char_boundary` (stable
+/// since 1.91), kept as a free function for MSRV 1.80 compatibility.
+fn floor_char_boundary(s: &str, pos: usize) -> usize {
+    let pos = pos.min(s.len());
+    let mut p = pos;
+    // UTF-8 continuation bytes have the pattern 0b10xxxxxx. Walk backwards
+    // until we're at the start of a character.
+    while p > 0 && (s.as_bytes()[p] & 0xC0) == 0x80 {
+        p -= 1;
+    }
+    p
+}
+
 /// Truncate a tool output to a maximum character count.
 /// Keeps head and tail — the most informative parts.
 pub(crate) fn truncate_output(output: &str, max_chars: usize) -> String {
@@ -83,15 +97,22 @@ pub(crate) fn truncate_output(output: &str, max_chars: usize) -> String {
     }
     let head = max_chars * 3 / 4; // 75% head
     let tail = max_chars - head; // 25% tail
+
+    // Floor to a valid UTF-8 char boundary — `head` and `tail` are byte
+    // offsets and may land inside a multi-byte character. Slicing at an
+    // invalid boundary panics the agent loop (observed with CJK text where
+    // 3-byte chars straddle the 3000-byte cutoff).
+    let head_byte = floor_char_boundary(output, head.min(output.len()));
+    let tail_start = floor_char_boundary(output, output.len().saturating_sub(tail));
+
     let mut result = String::with_capacity(max_chars + 100);
-    result.push_str(&output[..head.min(output.len())]);
+    result.push_str(&output[..head_byte]);
     result.push_str(&format!(
         "\n\n... [truncated: {} total chars, showing first {} + last {}] ...\n\n",
         output.len(),
-        head,
-        tail
+        head_byte,
+        output.len() - tail_start,
     ));
-    let tail_start = output.len().saturating_sub(tail);
     result.push_str(&output[tail_start..]);
     result
 }
@@ -263,6 +284,7 @@ mod tests {
                 thinking: None,
                 tool_calls: Some(vec![]),
                 tool_call_id: None,
+                images: Vec::new(),
             },
             LlmMessage {
                 role: LlmRole::User,
@@ -270,6 +292,7 @@ mod tests {
                 thinking: None,
                 tool_calls: None,
                 tool_call_id: Some("t1".into()),
+                images: Vec::new(),
             },
             LlmMessage::assistant("after tool"),
         ];
@@ -289,6 +312,7 @@ mod tests {
                 thinking: None,
                 tool_calls: Some(vec![]),
                 tool_call_id: None,
+                images: Vec::new(),
             },
             LlmMessage {
                 role: LlmRole::User,
@@ -296,6 +320,7 @@ mod tests {
                 thinking: None,
                 tool_calls: None,
                 tool_call_id: Some("t1".into()),
+                images: Vec::new(),
             },
         ];
         let removed = snip_low_value_messages(&mut msgs);
@@ -314,6 +339,7 @@ mod tests {
                 thinking: None,
                 tool_calls: Some(vec![]),
                 tool_call_id: None,
+                images: Vec::new(),
             },
             LlmMessage {
                 role: LlmRole::User,
@@ -321,6 +347,7 @@ mod tests {
                 thinking: None,
                 tool_calls: None,
                 tool_call_id: Some("t1".into()),
+                images: Vec::new(),
             },
         ];
         let removed = snip_low_value_messages(&mut msgs);
@@ -348,6 +375,7 @@ mod tests {
                 thinking: None,
                 tool_calls: Some(vec![]), // has tool_calls
                 tool_call_id: None,
+                images: Vec::new(),
             },
             LlmMessage::user("recent1"),
             LlmMessage::assistant("recent2"),
@@ -380,5 +408,18 @@ mod tests {
         assert!(result.contains("[truncated:"));
         assert!(result.starts_with('A'));
         assert!(result.ends_with('A'));
+    }
+
+    #[test]
+    fn test_truncate_output_cjk_boundary() {
+        // Reproduces the crash: 3000-byte cutoff falls inside '持' (3-byte
+        // UTF-8 char at bytes 2999-3002). floor_char_boundary prevents panic.
+        let cjk_prefix = "中".repeat(1000); // 3000 bytes (3 bytes each)
+        let cjk_with_bad_cut = format!("{}{}国", cjk_prefix, "持".repeat(100));
+        // Force the cutoff to fall in a bad spot
+        let result = truncate_output(&cjk_with_bad_cut, 3000);
+        // Must not panic, and must contain valid UTF-8
+        assert!(result.contains("[truncated:"));
+        std::str::from_utf8(result.as_bytes()).expect("output must be valid UTF-8");
     }
 }

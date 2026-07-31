@@ -38,9 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cli = Cli::parse();
-    let target = cli
-        .target
-        .unwrap_or_else(everevo_bootstrap::detect_target);
+    let target = cli.target.unwrap_or_else(everevo_bootstrap::detect_target);
 
     tracing::info!(%target, output = %cli.output.display(), "EverEvo bundler starting");
 
@@ -48,8 +46,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let filtered: Vec<&Asset> = assets
         .iter()
         .filter(|a| {
-            if cli.skip_git && a.key == "git" { return false; }
-            if cli.skip_reranker_cn && a.key == "reranker-cn" { return false; }
+            if cli.skip_git && a.key == "git" {
+                return false;
+            }
+            if cli.skip_reranker_cn && a.key == "reranker-cn" {
+                return false;
+            }
             !a.is_system_provided()
         })
         .collect();
@@ -65,13 +67,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load existing manifest for resume support
     let manifest_path = cli.output.join("manifest.json");
-    let mut manifest: serde_json::Map<String, serde_json::Value> =
-        if manifest_path.exists() {
-            let data = std::fs::read_to_string(&manifest_path).unwrap_or_default();
-            serde_json::from_str(&data).unwrap_or_default()
-        } else {
-            serde_json::Map::new()
-        };
+    let mut manifest: serde_json::Map<String, serde_json::Value> = if manifest_path.exists() {
+        let data = std::fs::read_to_string(&manifest_path).unwrap_or_default();
+        serde_json::from_str(&data).unwrap_or_default()
+    } else {
+        serde_json::Map::new()
+    };
 
     let mut success = 0usize;
     let mut skipped = 0usize;
@@ -154,11 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 // ── Download helpers ────────────────────────────────────────────────────
 
 /// Try downloading a URL to a file, with one retry.
-async fn download_file(
-    client: &reqwest::Client,
-    url: &str,
-    dest: &Path,
-) -> Result<u64, String> {
+async fn download_file(client: &reqwest::Client, url: &str, dest: &Path) -> Result<u64, String> {
     for attempt in 0..2 {
         match try_download(client, url, dest).await {
             Ok(size) => return Ok(size),
@@ -172,11 +169,7 @@ async fn download_file(
     unreachable!()
 }
 
-async fn try_download(
-    client: &reqwest::Client,
-    url: &str,
-    dest: &Path,
-) -> Result<u64, String> {
+async fn try_download(client: &reqwest::Client, url: &str, dest: &Path) -> Result<u64, String> {
     let response = client
         .get(url)
         .send()
@@ -284,15 +277,14 @@ async fn bundle_model(
 fn extract_zip(zip_path: &Path, dest: &Path) -> Result<(), String> {
     let file = std::fs::File::open(zip_path).map_err(|e| format!("open zip: {e}"))?;
     let reader = BufReader::new(file);
-    let mut archive =
-        zip::ZipArchive::new(reader).map_err(|e| format!("read zip: {e}"))?;
+    let mut archive = zip::ZipArchive::new(reader).map_err(|e| format!("read zip: {e}"))?;
 
-    let canonical_dest = dest
-        .canonicalize()
-        .unwrap_or_else(|_| dest.to_path_buf());
+    let canonical_dest = dest.canonicalize().unwrap_or_else(|_| dest.to_path_buf());
 
     for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).map_err(|e| format!("zip entry {i}: {e}"))?;
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| format!("zip entry {i}: {e}"))?;
         let name = entry.name().to_string();
 
         // Strip top-level directory (most ZIPs have a single root dir)
@@ -341,12 +333,11 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> Result<(), String> {
 // ── tar.zst creation ────────────────────────────────────────────────────
 
 fn create_tar_zst(input_dir: &Path, output_path: &Path) -> Result<u64, String> {
-    let out_file =
-        std::fs::File::create(output_path).map_err(|e| format!("create: {e}"))?;
+    let out_file = std::fs::File::create(output_path).map_err(|e| format!("create: {e}"))?;
 
     // zstd compression level 3 — good balance of speed/size
-    let encoder = zstd::stream::Encoder::new(out_file, 3)
-        .map_err(|e| format!("zstd encoder: {e}"))?;
+    let encoder =
+        zstd::stream::Encoder::new(out_file, 3).map_err(|e| format!("zstd encoder: {e}"))?;
 
     let mut tar_builder = tar::Builder::new(encoder);
     add_dir_to_tar(&mut tar_builder, input_dir, "")?;
@@ -355,13 +346,10 @@ fn create_tar_zst(input_dir: &Path, output_path: &Path) -> Result<u64, String> {
     let encoder = tar_builder
         .into_inner()
         .map_err(|e| format!("tar finish: {e}"))?;
-    encoder
-        .finish()
-        .map_err(|e| format!("zstd finish: {e}"))?;
+    encoder.finish().map_err(|e| format!("zstd finish: {e}"))?;
 
     // Read back to get final compressed size
-    let metadata = std::fs::metadata(output_path)
-        .map_err(|e| format!("metadata: {e}"))?;
+    let metadata = std::fs::metadata(output_path).map_err(|e| format!("metadata: {e}"))?;
     Ok(metadata.len())
 }
 
@@ -380,7 +368,13 @@ fn add_dir_to_tar<W: Write>(
                 .unwrap_or("unknown")
                 .to_string()
         } else {
-            format!("{}/{}", prefix, path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown"))
+            format!(
+                "{}/{}",
+                prefix,
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+            )
         };
 
         if path.is_dir() {

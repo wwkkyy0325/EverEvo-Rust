@@ -91,7 +91,7 @@ impl Tool for SkillTool {
                 return Ok(ToolOutput {
                     content: "No skills found. Place SKILL.md files in data/skills/<name>/ to create skills.".into(),
                     is_error: false,
-                });
+                 ..Default::default() });
             }
             return Ok(ToolOutput {
                 content: format!(
@@ -103,6 +103,7 @@ impl Tool for SkillTool {
                         .join("\n")
                 ),
                 is_error: false,
+                ..Default::default()
             });
         }
 
@@ -117,6 +118,7 @@ impl Tool for SkillTool {
                 Ok(ToolOutput {
                     content: header,
                     is_error: false,
+                    ..Default::default()
                 })
             }
             None => Ok(ToolOutput {
@@ -124,6 +126,7 @@ impl Tool for SkillTool {
                     "Skill '{skill}' not found. Use Skill(action='list') to see available skills."
                 ),
                 is_error: true,
+                ..Default::default()
             }),
         }
     }

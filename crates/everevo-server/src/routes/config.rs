@@ -48,6 +48,10 @@ pub struct AppSettings {
     pub llm: Option<Vec<LlmProviderConfig>>,
     #[serde(default)]
     pub routing: Option<RoutingSettings>,
+    /// MCP server definitions — round-tripped through the config UI so manual
+    /// edits to `[[mcp_servers]]` in config.toml aren't destroyed on save.
+    #[serde(default)]
+    pub mcp_servers: Option<Vec<everevo_core::config::McpServerConfig>>,
 }
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -85,6 +89,7 @@ async fn put_config(
     let merged = AppSettings {
         llm: body.llm,
         routing: existing.routing, // keep routing intact
+        mcp_servers: body.mcp_servers.or(existing.mcp_servers), // round-trip MCP
     };
     let path = state.config.data_dir.join("config.toml");
     let toml_str = toml::to_string_pretty(&merged).unwrap_or_default();
@@ -312,3 +317,5 @@ async fn get_balance(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
 
     Json(serde_json::json!({ "balances": results }))
 }
+
+// Credential config removed — sandbox inherits host git config directly.

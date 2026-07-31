@@ -60,6 +60,7 @@ impl Tool for ShellTool {
             return Ok(ToolOutput {
                 content: "cancelled".into(),
                 is_error: true,
+                ..Default::default()
             });
         }
 
@@ -75,6 +76,20 @@ impl Tool for ShellTool {
             config = config.with_working_dir(dir);
         }
 
+        // ── Git commit/push guard: always confirm destructive git operations ──
+        if is_git_destructive(command) {
+            return Ok(ToolOutput {
+                content: format!(
+                    "⚠️ 此 Git 操作需要你的确认。\n\n命令: {command}\n\
+                     这将修改仓库历史或远程分支。\n\n\
+                     请回复「确认执行」以继续，或「拒绝」以取消。\n\
+                     (GitGuard: reply with \"确认执行\" to proceed)",
+                ),
+                is_error: false,
+                ..Default::default()
+            });
+        }
+
         // Permission gate — check before execution
         let result = self.sandbox.execute(&config).await?;
 
@@ -88,6 +103,7 @@ impl Tool for ShellTool {
                      (ConfirmRequired: use `confirmed: true` to proceed)",
                 ),
                 is_error: false,
+                ..Default::default()
             });
         }
 
@@ -111,27 +127,93 @@ impl Tool for ShellTool {
             return Ok(ToolOutput {
                 content: format!("Timeout after {timeout_secs}s\n\n{content}"),
                 is_error: true,
+                ..Default::default()
             });
         }
         match result.exit_code {
             0 => Ok(ToolOutput {
                 content,
                 is_error: false,
+                ..Default::default()
             }),
             126 => Ok(ToolOutput {
                 // Permission denied by sandbox
                 content: format!("Permission denied (exit 126)\n\n{content}"),
                 is_error: true,
+                ..Default::default()
             }),
             127 => Ok(ToolOutput {
                 // Command not found
                 content: format!("Command not found (exit 127)\n\n{content}"),
                 is_error: true,
+                ..Default::default()
             }),
             _ => Ok(ToolOutput {
                 content: format!("Exit code {}\n\n{content}", result.exit_code),
                 is_error: true,
+                ..Default::default()
             }),
         }
+    }
+}
+
+// ── Git Commit Guard ──────────────────────────────────────────────────────
+
+/// Check if a command is a destructive git operation that should require
+/// explicit user confirmation. Based on Claude Code community best practice:
+/// deny `Bash(git commit:*)` and `Bash(git push:*)` by default.
+fn is_git_destructive(command: &str) -> bool {
+    let cmd = command.trim();
+    if cmd.starts_with("git commit") {
+        return true;
+    }
+    if cmd.starts_with("git push") {
+        return true;
+    }
+    // git tag (creating, not listing)
+    if cmd.starts_with("git tag") && !cmd.contains("-l") && !cmd.contains("--list") {
+        return true;
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_git_commit_flagged() {
+        assert!(is_git_destructive("git commit -m 'test'"));
+        assert!(is_git_destructive("git commit --amend"));
+    }
+
+    #[test]
+    fn test_git_push_flagged() {
+        assert!(is_git_destructive("git push origin main"));
+        assert!(is_git_destructive("git push --force"));
+    }
+
+    #[test]
+    fn test_git_tag_flagged() {
+        assert!(is_git_destructive("git tag v1.0"));
+    }
+
+    #[test]
+    fn test_git_tag_list_not_flagged() {
+        assert!(!is_git_destructive("git tag -l"));
+    }
+
+    #[test]
+    fn test_git_status_not_flagged() {
+        assert!(!is_git_destructive("git status"));
+        assert!(!is_git_destructive("git log"));
+        assert!(!is_git_destructive("git diff"));
+        assert!(!is_git_destructive("git branch"));
+    }
+
+    #[test]
+    fn test_non_git_not_flagged() {
+        assert!(!is_git_destructive("cargo build"));
+        assert!(!is_git_destructive("npm test"));
     }
 }

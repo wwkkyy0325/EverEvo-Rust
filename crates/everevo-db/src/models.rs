@@ -13,6 +13,8 @@ pub struct SessionRow {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub metadata: String, // JSON string
+    /// Per-session workspace directory (NULL = use sandbox default).
+    pub workspace_dir: Option<String>,
 }
 
 /// A message row in the `messages` table.

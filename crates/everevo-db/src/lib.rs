@@ -38,10 +38,13 @@ impl Database {
                 .create_if_missing(true)
                 .foreign_keys(true)
                 .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-                .busy_timeout(std::time::Duration::from_secs(5))
+                .busy_timeout(std::time::Duration::from_secs(30))
         };
 
-        let pool = SqlitePool::connect_with(options)
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(6)
+            .acquire_timeout(std::time::Duration::from_secs(15))
+            .connect_with(options)
             .await
             .map_err(|e| EverEvoError::Database(format!("Failed to connect: {e}")))?;
 
@@ -49,6 +52,25 @@ impl Database {
             .run(&pool)
             .await
             .map_err(|e| EverEvoError::Database(format!("Migration failed: {e}")))?;
+
+        // Tune WAL for multi-writer safety under burst writes (fact upsert +
+        // message save + telemetry inserts in the same agent turn).
+        //
+        // synchronous=NORMAL is safe in WAL mode and ~20× faster for multi-
+        // statement transactions than FULL (default). The WAL itself protects
+        // against corruption on power loss.
+        sqlx::query("PRAGMA synchronous=NORMAL")
+            .execute(&pool)
+            .await
+            .ok();
+        // Raise WAL autocheckpoint threshold to reduce snapshot-invalidation
+        // frequency (BUSY_SNAPSHOT 517). Default is 1000 pages (~4 MB); 10000
+        // pages (~40 MB) means checkpoints happen 10× less often, giving
+        // concurrent writers much more time to finish before the WAL is pruned.
+        sqlx::query("PRAGMA wal_autocheckpoint=10000")
+            .execute(&pool)
+            .await
+            .ok();
 
         Ok(Self { pool })
     }

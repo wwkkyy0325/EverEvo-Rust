@@ -36,6 +36,9 @@ pub enum EverEvoError {
     #[error("RAG pipeline error: {0}")]
     Rag(String),
 
+    #[error("Network error: {0}")]
+    Network(String),
+
     #[error("llmwiki error: {0}")]
     Llmwiki(String),
 
@@ -72,6 +75,7 @@ impl EverEvoError {
             KnowledgeGraph(s) => KnowledgeGraph(format!("{s} [{ctx}]")),
             Vector(s) => Vector(format!("{s} [{ctx}]")),
             Rag(s) => Rag(format!("{s} [{ctx}]")),
+            Network(s) => Network(format!("{s} [{ctx}]")),
             Llmwiki(s) => Llmwiki(format!("{s} [{ctx}]")),
             NotFound(s) => NotFound(format!("{s} [{ctx}]")),
             InvalidInput(s) => InvalidInput(format!("{s} [{ctx}]")),

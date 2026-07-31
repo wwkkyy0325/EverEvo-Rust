@@ -33,7 +33,11 @@ pub struct SlashCommand {
 
 impl SlashCommand {
     pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
-        Self { name: name.into(), description: description.into(), args_hint: None }
+        Self {
+            name: name.into(),
+            description: description.into(),
+            args_hint: None,
+        }
     }
 
     pub fn with_args(mut self, hint: impl Into<String>) -> Self {
@@ -68,7 +72,9 @@ pub struct SlashCommandRegistry {
 
 impl SlashCommandRegistry {
     pub fn new() -> Self {
-        Self { commands: Vec::new() }
+        Self {
+            commands: Vec::new(),
+        }
     }
 
     /// Register a command. Later registrations override earlier ones with the same name.
@@ -98,7 +104,7 @@ impl SlashCommandRegistry {
             return None;
         }
         let rest = &trimmed[1..]; // strip '/'
-        // Extract command name (up to first space or end)
+                                  // Extract command name (up to first space or end)
         let (cmd_name, remainder) = match rest.find(' ') {
             Some(pos) => (&rest[..pos], rest[pos..].trim_start()),
             None => (rest, ""),
@@ -137,7 +143,10 @@ mod tests {
         reg.register(SlashCommand::new("plan", "Plan mode"));
 
         assert_eq!(reg.parse("/help").map(|(n, r)| (n, r)), Some(("help", "")));
-        assert_eq!(reg.parse("/plan my task").map(|(n, r)| (n, r)), Some(("plan", "my task")));
+        assert_eq!(
+            reg.parse("/plan my task").map(|(n, r)| (n, r)),
+            Some(("plan", "my task"))
+        );
     }
 
     #[test]

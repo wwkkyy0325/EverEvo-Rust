@@ -25,7 +25,10 @@ async fn query_sparql(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SparqlRequest>,
 ) -> Result<Json<serde_json::Value>, KgError> {
-    let kg = state.knowledge_graph.read().unwrap_or_else(|e| e.into_inner());
+    let kg = state
+        .knowledge_graph
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     let rows = kg.query_sparql(&req.query)?;
     Ok(Json(
         serde_json::json!({ "results": rows, "count": rows.len() }),
@@ -36,7 +39,10 @@ async fn get_entity(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, KgError> {
-    let kg = state.knowledge_graph.read().unwrap_or_else(|e| e.into_inner());
+    let kg = state
+        .knowledge_graph
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
 
     // Search by name or ID
     let entities = kg.search(&name);

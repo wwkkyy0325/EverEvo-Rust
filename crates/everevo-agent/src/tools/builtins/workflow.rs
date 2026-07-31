@@ -85,13 +85,15 @@ impl WorkflowTool {
 #[async_trait]
 impl Tool for WorkflowTool {
     fn name(&self) -> &str {
-        "Workflow"
+        "parallel_agents"
     }
 
     fn description(&self) -> &str {
-        "Execute multiple tasks in parallel using sub-agents. Each task runs \
-         independently with tool access. Results are aggregated. Use for complex \
-         multi-step work where tasks can run in parallel."
+        "Run multiple independent tasks in PARALLEL via sub-agents (or SEQUENTIAL \
+         mode to chain context). Each task gets full tool access and an isolated \
+         context. Distinct from `workflow_run` (which runs a JSON step pipeline) — \
+         this tool is for fan-out of whole sub-agent tasks. Use when 2+ tasks are \
+         independent and benefit from isolated reasoning."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -134,6 +136,7 @@ impl Tool for WorkflowTool {
             return Ok(ToolOutput {
                 content: "No tasks provided.".into(),
                 is_error: false,
+                ..Default::default()
             });
         }
 
@@ -152,7 +155,7 @@ impl Tool for WorkflowTool {
             return Ok(ToolOutput {
                 content: format!("Workflow plan ({} tasks):\n\n{plan}\n\n*Sub-agent engine not wired — tasks logged only.*", tasks.len()),
                 is_error: false,
-            });
+             ..Default::default() });
         };
 
         // ── Real sub-agent execution ──────────────────────────────
@@ -192,6 +195,7 @@ impl Tool for WorkflowTool {
             return Ok(ToolOutput {
                 content: results.join("\n\n---\n\n"),
                 is_error: false,
+                ..Default::default()
             });
         }
 
@@ -263,7 +267,6 @@ impl Tool for WorkflowTool {
                     }
                 }
             });
-
         }
 
         Ok(ToolOutput {
@@ -272,6 +275,7 @@ impl Tool for WorkflowTool {
                  max {max_concurrent} concurrent). Results will appear as they complete.",
             ),
             is_error: false,
+            ..Default::default()
         })
     }
 }

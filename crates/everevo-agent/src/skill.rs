@@ -27,10 +27,12 @@ use crate::memory::frontmatter::parse_frontmatter;
 
 /// Content for built-in skills, embedded in the binary at compile time.
 /// Each entry: (directory_name, "SKILL.md content").
-const BUILTIN_SKILLS: &[(&str, &str)] = &[(
-    "anti-fixation",
-    include_str!("../builtin-skills/anti-fixation/SKILL.md"),
-)];
+const BUILTIN_SKILLS: &[(&str, &str)] = &[
+    ("anti-fixation", include_str!("../builtin-skills/anti-fixation/SKILL.md")),
+    ("code-review", include_str!("../builtin-skills/code-review/SKILL.md")),
+    ("debug-error", include_str!("../builtin-skills/debug-error/SKILL.md")),
+    ("write-tests", include_str!("../builtin-skills/write-tests/SKILL.md")),
+];
 
 // ── Skill ─────────────────────────────────────────────────────────────────
 
@@ -239,6 +241,112 @@ fn parse_list_value(raw: &str) -> Vec<String> {
 }
 
 /// Parse a SKILL.md file into a `Skill`.
+/// Write a `SKILL.md` to the skills library, promoting a repeatable procedure
+/// into a discoverable skill (auto-surfaced via `when_to_use` triggers once the
+/// registry reloads — next session start or a future `rescan`).
+pub fn promote_to_skill(
+    skills_dir: &std::path::Path,
+    name: &str,
+    description: &str,
+    when_to_use: &[String],
+    body: &str,
+) -> Result<std::path::PathBuf, everevo_core::EverEvoError> {
+    let safe: String = name
+        .chars()
+        .filter(|c| c.is_alphanumeric() || matches!(c, '-' | '_'))
+        .collect();
+    if safe.is_empty() {
+        return Err(everevo_core::EverEvoError::InvalidInput(format!(
+            "invalid skill name: {name}"
+        )));
+    }
+    let dir = skills_dir.join(&safe);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| everevo_core::EverEvoError::Internal(format!("create skill dir: {e}")))?;
+    let triggers = when_to_use
+        .iter()
+        .map(|t| format!("  - {t}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content = format!(
+        "---\nname: {safe}\ndescription: {description}\nwhen_to_use:\n{triggers}\n---\n\n{body}\n"
+    );
+    let path = dir.join("SKILL.md");
+    std::fs::write(&path, content)
+        .map_err(|e| everevo_core::EverEvoError::Internal(format!("write SKILL.md: {e}")))?;
+    tracing::info!(name = %safe, path = %path.display(), "Skill promoted to library");
+    Ok(path)
+}
+
+/// Tool for the LLM to promote a repeatable procedure into a discoverable skill.
+pub struct PromoteSkillTool {
+    skills_dir: std::path::PathBuf,
+}
+
+impl PromoteSkillTool {
+    pub fn new(skills_dir: std::path::PathBuf) -> Self {
+        Self { skills_dir }
+    }
+}
+
+#[async_trait::async_trait]
+impl everevo_core::tool::Tool for PromoteSkillTool {
+    fn name(&self) -> &str {
+        "promote_to_skill"
+    }
+    fn description(&self) -> &str {
+        "Promote a repeatable procedure into a discoverable skill (writes \
+         data/skills/<name>/SKILL.md). Skills auto-surface in future sessions via \
+         their `when_to_use` triggers. Use for procedures you keep repeating and \
+         want the agent to recall automatically. Parameters: name, description, \
+         when_to_use (trigger phrases), body (the skill instructions)."
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "description": {"type": "string"},
+                "when_to_use": {"type": "array", "items": {"type": "string"}, "description": "trigger phrases"},
+                "body": {"type": "string", "description": "the skill instructions (markdown)"}
+            },
+            "required": ["name", "description", "when_to_use", "body"]
+        })
+    }
+    fn risk_level(&self) -> everevo_core::types::RiskLevel {
+        everevo_core::types::RiskLevel::Low
+    }
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        _cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<everevo_core::tool::ToolOutput, everevo_core::EverEvoError> {
+        let name = params["name"]
+            .as_str()
+            .ok_or_else(|| everevo_core::EverEvoError::InvalidInput("name is required".into()))?;
+        let description = params["description"].as_str().unwrap_or("");
+        let body = params["body"].as_str().unwrap_or("");
+        let when_to_use: Vec<String> = params["when_to_use"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let path = promote_to_skill(&self.skills_dir, name, description, &when_to_use, body)?;
+        Ok(everevo_core::tool::ToolOutput {
+            content: format!(
+                "Promoted skill '{}' → {}. It will auto-surface via its triggers in future sessions (registry reloads on restart).",
+                name,
+                path.display()
+            ),
+            is_error: false,
+            ..Default::default()
+        })
+    }
+}
+
 fn parse_skill_md(content: &str, path: &Path) -> Result<Skill, String> {
     let (fm, body) = parse_frontmatter(content).ok_or("No frontmatter found")?;
 
@@ -457,6 +565,34 @@ Body here.";
     }
 
     #[test]
+    fn test_promote_to_skill_writes_valid_skill_md() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = promote_to_skill(
+            dir.path(),
+            "deploy-app",
+            "Deploys the app",
+            &["user asks to deploy".into(), "release the app".into()],
+            "Run: npm run deploy",
+        )
+        .unwrap();
+        assert!(path.ends_with("deploy-app/SKILL.md"));
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("name: deploy-app"));
+        assert!(written.contains("user asks to deploy"));
+        assert!(written.contains("Run: npm run deploy"));
+        // Round-trip: parse_skill_md can read it back.
+        let skill = parse_skill_md(&written, &path).unwrap();
+        assert_eq!(skill.name, "deploy-app");
+        assert_eq!(skill.when_to_use.len(), 2);
+    }
+
+    #[test]
+    fn test_promote_to_skill_rejects_bad_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(promote_to_skill(dir.path(), "!!!", "x", &[], "x").is_err());
+    }
+
+    #[test]
     fn test_registry_get_by_name() {
         let skills = vec![Skill {
             name: "code-review".into(),
@@ -511,7 +647,9 @@ Body here.";
     #[test]
     fn test_with_builtins_registers_anti_fixation() {
         let registry = SkillRegistry::empty().with_builtins();
-        let skill = registry.get("anti-fixation").expect("anti-fixation should be registered");
+        let skill = registry
+            .get("anti-fixation")
+            .expect("anti-fixation should be registered");
         assert!(skill.description.contains("fixation"));
         assert!(!skill.body.is_empty());
     }

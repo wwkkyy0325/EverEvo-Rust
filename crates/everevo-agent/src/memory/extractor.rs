@@ -54,13 +54,18 @@ pub async fn extract_from_turn(
                     created_at: chrono::Utc::now(),
                     updated_at: chrono::Utc::now(),
                     projection: everevo_core::memory::ProjectionMetadata::new(
-                        "turn-extractor", "llm", vec![], 0.7,
+                        "turn-extractor",
+                        "llm",
+                        vec![],
+                        0.7,
                     ),
                     links: vec![],
                 };
                 match fact_manager.save(&fact) {
                     Ok(()) => saved += 1,
-                    Err(e) => tracing::debug!(name = %fact.name, error = %e, "Extracted fact dedup'd or rejected"),
+                    Err(e) => {
+                        tracing::debug!(name = %fact.name, error = %e, "Extracted fact dedup'd or rejected")
+                    }
                 }
             }
             if saved > 0 {
@@ -87,8 +92,13 @@ fn build_memory_extraction_prompt(user_msg: &str, assistant_msg: &str) -> String
 }
 
 /// Parse extracted facts from LLM response JSON.
-fn parse_extracted_facts(text: &str) -> Vec<(String, String, String)> {
-    let trimmed = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+pub(crate) fn parse_extracted_facts(text: &str) -> Vec<(String, String, String)> {
+    let trimmed = text
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
     let parsed: Vec<serde_json::Value> = match serde_json::from_str(trimmed) {
         Ok(v) => v,
         Err(_) => {
@@ -104,13 +114,18 @@ fn parse_extracted_facts(text: &str) -> Vec<(String, String, String)> {
         }
     };
 
-    parsed.iter().filter_map(|item| {
-        let name = item.get("name")?.as_str()?.to_string();
-        let desc = item.get("description")?.as_str()?.to_string();
-        let content = item.get("content")?.as_str()?.to_string();
-        if name.is_empty() || desc.is_empty() { return None; }
-        Some((name, desc, content))
-    }).collect()
+    parsed
+        .iter()
+        .filter_map(|item| {
+            let name = item.get("name")?.as_str()?.to_string();
+            let desc = item.get("description")?.as_str()?.to_string();
+            let content = item.get("content")?.as_str()?.to_string();
+            if name.is_empty() || desc.is_empty() {
+                return None;
+            }
+            Some((name, desc, content))
+        })
+        .collect()
 }
 
 #[cfg(test)]

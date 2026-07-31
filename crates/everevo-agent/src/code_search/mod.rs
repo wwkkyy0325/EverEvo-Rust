@@ -13,6 +13,8 @@
 
 pub mod indexer;
 pub mod scanner;
+pub mod watcher;
 
 pub use indexer::{format_search_results, CodeIndex, IndexStats, SearchConfig, SearchResult};
 pub use scanner::{scan_file, CodeSymbol, SymbolKind};
+pub use watcher::has_changes_since;

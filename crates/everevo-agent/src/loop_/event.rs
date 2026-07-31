@@ -19,6 +19,9 @@ pub enum AgentEvent {
         name: String,
         content: String,
         is_error: bool,
+        /// Image attachments (e.g. browser screenshots). Forwarded to the
+        /// LLM as image content blocks for vision-capable models.
+        images: Vec<everevo_core::ImageData>,
     },
     /// A shell command needs user confirmation before execution.
     ConfirmationNeeded { command: String, reason: String },

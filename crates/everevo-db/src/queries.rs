@@ -15,8 +15,9 @@ impl Database {
         let metadata = "{}".to_string();
 
         sqlx::query_as::<_, SessionRow>(
-            "INSERT INTO sessions (id, title, created_at, updated_at, metadata) VALUES (?, ?, ?, ?, ?)
-             RETURNING id, title, created_at, updated_at, metadata",
+            "INSERT INTO sessions (id, title, created_at, updated_at, metadata, workspace_dir) \
+             VALUES (?, ?, ?, ?, ?, NULL) \
+             RETURNING id, title, created_at, updated_at, metadata, workspace_dir",
         )
         .bind(id)
         .bind(title)
@@ -30,7 +31,8 @@ impl Database {
 
     pub async fn list_sessions(&self) -> Result<Vec<SessionRow>, EverEvoError> {
         sqlx::query_as::<_, SessionRow>(
-            "SELECT id, title, created_at, updated_at, metadata FROM sessions ORDER BY updated_at DESC",
+            "SELECT id, title, created_at, updated_at, metadata, workspace_dir \
+             FROM sessions ORDER BY updated_at DESC",
         )
         .fetch_all(&self.pool)
         .await
@@ -39,12 +41,29 @@ impl Database {
 
     pub async fn get_session(&self, id: Uuid) -> Result<Option<SessionRow>, EverEvoError> {
         sqlx::query_as::<_, SessionRow>(
-            "SELECT id, title, created_at, updated_at, metadata FROM sessions WHERE id = ?",
+            "SELECT id, title, created_at, updated_at, metadata, workspace_dir \
+             FROM sessions WHERE id = ?",
         )
         .bind(id)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| EverEvoError::Database(format!("Get session failed: {e}")))
+    }
+
+    /// Set or clear the workspace directory for a session.
+    pub async fn set_session_workspace(
+        &self,
+        id: Uuid,
+        workspace_dir: Option<&str>,
+    ) -> Result<(), EverEvoError> {
+        sqlx::query("UPDATE sessions SET workspace_dir = ?, updated_at = ? WHERE id = ?")
+            .bind(workspace_dir)
+            .bind(Utc::now())
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| EverEvoError::Database(format!("Set workspace failed: {e}")))?;
+        Ok(())
     }
 
     pub async fn delete_session(&self, id: Uuid) -> Result<(), EverEvoError> {
@@ -164,7 +183,7 @@ impl Database {
         let pattern = format!("%{escaped}%");
         // SQLite uses \ as default escape char
         sqlx::query_as::<_, SessionRow>(
-            "SELECT DISTINCT s.id, s.title, s.created_at, s.updated_at, s.metadata
+            "SELECT DISTINCT s.id, s.title, s.created_at, s.updated_at, s.metadata, s.workspace_dir
              FROM sessions s
              LEFT JOIN messages m ON s.id = m.session_id
              WHERE s.title LIKE ? OR m.content LIKE ?
@@ -191,6 +210,7 @@ pub struct SessionWithMeta {
     pub metadata: String,
     pub message_count: i64,
     pub last_content: Option<String>,
+    pub workspace_dir: Option<String>,
 }
 
 impl Database {
@@ -202,7 +222,7 @@ impl Database {
     ) -> Result<Vec<SessionWithMeta>, EverEvoError> {
         sqlx::query_as::<_, SessionWithMeta>(
             r#"SELECT
-                s.id, s.title, s.created_at, s.updated_at, s.metadata,
+                s.id, s.title, s.created_at, s.updated_at, s.metadata, s.workspace_dir,
                 COUNT(CASE WHEN m.role = 'user' THEN 1 END) AS message_count,
                 (SELECT m2.content FROM messages m2
                  WHERE m2.session_id = s.id
@@ -303,6 +323,8 @@ pub struct FactRow {
 
 impl Database {
     /// Upsert a fact into the SQLite index (INSERT OR REPLACE).
+    /// Returns Ok(()) on success, or an error if the table doesn't exist or
+    /// data constraints are violated.
     pub async fn upsert_fact(
         &self,
         id: &str,
@@ -310,15 +332,23 @@ impl Database {
         content: &str,
         fact_type: &str,
     ) -> Result<(), EverEvoError> {
+        // Guard against empty values that would cause SQL logic errors
+        if id.is_empty() || content.is_empty() {
+            return Err(EverEvoError::Database(
+                "Upsert fact failed: id or content is empty".into(),
+            ));
+        }
+        // Sanitize content: null bytes cause "SQL logic error" (code 1).
+        let content = content.replace('\0', "\\0");
         sqlx::query(
             "INSERT INTO facts (id, description, content, fact_type, retrieval_count, created_at, updated_at)
-             VALUES (?, ?, ?, ?, 0, datetime('now'), datetime('now'))
-             ON CONFLICT(id) DO UPDATE SET description=excluded.description, content=excluded.content,
-             fact_type=excluded.fact_type, updated_at=datetime('now')",
+             VALUES (?1, ?2, ?3, ?4, 0, datetime('now'), datetime('now'))
+             ON CONFLICT(id) DO UPDATE SET description=?2, content=?3,
+             fact_type=?4, updated_at=datetime('now')",
         )
         .bind(id)
         .bind(description)
-        .bind(content)
+        .bind(&content)
         .bind(fact_type)
         .execute(&self.pool)
         .await

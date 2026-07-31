@@ -128,9 +128,7 @@ impl SubAgentPool {
                     LlmMessage::system(&system_prompt),
                     LlmMessage::user(&task.prompt),
                 ];
-                let cancel = task
-                    .cancel_token
-                    .unwrap_or_else(CancellationToken::new);
+                let cancel = task.cancel_token.unwrap_or_else(CancellationToken::new);
 
                 let content = tokio::time::timeout(
                     std::time::Duration::from_secs(timeout),
@@ -204,9 +202,7 @@ impl SubAgentPool {
                     LlmMessage::system(&system_prompt),
                     LlmMessage::user(&task.prompt),
                 ];
-                let cancel = task
-                    .cancel_token
-                    .unwrap_or_else(CancellationToken::new);
+                let cancel = task.cancel_token.unwrap_or_else(CancellationToken::new);
 
                 let content = tokio::time::timeout(
                     std::time::Duration::from_secs(timeout),

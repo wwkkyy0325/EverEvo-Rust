@@ -19,6 +19,22 @@ use everevo_core::EverEvoError;
 use super::frontmatter::{parse_fact_file, serialize_fact_file};
 use super::index::{load_all_facts, regenerate_index};
 
+/// A fact upsert task enqueued to the serialized FTS5 writer actor.
+///
+/// The writer processes these one at a time, avoiding concurrent writes to the
+/// FTS5 external-content table — the root cause of "SQL logic error" (code 1)
+/// that surfaced when multiple facts were saved within the same millisecond.
+#[derive(Debug, Clone)]
+pub struct FactWriteTask {
+    pub id: String,
+    pub description: String,
+    pub content: String,
+    pub fact_type: String,
+}
+
+/// Sender for the serialized fact-writer actor.
+pub type FactWriteTx = tokio::sync::mpsc::UnboundedSender<FactWriteTask>;
+
 /// Manages the facts directory (data/memory/facts/).
 ///
 /// ## Triple-Write Architecture
@@ -34,6 +50,10 @@ pub struct FactManager {
     rag: Arc<std::sync::Mutex<Option<Arc<crate::rag::RagPipeline>>>>,
     /// Optional DB handle for SQLite FTS5 indexing on save.
     db: Arc<std::sync::Mutex<Option<Arc<everevo_db::Database>>>>,
+    /// Serialized FTS5 writer channel. When set, fact upserts are enqueued here
+    /// instead of fire-and-forget spawned — eliminates concurrent FTS5
+    /// external-content trigger conflicts ("SQL logic error").
+    write_queue: Arc<std::sync::Mutex<Option<FactWriteTx>>>,
 }
 
 impl FactManager {
@@ -49,6 +69,7 @@ impl FactManager {
             max_facts: 200,
             rag: Arc::new(std::sync::Mutex::new(None)),
             db: Arc::new(std::sync::Mutex::new(None)),
+            write_queue: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -72,6 +93,16 @@ impl FactManager {
         }
     }
 
+    /// Attach a serialized writer channel. When set, `save()` enqueues FTS5
+    /// upserts here instead of spawning unbounded tasks — eliminates the
+    /// concurrent FTS5 external-content trigger conflicts that produced
+    /// "SQL logic error" (code 1) under burst saves.
+    pub fn set_write_queue(&self, tx: FactWriteTx) {
+        if let Ok(mut guard) = self.write_queue.lock() {
+            *guard = Some(tx);
+        }
+    }
+
     /// Save a fact to disk, regenerate the index, and auto-index into RAG.
     pub fn save(&self, fact: &MemoryFact) -> Result<(), EverEvoError> {
         let existing = load_all_facts(&self.facts_dir)?;
@@ -82,12 +113,17 @@ impl FactManager {
             // Build word set for the new fact
             let new_text = format!("{} {}", fact.description, fact.content).to_lowercase();
             let new_words: std::collections::HashSet<&str> = new_text
-                .split_whitespace().filter(|w| w.len() > 2).collect();
+                .split_whitespace()
+                .filter(|w| w.len() > 2)
+                .collect();
 
             for old_fact in &existing {
-                let old_text = format!("{} {}", old_fact.description, old_fact.content).to_lowercase();
+                let old_text =
+                    format!("{} {}", old_fact.description, old_fact.content).to_lowercase();
                 let old_words: std::collections::HashSet<&str> = old_text
-                    .split_whitespace().filter(|w| w.len() > 2).collect();
+                    .split_whitespace()
+                    .filter(|w| w.len() > 2)
+                    .collect();
                 let intersection = new_words.intersection(&old_words).count();
                 let union = new_words.len() + old_words.len() - intersection;
                 if union > 0 {
@@ -122,19 +158,40 @@ impl FactManager {
 
         regenerate_index(&self.facts_dir, &self.index_path)?;
 
-        // SQLite FTS5 indexing (keyword search, sub-millisecond)
+        // SQLite FTS5 indexing (keyword search, sub-millisecond).
+        // Prefer the serialized writer queue to avoid concurrent FTS5
+        // external-content trigger conflicts ("SQL logic error"). Falls back
+        // to a fire-and-forget spawn when no queue is attached (e.g. tests).
         if let Ok(guard) = self.db.lock() {
             if let Some(ref db) = *guard {
-                let content = format!("{}: {}", fact.name, fact.content);
-                let db = Arc::clone(db);
-                let name = fact.name.clone();
-                let desc = fact.description.clone();
-                // Fire-and-forget: don't block the save for SQLite write
-                tokio::spawn(async move {
-                    if let Err(e) = db.upsert_fact(&name, &desc, &content, "project").await {
-                        tracing::warn!(error = %e, "Fact SQLite indexing failed");
-                    }
-                });
+                let task = FactWriteTask {
+                    id: fact.name.clone(),
+                    description: fact.description.clone(),
+                    content: format!("{}: {}", fact.name, fact.content),
+                    fact_type: "project".to_string(),
+                };
+                let queued = self
+                    .write_queue
+                    .lock()
+                    .ok()
+                    .and_then(|wq| wq.as_ref().map(|tx| tx.send(task.clone()).is_ok()))
+                    .unwrap_or(false);
+                if !queued {
+                    let db = Arc::clone(db);
+                    tokio::spawn(async move {
+                        if let Err(e) = db
+                            .upsert_fact(
+                                &task.id,
+                                &task.description,
+                                &task.content,
+                                &task.fact_type,
+                            )
+                            .await
+                        {
+                            tracing::warn!(error = %e, "Fact SQLite indexing failed");
+                        }
+                    });
+                }
             }
         }
 
@@ -203,7 +260,11 @@ impl FactManager {
 
         let current_recall: u32 = super::frontmatter::get_recall(&fm);
         let new_recall = current_recall.saturating_add(1);
-        let tier: u8 = if new_recall >= 3 { 1 } else { super::frontmatter::get_tier(&fm) };
+        let tier: u8 = if new_recall >= 3 {
+            1
+        } else {
+            super::frontmatter::get_tier(&fm)
+        };
 
         // Reconstruct the file with updated recall
         let mut out = String::new();
@@ -239,15 +300,18 @@ impl FactManager {
     /// These are injected at session start (Claude Code T1 pattern).
     pub fn load_tier1(&self) -> Result<Vec<MemoryFact>, EverEvoError> {
         let all = load_all_facts(&self.facts_dir)?;
-        Ok(all.into_iter().filter(|f| {
-            let path = self.fact_path(&f.name);
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                if let Some((fm, _)) = super::frontmatter::parse_frontmatter(&content) {
-                    return super::frontmatter::get_tier(&fm) <= 1;
+        Ok(all
+            .into_iter()
+            .filter(|f| {
+                let path = self.fact_path(&f.name);
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Some((fm, _)) = super::frontmatter::parse_frontmatter(&content) {
+                        return super::frontmatter::get_tier(&fm) <= 1;
+                    }
                 }
-            }
-            false
-        }).collect())
+                false
+            })
+            .collect())
     }
 
     /// Read the MEMORY.md index (first 300 lines for context injection).
@@ -327,5 +391,47 @@ mod tests {
 
         let count = mgr.count().unwrap();
         assert_eq!(count, 1);
+    }
+
+    /// When a serialized writer queue is attached, `save()` must enqueue the
+    /// upsert task to the queue rather than spawning a fire-and-forget task.
+    /// This is the core of the fix for concurrent FTS5 "SQL logic error".
+    #[tokio::test]
+    async fn test_save_enqueues_via_writer_queue() {
+        let dir = TempDir::new().unwrap();
+        let mgr = FactManager::new(dir.path()).unwrap();
+
+        // Attach an in-memory DB so save() enters the SQLite-indexing branch.
+        let db = everevo_db::Database::connect(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        mgr.set_db(Arc::new(db));
+
+        // Attach the serialized writer queue.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        mgr.set_write_queue(tx);
+
+        let fact = MemoryFact {
+            name: "queued-fact".into(),
+            description: "Queue test".into(),
+            content: "This fact should be enqueued, not spawned".into(),
+            fact_type: FactType::Project,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            projection: ProjectionMetadata::new("test", "none", vec![], 1.0),
+            links: vec![],
+        };
+        mgr.save(&fact).unwrap();
+
+        // The task must arrive on the queue (not via tokio::spawn).
+        let task = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("timed out waiting for queued task")
+            .expect("channel closed unexpectedly");
+
+        assert_eq!(task.id, "queued-fact");
+        assert_eq!(task.description, "Queue test");
+        assert_eq!(task.fact_type, "project");
+        assert!(task.content.starts_with("queued-fact:"));
     }
 }
