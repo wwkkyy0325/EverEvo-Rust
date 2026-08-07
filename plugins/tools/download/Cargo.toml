@@ -1,0 +1,12 @@
+[package]
+name = "plugin-download"
+version = "1.0.0"
+edition = "2021"
+
+[[bin]]
+name = "plugin-download"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+ureq = "3"

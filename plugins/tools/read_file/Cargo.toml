@@ -1,0 +1,12 @@
+[package]
+name = "plugin-read-file"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.80"
+
+[[bin]]
+name = "plugin-read-file"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

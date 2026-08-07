@@ -1,0 +1,9 @@
+[package]
+name = "plugin-compact"
+version = "1.0.0"
+edition = "2021"
+[[bin]]
+name = "plugin-compact"
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "plugin-memory"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.80"
+
+[[bin]]
+name = "plugin-memory"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

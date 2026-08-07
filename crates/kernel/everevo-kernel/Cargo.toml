@@ -1,0 +1,32 @@
+[package]
+name = "everevo-kernel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "EverEvo microkernel — immutable core loop, plugin registry, bootstrap tools"
+
+[dependencies]
+everevo-core = { path = "../everevo-core" }
+everevo-mcp = { path = "../everevo-mcp" }
+everevo-mcp-protocol = { path = "../everevo-mcp-protocol" }
+
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+futures = "0.3"
+sha2 = "0.10"
+toml = "0.8"
+regex-lite = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+tempfile = "3"
+
+[lints]
+workspace = true

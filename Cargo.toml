@@ -2,7 +2,7 @@
 # No [package] section = virtual manifest = no root crate
 
 [workspace]
-members = ["crates/*", "crates/everevo-bundler"]
+members = ["crates/kernel/*", "crates/infra/*", "crates/app/*", "crates/tools/*"]
 resolver = "2"
 
 [workspace.package]

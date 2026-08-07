@@ -1,0 +1,9 @@
+[package]
+name = "plugin-verify"
+version = "1.0.0"
+edition = "2021"
+[[bin]]
+name = "plugin-verify"
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

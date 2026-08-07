@@ -20,10 +20,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Reuse existing EverEvo crates — zero bridge overhead
-everevo-core = { path = "../crates/everevo-core" }
-everevo-bootstrap = { path = "../crates/everevo-bootstrap" }
-everevo-db = { path = "../crates/everevo-db" }
-everevo-server = { path = "../crates/everevo-server" }
+everevo-core = { path = "../crates/kernel/everevo-core" }
+everevo-bootstrap = { path = "../crates/infra/everevo-bootstrap" }
+everevo-db = { path = "../crates/infra/everevo-db" }
+everevo-server = { path = "../crates/app/everevo-server" }
 
 [features]
 default = ["custom-protocol"]

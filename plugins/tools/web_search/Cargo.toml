@@ -1,0 +1,13 @@
+[package]
+name = "plugin-web-search"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.80"
+
+[[bin]]
+name = "plugin-web-search"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+ureq = "3"

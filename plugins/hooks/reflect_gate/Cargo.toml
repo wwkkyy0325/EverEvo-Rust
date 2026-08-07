@@ -1,0 +1,9 @@
+[package]
+name = "plugin-hooks-reflect_gate"
+version = "1.0.0"
+edition = "2021"
+[[bin]]
+name = "plugin-hooks-reflect_gate"
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

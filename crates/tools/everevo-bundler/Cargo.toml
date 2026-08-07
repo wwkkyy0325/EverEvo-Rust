@@ -1,0 +1,28 @@
+[package]
+name = "everevo-bundler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "EverEvo asset bundler — downloads and compresses runtimes + models for offline distribution"
+
+[[bin]]
+name = "everevo-bundler"
+path = "src/main.rs"
+
+[dependencies]
+everevo-bootstrap = { path = "../../infra/everevo-bootstrap" }
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+zstd.workspace = true
+tar.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+zip.workspace = true
+tempfile = "3"
+
+[lints]
+workspace = true

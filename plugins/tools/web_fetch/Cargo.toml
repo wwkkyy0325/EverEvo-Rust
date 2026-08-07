@@ -1,0 +1,10 @@
+[package]
+name = "plugin-web-fetch"
+version = "1.0.0"
+edition = "2021"
+[[bin]]
+name = "plugin-web-fetch"
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+ureq = "3"
