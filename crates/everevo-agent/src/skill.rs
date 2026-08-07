@@ -22,6 +22,7 @@ use std::sync::RwLock;
 use std::time::SystemTime;
 
 use everevo_core::EverEvoError;
+use serde::Serialize;
 
 use crate::memory::frontmatter::parse_frontmatter;
 
@@ -33,21 +34,53 @@ const BUILTIN_SKILLS: &[(&str, &str)] = &[
     ("anti-fixation", include_str!("../builtin-skills/anti-fixation/SKILL.md")),
     ("code-review", include_str!("../builtin-skills/code-review/SKILL.md")),
     ("debug-error", include_str!("../builtin-skills/debug-error/SKILL.md")),
+    ("web-research", include_str!("../../everevo-webagent/builtin-skills/web-research/SKILL.md")),
     ("write-tests", include_str!("../builtin-skills/write-tests/SKILL.md")),
 ];
 
 // ── Skill ─────────────────────────────────────────────────────────────────
 
 /// A parsed skill from a SKILL.md file.
+/// Where a skill was loaded from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum SkillSource {
+    Builtin,
+    User,
+    Project,
+}
+
 #[derive(Debug, Clone)]
 pub struct Skill {
     pub name: String,
     pub description: String,
     pub body: String,
+    /// Tool dependencies (legacy `tools:` or standard `allowed-tools:` frontmatter).
     pub tools: Vec<String>,
+    /// Trigger phrases for auto-activation.
     pub when_to_use: Vec<String>,
     pub persona: Option<String>,
     pub path: PathBuf,
+    /// Source location (builtin, user data/skills, project .everevo/skills).
+    pub source: SkillSource,
+    /// agentskills.io: if true, the model should NOT auto-invoke this skill.
+    pub disable_model_invocation: bool,
+    /// agentskills.io: override the model for this skill (sonnet/opus/haiku).
+    pub model_override: Option<String>,
+    /// agentskills.io: if false, only Claude can invoke (not the user).
+    pub user_invocable: bool,
+}
+
+impl SkillSource {
+    pub fn infer_from_path(path: &Path) -> Self {
+        let s = path.to_string_lossy();
+        if s.contains("[builtin]") {
+            SkillSource::Builtin
+        } else if s.contains(".everevo/skills") {
+            SkillSource::Project
+        } else {
+            SkillSource::User
+        }
+    }
 }
 
 // ── SkillRegistry ─────────────────────────────────────────────────────────
@@ -68,6 +101,11 @@ pub struct SkillRegistry {
 impl SkillRegistry {
     /// Create an empty registry — used as a last-resort fallback when
     /// all load attempts fail. Skills are non-critical; graceful degradation.
+    /// Path to the skills directory (for tools that need to write new skills).
+    pub fn skills_dir(&self) -> PathBuf {
+        self.skills_dir.clone()
+    }
+
     pub fn empty() -> Self {
         Self {
             skills: RwLock::new(Vec::new()),
@@ -148,17 +186,30 @@ impl SkillRegistry {
         if !self.skills_dir.exists() {
             return;
         }
-        // Quick path: check if the directory itself has changed.
-        if let Ok(meta) = std::fs::metadata(&self.skills_dir) {
-            if let Ok(mtime) = meta.modified() {
-                let last = *self
-                    .last_scan
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner());
-                if mtime <= last {
-                    return; // no changes
+        // Quick path: walk skill dirs and check the newest SKILL.md file mtime.
+        // Previously we only checked the directory mtime — that missed edits to
+        // files inside existing skill directories (most filesystems only update
+        // the parent dir's mtime on entry add/remove, not content changes).
+        let last = *self.last_scan.read().unwrap_or_else(|e| e.into_inner());
+        let mut newest = last;
+        if let Ok(entries) = std::fs::read_dir(&self.skills_dir) {
+            for entry in entries.flatten() {
+                let skill_md = entry.path().join("SKILL.md");
+                if let Ok(sm) = std::fs::metadata(&skill_md) {
+                    if let Ok(m) = sm.modified() {
+                        newest = newest.max(m);
+                    }
+                }
+                // Also check dir mtime (covers new/removed skill dirs)
+                if let Ok(dm) = entry.metadata() {
+                    if let Ok(m) = dm.modified() {
+                        newest = newest.max(m);
+                    }
                 }
             }
+        }
+        if newest <= last {
+            return; // no changes
         }
         // Slow path: reload
         if let Ok(reloaded) = SkillRegistry::load(&self.skills_dir) {
@@ -191,35 +242,69 @@ impl SkillRegistry {
 
     /// Find skills relevant to a user message.
     ///
-    /// Extracts significant words from each skill's `when_to_use` triggers
-    /// and matches them against the user message using case-insensitive
-    /// keyword overlap. Returns skills with at least one keyword match,
-    /// sorted by match count.
-    pub fn find_relevant(&self, user_message: &str) -> Vec<Skill> {
+    /// Uses multi-signal scoring across `when_to_use` triggers, `description`,
+    /// and `name` fields. Returns skills sorted by relevance score (descending).
+    /// Skills with zero matches are filtered out.
+    pub fn find_relevant(&self, user_message: &str) -> Vec<(Skill, f64)> {
         if user_message.trim().is_empty() {
             return vec![];
         }
 
         let guard = self.skills.read().unwrap_or_else(|e| e.into_inner());
-        let msg_lower = user_message.to_lowercase();
-        let mut scored: Vec<(usize, Skill)> = guard
+        let msg = user_message.to_lowercase();
+        let mut scored: Vec<(Skill, f64)> = guard
             .iter()
             .filter_map(|s| {
-                let count = s
-                    .when_to_use
-                    .iter()
-                    .filter(|trigger| trigger_keyword_match(trigger, &msg_lower))
-                    .count();
-                if count > 0 {
-                    Some((count, s.clone()))
+                let mut score: f64 = 0.0;
+
+                // 1. Name exact match — weight 5.0
+                if msg.contains(&s.name.to_lowercase()) {
+                    score += 5.0;
+                }
+
+                // 2. when_to_use triggers — weight 3.0 per matching trigger
+                for trigger in &s.when_to_use {
+                    let keywords: Vec<&str> = trigger
+                        .split_whitespace()
+                        .filter(|w| w.len() > 2 && !STOP_WORDS.contains(&w.to_lowercase().as_str()))
+                        .collect();
+                    if keywords.is_empty() {
+                        continue;
+                    }
+                    let hits = keywords.iter().filter(|k| msg.contains(&k.to_lowercase())).count();
+                    if hits > 0 {
+                        score += 3.0 * (hits as f64 / keywords.len() as f64);
+                    }
+                }
+
+                // 3. Description keyword overlap — weight 1.0
+                let desc_words: Vec<&str> = s
+                    .description
+                    .split_whitespace()
+                    .filter(|w| w.len() > 2 && !STOP_WORDS.contains(&w.to_lowercase().as_str()))
+                    .collect();
+                if !desc_words.is_empty() {
+                    let desc_hits = desc_words
+                        .iter()
+                        .filter(|k| msg.contains(&k.to_lowercase()))
+                        .count();
+                    if desc_hits > 0 {
+                        score += 1.0 * (desc_hits as f64 / desc_words.len() as f64);
+                    }
+                }
+
+                if score > 0.0 {
+                    Some((s.clone(), score))
                 } else {
                     None
                 }
             })
             .collect();
 
-        scored.sort_by_key(|(count, _)| std::cmp::Reverse(*count));
-        scored.into_iter().map(|(_, s)| s).collect()
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Cap at top 8 to avoid context bloat
+        scored.truncate(8);
+        scored
     }
 
     /// Get a skill by name.
@@ -398,12 +483,26 @@ fn parse_skill_md(content: &str, path: &Path) -> Result<Skill, String> {
         .ok_or_else(|| "Missing 'name' in frontmatter".to_string())?;
     let description = fm.get("description").cloned().unwrap_or_default();
 
-    let tools = fm
-        .get("tools")
-        .map(|v| parse_list_value(v))
+    // tools: try "allowed-tools" (agentskills.io standard) first, fall back to "tools" (legacy)
+    let tools_raw = fm
+        .get("allowed-tools")
+        .or_else(|| fm.get("tools"))
+        .cloned();
+    let tools = tools_raw
+        .as_deref()
+        .map(parse_list_value)
         .unwrap_or_default();
 
     let persona = fm.get("persona").cloned();
+    let disable_model_invocation = fm
+        .get("disable-model-invocation")
+        .map(|v| matches!(v.as_str(), "true" | "yes" | "1"))
+        .unwrap_or(false);
+    let model_override = fm.get("model").cloned();
+    let user_invocable = fm
+        .get("user-invocable")
+        .map(|v| !matches!(v.as_str(), "false" | "no" | "0"))
+        .unwrap_or(true);
 
     let when_to_use = if let Some(raw) = fm.get("when_to_use") {
         if raw.is_empty() {
@@ -423,6 +522,10 @@ fn parse_skill_md(content: &str, path: &Path) -> Result<Skill, String> {
         when_to_use,
         persona,
         path: path.to_path_buf(),
+        source: SkillSource::infer_from_path(path),
+        disable_model_invocation,
+        model_override,
+        user_invocable,
     })
 }
 
@@ -464,17 +567,7 @@ const STOP_WORDS: &[&str] = &[
 ];
 
 /// Check if a skill trigger matches a user message via keyword overlap.
-///
-/// Extracts significant words (len > 2, not in stop list) from the trigger
-/// and checks if any of them appear in the user message. A single keyword
-/// match is sufficient.
-fn trigger_keyword_match(trigger: &str, msg_lower: &str) -> bool {
-    let trigger_lower = trigger.to_lowercase();
-    trigger_lower
-        .split_whitespace()
-        .filter(|w| w.len() > 2 && !STOP_WORDS.contains(w))
-        .any(|word| msg_lower.contains(word))
-}
+// (trigger_keyword_match removed — keyword extraction now inline in find_relevant)
 
 // ── Tests ─────────────────────────────────────────────────────────────────
 
@@ -579,6 +672,10 @@ Body here.";
                 when_to_use: vec!["User asks for code review".into()],
                 persona: None,
                 path: PathBuf::from("test"),
+            source: crate::skill::SkillSource::User,
+            disable_model_invocation: false,
+            model_override: None,
+            user_invocable: true,
             },
             Skill {
                 name: "diagram".into(),
@@ -588,6 +685,10 @@ Body here.";
                 when_to_use: vec!["User provides an image".into()],
                 persona: None,
                 path: PathBuf::from("test"),
+            source: crate::skill::SkillSource::User,
+            disable_model_invocation: false,
+            model_override: None,
+            user_invocable: true,
             },
         ];
         let registry = SkillRegistry {
@@ -598,7 +699,7 @@ Body here.";
 
         let relevant = registry.find_relevant("Please do a code review on my PR");
         assert_eq!(relevant.len(), 1);
-        assert_eq!(relevant[0].name, "code-review");
+        assert_eq!(relevant[0].0.name, "code-review");
 
         let no_match = registry.find_relevant("Hello world");
         assert!(no_match.is_empty());
@@ -645,6 +746,10 @@ Body here.";
             when_to_use: vec![],
             persona: None,
             path: PathBuf::from("test"),
+            source: crate::skill::SkillSource::User,
+            disable_model_invocation: false,
+            model_override: None,
+            user_invocable: true,
         }];
         let registry = SkillRegistry {
             skills: RwLock::new(skills),
@@ -667,6 +772,10 @@ Body here.";
                 when_to_use: vec![],
                 persona: None,
                 path: PathBuf::from("test"),
+            source: crate::skill::SkillSource::User,
+            disable_model_invocation: false,
+            model_override: None,
+            user_invocable: true,
             },
             Skill {
                 name: "b".into(),
@@ -676,6 +785,10 @@ Body here.";
                 when_to_use: vec![],
                 persona: None,
                 path: PathBuf::from("test"),
+            source: crate::skill::SkillSource::User,
+            disable_model_invocation: false,
+            model_override: None,
+            user_invocable: true,
             },
         ];
         let registry = SkillRegistry {
@@ -712,6 +825,10 @@ Body here.";
             when_to_use: vec![],
             persona: None,
             path: PathBuf::from("data/skills/anti-fixation/SKILL.md"),
+            source: SkillSource::User,
+            disable_model_invocation: false,
+            model_override: None,
+            user_invocable: true,
         });
         // with_builtins should remove user version and register builtin
         let registry = registry.with_builtins();

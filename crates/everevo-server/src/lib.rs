@@ -2,6 +2,7 @@
 
 pub mod app_state;
 pub mod main_impl;
+pub mod middleware;
 pub mod orchestration;
 pub mod routes;
 pub mod sandbox_tool;
@@ -51,23 +52,7 @@ pub async fn build_app(
             .allow_headers(Any)
     };
 
-    let api_routes = Router::new()
-        .merge(routes::health::router())
-        .merge(routes::config::router())
-        .merge(routes::bootstrap::router())
-        .merge(routes::chat::router())
-        .merge(routes::session_routes::router())
-        .merge(routes::sandbox_routes::router())
-        .merge(routes::domain_routes::router())
-        .merge(routes::kg_routes::router())
-        .merge(routes::mcp_routes::router())
-        .merge(routes::tools_routes::router())
-        .merge(routes::workspace_routes::router())
-        .merge(routes::diary_routes::router())
-        .merge(routes::memory_routes::router())
-        .merge(routes::context_routes::router())
-        .merge(routes::command_routes::routes())
-        .merge(routes::model_routes::routes());
+    let api_routes = routes::all_routes();
 
     // Serve frontend: disk first (dev mode), fallback to embedded (single-exe)
     let dist = std::path::Path::new("frontend/dist");
@@ -88,6 +73,7 @@ pub async fn build_app(
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
+        .layer(axum::middleware::from_fn(middleware::panic_recovery))
         .with_state(Arc::clone(&state));
 
     Ok((router, state))

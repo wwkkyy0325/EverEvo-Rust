@@ -25,7 +25,7 @@ use everevo_core::memory::MemoryIndexEntry;
 use everevo_core::{RetrievalRecord, Telemetry};
 use uuid::Uuid;
 
-use crate::knowledge::graph::KnowledgeGraph;
+use everevo_knowledge::graph::KnowledgeGraph;
 use crate::memory::facts::FactManager;
 use crate::rag::RagPipeline;
 
@@ -397,6 +397,25 @@ impl ContextStage for MemoryStage {
                     }
                     content.push_str(&kg_section);
                 }
+            }
+        }
+
+        // ── Action Paradigms (SAMULE pattern: reuse learned strategies) ──
+        let paradigms = crate::memory::paradigm::search_paradigms(
+            &self.fact_manager,
+            &ctx.user_message,
+        );
+        if !paradigms.is_empty() {
+            content.push_str("\n\n## Action Paradigms (learned strategies)\n\n");
+            for p in paradigms.iter().take(3) {
+                // Extract a short approach summary from the paradigm content
+                let short = p
+                    .content
+                    .lines()
+                    .find(|l| l.starts_with("**Approach**"))
+                    .map(|l| l.trim_start_matches("**Approach**:").trim().to_string())
+                    .unwrap_or_else(|| p.description.clone());
+                content.push_str(&format!("- {} — {}\n", p.name, short));
             }
         }
 

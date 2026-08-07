@@ -17,8 +17,7 @@ everevo-db = { path = "../everevo-db" }
 everevo-bootstrap = { path = "../everevo-bootstrap" }
 everevo-downloader = { path = "../everevo-downloader" }
 everevo-sandbox = { path = "../everevo-sandbox" }
-# Domain knowledge + graph — re-exported via everevo_agent::knowledge
-# Telemetry now in everevo_core::telemetry
+everevo-knowledge = { path = "../everevo-knowledge" }
 everevo-vector = { path = "../everevo-vector" }
 everevo-mcp = { path = "../everevo-mcp" }
 everevo-workflow = { path = "../everevo-workflow" }

@@ -132,8 +132,7 @@ impl SubAgentPool {
 
                 let content = tokio::time::timeout(
                     std::time::Duration::from_secs(timeout),
-                    AgentLoop::new()
-                        .with_max_turns(task.max_turns.max(1))
+                    AgentLoop::sub_agent(task.max_turns.max(1))
                         .run_subagent(llm, tools, messages, cancel),
                 )
                 .await
@@ -206,8 +205,7 @@ impl SubAgentPool {
 
                 let content = tokio::time::timeout(
                     std::time::Duration::from_secs(timeout),
-                    AgentLoop::new()
-                        .with_max_turns(task.max_turns.max(1))
+                    AgentLoop::sub_agent(task.max_turns.max(1))
                         .run_subagent(llm, tools, messages, cancel),
                 )
                 .await

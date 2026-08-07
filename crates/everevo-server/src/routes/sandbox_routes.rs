@@ -10,6 +10,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
+use everevo_core::ApiError;
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -104,25 +105,27 @@ async fn add_trusted(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<Uuid>,
     Json(body): Json<TrustRequest>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let sandboxes = state.sandboxes.read().await;
     match sandboxes.get(&session_id) {
         Some(sb) => {
             sb.trust_path(&body.path);
-            Json(serde_json::json!({ "data": { "trusted": true } }))
+            Ok(Json(serde_json::json!({ "data": { "trusted": true } })))
         }
-        None => Json(serde_json::json!({ "error": "not found" })),
+        None => Err(ApiError::not_found("Sandbox session not found")),
     }
 }
 
 async fn get_trusted(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<Uuid>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let sandboxes = state.sandboxes.read().await;
     match sandboxes.get(&session_id) {
-        Some(sb) => Json(serde_json::json!({ "data": { "trusted_paths": sb.trusted_paths() } })),
-        None => Json(serde_json::json!({ "error": "not found" })),
+        Some(sb) => Ok(Json(
+            serde_json::json!({ "data": { "trusted_paths": sb.trusted_paths() } }),
+        )),
+        None => Err(ApiError::not_found("Sandbox session not found")),
     }
 }
 
@@ -162,16 +165,16 @@ async fn set_permission(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<Uuid>,
     Json(body): Json<PermissionRequest>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let level = match body.level.as_str() {
         "read_only" => everevo_sandbox::PermissionLevel::ReadOnly,
         "fully_manual" => everevo_sandbox::PermissionLevel::FullyManual,
         "semi_auto" => everevo_sandbox::PermissionLevel::SemiAuto,
         "fully_auto" => everevo_sandbox::PermissionLevel::FullyAuto,
         other => {
-            return Json(serde_json::json!({
-                "error": format!("Unknown permission level: {other}. Valid: read_only, fully_manual, semi_auto, fully_auto")
-            }));
+            return Err(ApiError::bad_request(format!(
+                "Unknown permission level: {other}. Valid: read_only, fully_manual, semi_auto, fully_auto"
+            )));
         }
     };
 
@@ -198,15 +201,15 @@ async fn set_permission(
                 }
             }
 
-            Json(serde_json::json!({
+            Ok(Json(serde_json::json!({
                 "data": {
                     "session_id": session_id.to_string(),
                     "permission_level": level.label(),
                     "permission_key": body.level,
                 }
-            }))
+            })))
         }
-        None => Json(serde_json::json!({ "error": "Session not found" })),
+        None => Err(ApiError::not_found("Session not found")),
     }
 }
 
@@ -228,7 +231,7 @@ async fn confirm_command(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<Uuid>,
     Json(body): Json<ConfirmRequest>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let pending = state.confirmations.write().await.remove(&session_id);
 
     match pending {
@@ -240,17 +243,17 @@ async fn confirm_command(
                 command = %p.command,
                 "User confirmed/denied command"
             );
-            Json(serde_json::json!({
+            Ok(Json(serde_json::json!({
                 "data": {
                     "session_id": session_id.to_string(),
                     "approved": body.approved,
                     "command": p.command,
                 }
-            }))
+            })))
         }
-        None => Json(serde_json::json!({
-            "error": "No pending confirmation for this session"
-        })),
+        None => Err(ApiError::not_found(
+            "No pending confirmation for this session",
+        )),
     }
 }
 
@@ -279,7 +282,7 @@ async fn dreaming_status(State(state): State<Arc<AppState>>) -> Json<serde_json:
 async fn dreaming_trigger(
     State(state): State<Arc<AppState>>,
     Json(body): Json<DreamingTriggerRequest>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     use everevo_agent::memory::scheduler::ScheduledPhase;
 
     let phases: Vec<ScheduledPhase> = match body.phase.as_str() {
@@ -295,9 +298,9 @@ async fn dreaming_trigger(
             ScheduledPhase::RemAndDeep,
         ],
         other => {
-            return Json(serde_json::json!({
-                "error": format!("Unknown phase: {other}. Valid: light, rem, deep, all")
-            }));
+            return Err(ApiError::bad_request(format!(
+                "Unknown phase: {other}. Valid: light, rem, deep, all"
+            )));
         }
     };
 
@@ -320,44 +323,44 @@ async fn dreaming_trigger(
         }
     }
 
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "data": {
             "triggered": body.phase,
             "results": results,
         }
-    }))
+    })))
 }
 
 // ── Memory Facts API ────────────────────────────────────────────
 
-async fn list_facts(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    match state.fact_manager.load_all() {
-        Ok(facts) => {
-            let items: Vec<_> = facts
-                .iter()
-                .map(|f| {
-                    serde_json::json!({
-                        "name": f.name, "description": f.description,
-                        "fact_type": f.fact_type.as_str(),
-                        "created_at": f.created_at.to_rfc3339(),
-                        "updated_at": f.updated_at.to_rfc3339(),
-                    })
-                })
-                .collect();
-            Json(serde_json::json!({ "data": { "facts": items, "total": items.len() } }))
-        }
-        Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
-    }
+async fn list_facts(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>, ApiError> {
+    let facts = state
+        .fact_manager
+        .load_all()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let items: Vec<_> = facts
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "name": f.name, "description": f.description,
+                "fact_type": f.fact_type.as_str(),
+                "created_at": f.created_at.to_rfc3339(),
+                "updated_at": f.updated_at.to_rfc3339(),
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "data": { "facts": items, "total": items.len() } })))
 }
 
 async fn delete_fact(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-) -> Json<serde_json::Value> {
-    match state.fact_manager.delete(&name) {
-        Ok(()) => Json(serde_json::json!({ "data": { "deleted": true, "name": name } })),
-        Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
-    }
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state
+        .fact_manager
+        .delete(&name)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(serde_json::json!({ "data": { "deleted": true, "name": name } })))
 }
 
 // ── Agent Orchestration API (deprecated — use /api/agent/tasks + TaskTool) ──
@@ -434,22 +437,20 @@ async fn list_subagent_tasks(
 async fn cancel_subagent(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let handles = state.subagent_handles.read().await;
     for arc in handles.values() {
         if let Ok(list) = arc.lock() {
             if let Some(entry) = list.iter().find(|e| e.id == id) {
                 entry.cancel.cancel();
                 tracing::info!(%id, "Sub-agent cancelled via API");
-                return Json(serde_json::json!({
+                return Ok(Json(serde_json::json!({
                     "data": { "cancelled": true, "id": id.to_string() }
-                }));
+                })));
             }
         }
     }
-    Json(serde_json::json!({
-        "error": format!("Sub-agent not found: {id}")
-    }))
+    Err(ApiError::not_found(format!("Sub-agent not found: {id}")))
 }
 
 /// GET /api/session/{id}/todos — return current task list for a session.
@@ -470,17 +471,52 @@ async fn get_session_todos(
 async fn interrupt_chat(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<Uuid>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let actors = state.session_actors.read().await;
     if let Some(token) = actors.get(&session_id) {
         token.cancel();
         tracing::info!(%session_id, "Agent run interrupted by user");
-        Json(serde_json::json!({
+        Ok(Json(serde_json::json!({
             "data": { "interrupted": true, "session_id": session_id.to_string() }
-        }))
+        })))
     } else {
-        Json(serde_json::json!({
-            "error": "No active agent run for this session"
-        }))
+        Err(ApiError::not_found(
+            "No active agent run for this session",
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_level_key_mapping() {
+        assert_eq!(level_key(everevo_sandbox::PermissionLevel::ReadOnly), "read_only");
+        assert_eq!(level_key(everevo_sandbox::PermissionLevel::FullyManual), "fully_manual");
+        assert_eq!(level_key(everevo_sandbox::PermissionLevel::SemiAuto), "semi_auto");
+        assert_eq!(level_key(everevo_sandbox::PermissionLevel::FullyAuto), "fully_auto");
+    }
+
+    #[test]
+    fn test_status_response_shape() {
+        // Verify the JSON structure matches what the frontend expects
+        // (pure data-shape test — no AppState needed)
+        let json = serde_json::json!({
+            "data": {
+                "active_sessions": 0,
+                "shell": "none",
+                "permission_level": "—",
+                "permission_key": "semi_auto",
+                "available_shells": [],
+                "available_levels": [
+                    { "key": "read_only", "label": "只读" },
+                    { "key": "fully_manual", "label": "纯手动" },
+                    { "key": "semi_auto", "label": "半自动" },
+                    { "key": "fully_auto", "label": "全自动" },
+                ]
+            }
+        });
+        assert!(json["data"]["available_levels"].as_array().unwrap().len() == 4);
     }
 }

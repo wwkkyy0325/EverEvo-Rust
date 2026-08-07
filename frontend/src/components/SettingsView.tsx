@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useRoutingConfig, type EffortLevel } from '../hooks/useRoutingConfig';
+import CharacterConfig from './CharacterConfig';
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -11,7 +12,7 @@ interface Provider {
   model: string;
 }
 
-type SettingsTab = 'llm' | 'routing';
+type SettingsTab = 'llm' | 'routing' | 'character';
 
 interface PresetDef {
   baseUrl: string;
@@ -33,6 +34,7 @@ const PROVIDER_PRESETS: Record<string, PresetDef> = {
 export default function SettingsView({ settingsTab }: { settingsTab: SettingsTab }) {
   if (settingsTab === 'llm') return <LlmConfig />;
   if (settingsTab === 'routing') return <RoutingConfig />;
+  if (settingsTab === 'character') return <CharacterConfig />;
   return null;
 }
 

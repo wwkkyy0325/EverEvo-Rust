@@ -12,6 +12,7 @@
 pub mod content_block;
 pub mod response;
 pub mod session;
+pub mod session_coordinator;
 pub mod stream;
 pub mod tools;
 
@@ -116,13 +117,14 @@ pub async fn resolve_session(
 }
 
 pub use tools::AssembledTools;
+pub use session_coordinator::{SessionCoordinator, SessionReceivers};
 
 /// Build the per-session tool registry with all dependencies injected.
 pub async fn build_registry(
     state: &Arc<AppState>,
     session_id: Uuid,
     client: &Arc<everevo_agent::llm::HttpClient>,
-    notif_tx: &mpsc::UnboundedSender<crate::app_state::ConfirmationNotification>,
+    coord: &mut SessionCoordinator,
     permission_level: &str,
     sub_ctx: &everevo_agent::subagent_context::SubAgentContext,
 ) -> AssembledTools {
@@ -130,7 +132,7 @@ pub async fn build_registry(
         state,
         session_id,
         client,
-        notif_tx,
+        &coord.confirm_tx,
         permission_level,
         sub_ctx,
     )
@@ -182,4 +184,19 @@ pub async fn finalize_response(
             Ok(())
         }
     }
+}
+
+/// Send a structured error event through the SSE channel.
+///
+/// The frontend renders SSE `error` events as an inline error block.
+/// This helper ensures consistent formatting with the `ErrorCode` enum.
+#[allow(dead_code)]
+pub(crate) fn send_sse_error(
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
+    code: everevo_core::ErrorCode,
+    msg: &str,
+) {
+    let _ = tx.try_send(Ok(Event::default().event("error").data(
+        serde_json::json!({"code": code, "message": msg}).to_string(),
+    )));
 }

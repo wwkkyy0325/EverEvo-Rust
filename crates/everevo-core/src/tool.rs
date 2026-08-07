@@ -148,6 +148,19 @@ impl ToolRegistry {
         self.tools.is_empty()
     }
 
+    /// Clone a subset of tools by name into a new registry.
+    /// Tools not found in the source are silently skipped (optional tools may
+    /// not be registered at all call sites).
+    pub fn subset(&self, names: &[&str]) -> Self {
+        let mut sub = Self::new();
+        for name in names {
+            if let Some(tool) = self.tools.get(*name) {
+                sub.tools.insert(name.to_string(), Arc::clone(tool));
+            }
+        }
+        sub
+    }
+
     /// Build JSON Schema for all registered tools (LLM function calling).
     pub fn as_tool_schemas(&self) -> Vec<serde_json::Value> {
         self.tools

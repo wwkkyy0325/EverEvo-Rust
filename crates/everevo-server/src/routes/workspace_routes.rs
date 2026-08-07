@@ -8,6 +8,7 @@ use crate::app_state::AppState;
 use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
+use everevo_core::ApiError;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -37,21 +38,21 @@ async fn get_workspace(State(state): State<Arc<AppState>>) -> Json<serde_json::V
 async fn set_workspace(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let path_str = body["path"].as_str().unwrap_or("");
     if path_str.is_empty() {
         *state.workspace_dir.write().await = None;
         // Persist cleared state
         let config_path = workspace_config_path(&state);
         let _ = std::fs::remove_file(&config_path);
-        return Json(serde_json::json!({ "ok": true, "path": null }));
+        return Ok(Json(serde_json::json!({ "ok": true, "path": null })));
     }
     let path = PathBuf::from(path_str);
     if !path.is_dir() {
-        return Json(serde_json::json!({
-            "ok": false,
-            "error": format!("Path does not exist or is not a directory: {}", path.display()),
-        }));
+        return Err(ApiError::bad_request(format!(
+            "Path does not exist or is not a directory: {}",
+            path.display()
+        )));
     }
     *state.workspace_dir.write().await = Some(path.clone());
 
@@ -68,9 +69,9 @@ async fn set_workspace(
         serde_json::to_string_pretty(&saved).unwrap_or_default(),
     );
 
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "ok": true,
         "path": path.display().to_string(),
         "exists": true,
-    }))
+    })))
 }

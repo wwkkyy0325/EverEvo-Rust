@@ -1,10 +1,16 @@
 //! WebSearch built-in tool — searches the web and returns result blocks.
 //!
-//! Claude Code equivalent: `WebSearch` tool. Searches the web via DuckDuckGo
-//! HTML (no API key required) and returns title + URL + snippet blocks.
+//! Claude Code equivalent: `WebSearch` tool. Multi-engine search with CDP browser
+//! bridge fallback. Returns title + URL + snippet blocks.
 //! Distinction: `web_search` asks the web, `web_fetch` reads a specific URL.
-//!
-//! Future: swap the backend to Brave / SerpAPI / Bing via config.
+
+mod engine;
+mod parser;
+
+pub(crate) use engine::ENGINES;
+#[cfg(test)]
+pub(crate) use engine::SearchEngine;
+pub(crate) use parser::*; // all parser functions + encode_url_query (pub)
 
 use async_trait::async_trait;
 use everevo_core::tool::{Tool, ToolOutput};
@@ -18,81 +24,8 @@ const MAX_RESULTS: usize = 20;
 /// HTTP request timeout for search.
 const REQUEST_TIMEOUT_SECS: u64 = 15;
 
-/// Search engines tried in order. **Bing (cn.bing.com) is first** — directly
-/// reachable from mainland China without a proxy (unlike DuckDuckGo) and
-/// returns real result URLs rather than DDG's `uddg=` redirect wrapper. DDG
-/// `lite`/`html` follow as fallback for when Bing is rate-limited or blocked.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum SearchEngine {
-    BingCn,
-    DdgLite,
-    DdgHtml,
-}
-
-const ENGINES: &[SearchEngine] = &[
-    SearchEngine::BingCn,
-    SearchEngine::DdgLite,
-    SearchEngine::DdgHtml,
-];
-
-impl SearchEngine {
-    fn label(&self) -> &'static str {
-        match self {
-            Self::BingCn => "bing-cn",
-            Self::DdgLite => "ddg-lite",
-            Self::DdgHtml => "ddg-html",
-        }
-    }
-
-    /// Fetch the results-page HTML for `query`.
-    async fn fetch_html(
-        &self,
-        client: &reqwest::Client,
-        query: &str,
-    ) -> Result<String, EverEvoError> {
-        match self {
-            Self::BingCn => {
-                // Bing uses GET ?q=; directly reachable in mainland China.
-                let url = format!("https://cn.bing.com/search?q={}", encode_url_query(query));
-                let resp = client
-                    .get(&url)
-                    .send()
-                    .await
-                    .map_err(|e| EverEvoError::Network(format!("bing request: {e}")))?;
-                if !resp.status().is_success() {
-                    return Err(EverEvoError::Network(format!(
-                        "bing HTTP {}",
-                        resp.status()
-                    )));
-                }
-                resp.text()
-                    .await
-                    .map_err(|e| EverEvoError::Network(format!("bing body: {e}")))
-            }
-            Self::DdgLite | Self::DdgHtml => {
-                let endpoint = match self {
-                    Self::DdgLite => "https://lite.duckduckgo.com/lite/",
-                    _ => "https://html.duckduckgo.com/html/",
-                };
-                let resp = client
-                    .post(endpoint)
-                    .form(&[("q", query), ("kp", "-2"), ("kl", "us-en")])
-                    .send()
-                    .await
-                    .map_err(|e| EverEvoError::Network(format!("ddg request: {e}")))?;
-                if !resp.status().is_success() {
-                    return Err(EverEvoError::Network(format!("ddg HTTP {}", resp.status())));
-                }
-                resp.text()
-                    .await
-                    .map_err(|e| EverEvoError::Network(format!("ddg body: {e}")))
-            }
-        }
-    }
-}
-
 /// Searches the web and returns structured results.
-/// Uses DuckDuckGo HTML (no API key) — reliable, rate-limited by DDG's web frontend.
+/// Uses multi-engine search (Bing + DuckDuckGo HTML, no API key required).
 pub struct WebSearchTool;
 
 impl WebSearchTool {
@@ -107,36 +40,26 @@ impl WebSearchTool {
             return Vec::new();
         }
 
-        // Bing has structured result blocks — parse those first for accuracy.
-        // If the page has `b_algo` markers but yields 0 results, it's a
-        // cold-query "no results" page and we should NOT fall back to generic
-        // parsing (which would return garbage nav/footer links).
         let has_bing_blocks = html.contains("b_algo");
         if has_bing_blocks {
             let results = Self::parse_bing_results(html, limit);
             if !results.is_empty() {
                 return results;
             }
-            // b_algo blocks exist but parser found nothing → genuine "no results"
-            // page; return empty rather than feeding nav links to the LLM.
             return Vec::new();
         }
 
-        // Generic parser — handles DDG lite/html and other engines.
         Self::parse_generic_results(html, limit)
     }
 
-    /// Parse Bing `b_algo` result blocks. Each block looks like:
-    /// `<li class="b_algo"><h2><a href="...">Title</a></h2><p>...</p></li>`
+    /// Parse Bing `b_algo` result blocks.
     fn parse_bing_results(html: &str, limit: usize) -> Vec<(String, String, String)> {
         let mut results = Vec::new();
         let mut pos = 0;
 
         while pos < html.len() && results.len() < limit {
-            // Find next <li class="b_algo">
             let block_start = match html[pos..].find("b_algo") {
                 Some(off) => {
-                    // Walk back to find the opening <li>
                     let slice = &html[..pos + off];
                     match slice.rfind("<li") {
                         Some(li) => li,
@@ -149,7 +72,6 @@ impl WebSearchTool {
                 None => break,
             };
 
-            // Find </li> for this block
             let block_end = match html[block_start..].find("</li>") {
                 Some(off) => block_start + off + 5,
                 None => break,
@@ -158,25 +80,21 @@ impl WebSearchTool {
 
             let block = &html[block_start..block_end];
 
-            // Extract href from <a href="...">
             let href = match extract_href(block) {
                 Some(h) if h.starts_with("http://") || h.starts_with("https://") => h,
                 _ => continue,
             };
 
-            // Skip Bing internal links
             if is_internal_link(&href) {
                 continue;
             }
 
-            // Extract title from <a ...>Title</a> or <h2><a ...>Title</a></h2>
             let title = extract_link_text(block);
 
             if title.is_empty() || title.eq_ignore_ascii_case("here") {
                 continue;
             }
 
-            // Extract snippet from <p> or <div class="b_caption">
             let snippet = extract_bing_snippet(block);
 
             if !results.iter().any(|(_, u, _)| u == &href) {
@@ -223,330 +141,6 @@ impl WebSearchTool {
 
         results
     }
-}
-
-/// Find the next result-like link in HTML, returning (url, title, next_pos).
-/// Looks for patterns like:
-///   <a ... href="http(s)://..." ... >Title</a>
-///   <a ... href="//example.com" ... >Title</a>
-fn find_result_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
-    let n = chars.len();
-    let mut pos = start;
-
-    while pos < n {
-        // Find next '<a'
-        let tag_start = substr_pos(chars, pos, "<a ")? + pos;
-        let tag_body_end = substr_pos(chars, tag_start, ">")? + tag_start + 1;
-
-        // Extract href from within the <a ... > tag
-        let tag_body: String = chars[tag_start + 3..tag_body_end].iter().collect();
-        let href = extract_href(&tag_body);
-
-        // Skip if no valid href. Accept protocol-relative `//` (DDG wraps
-        // results as `//duckduckgo.com/l/?uddg=...`); resolve_real_url unwraps it.
-        let href = match href {
-            Some(h)
-                if h.starts_with("http://") || h.starts_with("https://") || h.starts_with("//") =>
-            {
-                h
-            }
-            _ => {
-                pos = tag_body_end;
-                continue;
-            }
-        };
-
-        // Find closing </a>
-        let close_tag = substr_pos(chars, tag_body_end, "</a>")? + tag_body_end;
-        let title: String = chars[tag_body_end..close_tag].iter().collect();
-        let title = strip_html_tags(&title).trim().to_string();
-
-        // Skip empty titles or javascript: links
-        if title.is_empty() || href.starts_with("javascript:") {
-            pos = close_tag + 4;
-            continue;
-        }
-
-        return Some((href, title, close_tag + 4));
-    }
-
-    None
-}
-
-/// Extract snippet text following a result link.
-fn extract_snippet(chars: &[char], pos: usize) -> String {
-    let n = chars.len();
-    // Look for text within next ~500 chars before another link
-    let end = (pos + 800).min(n);
-
-    // Try to find <span class="result-snippet"> or <div class="result__snippet">
-    let snippet_tag = ["result-snippet", "result__snippet", "snippet"];
-    for tag in &snippet_tag {
-        if let Some(start) = substr_pos(chars, pos, tag) {
-            let real_start = start + pos + tag.len();
-            // find > after class
-            if let Some(gt) = substr_pos(chars, real_start, ">") {
-                let content_start = real_start + gt + 1;
-                // find closing </span> or </div>
-                for end_tag in &["</span>", "</div>"] {
-                    if let Some(et) = substr_pos(chars, content_start, end_tag) {
-                        let end_pos = content_start + et;
-                        let text: String = chars[content_start..end_pos].iter().collect();
-                        let clean = strip_html_tags(&text).trim().to_string();
-                        if clean.len() > 10 {
-                            return truncate_at(&clean, 200);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Fallback: grab plain text near the result
-    let mut text = String::new();
-    let mut in_tag = false;
-    let mut collected = 0usize;
-
-    for &ch in chars[pos..end].iter() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => {
-                in_tag = false;
-                if collected > 10 {
-                    text.push(' ');
-                }
-            }
-            _ if !in_tag && !matches!(ch, '\n' | '\r' | '\t') => {
-                text.push(ch);
-                collected += 1;
-            }
-            _ => {}
-        }
-        if collected > 200 {
-            break;
-        }
-    }
-
-    let clean: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    truncate_at(&clean, 200)
-}
-
-fn extract_href(tag_body: &str) -> Option<String> {
-    let href_pos = tag_body.find("href=")?;
-    let after = &tag_body[href_pos + 5..];
-    let quote = after.chars().next()?;
-    let inner = &after[1..];
-    let end = inner.find(quote)?;
-    let url = &inner[..end];
-
-    // Decode minimal HTML entities
-    let url = url.replace("&amp;", "&");
-
-    Some(url.to_string())
-}
-
-/// Detect a search-engine anti-bot / challenge page — these contain no real
-/// results and must return empty so the caller falls back to the next endpoint
-/// instead of parsing garbage links from the challenge footer.
-///
-/// Covers both DuckDuckGo and Bing block pages.
-fn is_challenge_page(html: &str) -> bool {
-    // DuckDuckGo challenge markers
-    html.contains("anomaly.js")
-        || html.contains("challenge-form")
-        || html.contains("/check.")
-        || html.contains("ddg_ptoken")
-        || html.contains("Get the full-JS version here")
-        || html.contains("not enabled JavaScript")
-        // Bing captcha / rate-limit / consent-wall markers
-        || html.contains("captcha-delivery.com")
-        || html.contains("g-recaptcha")
-        || html.contains("hCaptcha")
-        || html.contains("challenge-platform")
-        || html.contains("tr.bing.com")
-        || (html.contains("id=\"b_sb_preview\"") && !html.contains("b_algo"))
-        // Cloudflare / generic CDN challenge pages
-        || html.contains("Just a moment...")
-        || html.contains("Checking your browser")
-        || html.contains("DDoS protection")
-        || html.contains("cf-browser-verification")
-        || html.contains("cf-challenge-running")
-        || html.contains("_cf_chl_opt")
-        || html.contains("cf-spinner")
-        || html.contains("Please turn JavaScript on")
-        || html.contains("please enable JavaScript")
-        || html.contains("Attention Required! | Cloudflare")
-        // Akamai / Imperva / Distil
-        || html.contains("akamai")
-        || html.contains("distil_r_captcha")
-        || html.contains("imperva")
-        // Generic: very short pages with no actual link tags are likely
-        // error/block pages, not search results
-        || (html.len() < 200 && !html.contains("<a "))
-}
-
-/// Resolve a DDG result href to the real destination URL.
-///
-/// DDG wraps results as `//duckduckgo.com/l/?uddg=<percent-encoded real url>`.
-/// Direct `http(s)://` hrefs pass through unchanged.
-fn resolve_real_url(href: &str) -> Option<String> {
-    if let Some(pos) = href.find("uddg=") {
-        let after = &href[pos + "uddg=".len()..];
-        let end = after.find('&').unwrap_or(after.len());
-        let decoded = percent_decode(&after[..end]);
-        if decoded.starts_with("http://") || decoded.starts_with("https://") {
-            return Some(decoded);
-        }
-    }
-    // Protocol-relative real URL (rare, non-DDG): normalize to https.
-    if let Some(rest) = href.strip_prefix("//") {
-        if !rest.starts_with("duckduckgo.com") && rest.contains('.') {
-            return Some(format!("https:{href}"));
-        }
-    }
-    if href.starts_with("http://") || href.starts_with("https://") {
-        return Some(href.replace("&amp;", "&"));
-    }
-    None
-}
-
-/// Is this a search-engine-internal link (ads, nav, redirect that didn't unwrap)?
-/// Covers both DuckDuckGo and Bing self-references.
-fn is_internal_link(url: &str) -> bool {
-    // DuckDuckGo internals
-    url.contains("duckduckgo.com/y.js")
-        || url.contains("duckduckgo.com/l/?")
-        || url.contains("duckduckgo.com/ai")
-        || url.starts_with("https://duckduckgo.com")
-        || url.starts_with("http://duckduckgo.com")
-        // Bing internals: nav, ads, attribution, "ck/a" click-redirect
-        || url.contains("://www.bing.com/ck/")
-        || url.contains("go.microsoft.com/fwlink")
-        || url.contains("://www.bing.com/account")
-        || url.contains("://www.bing.com/feedback")
-        || url.contains("://cn.bing.com/ck/")
-        || url == "https://www.bing.com"
-        || url == "https://cn.bing.com"
-}
-
-/// Minimal percent-decoding for `uddg=` params: `+` → space, `%XX` → byte.
-fn percent_decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'+' => out.push(b' '),
-            b'%' if i + 2 < b.len() => {
-                if let Ok(byte) =
-                    u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or(""), 16)
-                {
-                    out.push(byte);
-                    i += 3;
-                    continue;
-                } else {
-                    out.push(b[i]);
-                }
-            }
-            c => out.push(c),
-        }
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-/// Extract the text content between `<a ...>` and `</a>`.
-fn extract_link_text(html_fragment: &str) -> String {
-    // Find <a ...>
-    let a_start = match html_fragment.find("<a ") {
-        Some(pos) => pos,
-        None => return String::new(),
-    };
-    let tag_end = match html_fragment[a_start..].find('>') {
-        Some(pos) => a_start + pos + 1,
-        None => return String::new(),
-    };
-    let close = match html_fragment[tag_end..].find("</a>") {
-        Some(pos) => tag_end + pos,
-        None => return String::new(),
-    };
-    strip_html_tags(&html_fragment[tag_end..close]).trim().to_string()
-}
-
-/// Extract snippet text from a Bing `b_algo` block.
-/// Bing puts the description in `<p>` or `<div class="b_caption">`.
-fn extract_bing_snippet(block: &str) -> String {
-    // Try <p> tag text
-    if let Some(p_start) = block.find("<p") {
-        if let Some(gt) = block[p_start..].find('>') {
-            let content_start = p_start + gt + 1;
-            if let Some(end) = block[content_start..].find("</p>") {
-                let text = &block[content_start..content_start + end];
-                let clean = strip_html_tags(text).trim().to_string();
-                if clean.len() > 10 {
-                    return truncate_at(&clean, 200);
-                }
-            }
-        }
-    }
-    // Try <div class="b_caption">
-    if let Some(div_start) = block.find("b_caption") {
-        if let Some(gt) = block[div_start..].find('>') {
-            let content_start = div_start + gt + 1;
-            if let Some(end) = block[content_start..].find("</div>") {
-                let text = &block[content_start..content_start + end];
-                let clean = strip_html_tags(text).trim().to_string();
-                if clean.len() > 10 {
-                    return truncate_at(&clean, 200);
-                }
-            }
-        }
-    }
-    String::new()
-}
-
-fn substr_pos(haystack: &[char], start: usize, needle: &str) -> Option<usize> {
-    let needle_chars: Vec<char> = needle.chars().collect();
-    if needle_chars.is_empty() || start >= haystack.len() {
-        return None;
-    }
-    haystack[start..]
-        .windows(needle_chars.len())
-        .position(|window| window == needle_chars.as_slice())
-}
-
-fn strip_html_tags(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut in_tag = false;
-    for ch in s.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(ch),
-            _ => {}
-        }
-    }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn truncate_at(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        s.chars().take(max).collect::<String>() + "…"
-    }
-}
-
-/// Percent-encode a search query for embedding in a browser URL.
-/// Space → `+` (form-encoded), unreserved chars pass through, all else → `%XX`.
-pub fn encode_url_query(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            ' ' => "+".to_string(),
-            c if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') => c.to_string(),
-            c => format!("%{:02X}", c as u8),
-        })
-        .collect()
 }
 
 #[async_trait]
@@ -645,15 +239,11 @@ impl Tool for WebSearchTool {
             })
             .unwrap_or_default();
 
-        // Browser-grade client: realistic headers + proxy awareness to dodge
-        // datacenter-IP 403 blocks.
         let client = super::http_util::build_browser_client(
             std::time::Duration::from_secs(10),
             std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS),
         )?;
 
-        // Try each DDG endpoint in order until one returns parseable results.
-        // This defeats per-endpoint IP blocking.
         let mut results: Vec<(String, String, String)> = Vec::new();
         let mut last_error = String::new();
         let mut tried: Vec<&str> = Vec::new();
@@ -685,15 +275,9 @@ impl Tool for WebSearchTool {
             }
         }
 
-        // Track the CDP bridge error for diagnostic output.
         let mut bridge_error: Option<String> = None;
 
         if results.is_empty() {
-            // ── Tier 2 fallback: CDP browser bridge ────────────────────
-            // Launch the user's real browser (Chrome/Edge) via CDP, navigate
-            // to the search engine, and extract results from the rendered DOM.
-            // The real browser has the user's TLS fingerprint, viewport, and
-            // IP (plus proxy/VPN), so it naturally bypasses anti-bot blocks.
             match super::browser_bridge::search_via_browser(query, limit).await {
                 Ok(browser_results) if !browser_results.is_empty() => {
                     results = browser_results
@@ -702,8 +286,13 @@ impl Tool for WebSearchTool {
                         .collect();
                 }
                 Ok(_) => {
-                    bridge_error = Some("CDP browser bridge: navigation succeeded but 0 results extracted".into());
-                    tracing::debug!("{}", bridge_error.as_deref().unwrap());
+                    bridge_error = Some(
+                        "CDP browser bridge: navigation succeeded but 0 results extracted"
+                            .into(),
+                    );
+                    tracing::debug!(
+                        "CDP browser bridge: navigation succeeded but 0 results extracted"
+                    );
                 }
                 Err(ref e) => {
                     bridge_error = Some(format!("CDP browser bridge: {e}"));
@@ -714,21 +303,16 @@ impl Tool for WebSearchTool {
 
         if results.is_empty() {
             let tried_str = tried.join(", ");
-            // ── Tier 3 last resort: open browser for manual review ─────
-            // CDP bridge failed or returned no results. Open the user's
-            // default browser as a final fallback so they can read results
-            // manually. The agent will see the search URL and can suggest
-            // the user paste relevant info back.
             let engine = std::env::var("EVEREVO_SEARCH_BROWSER_URL")
                 .unwrap_or_else(|_| "https://cn.bing.com/search?q=".to_string());
             let browser_url = format!("{}{}", engine, encode_url_query(query));
 
             let _ = open::that(&browser_url);
 
-            // Build a diagnostic-rich error message.
             let bridge_detail = bridge_error
                 .as_deref()
-                .unwrap_or("CDP browser bridge: not attempted (HTTP engines returned results but all were empty)");
+                .unwrap_or("CDP browser bridge: not attempted");
+
             return Ok(ToolOutput {
                 content: format!(
                     "Web search failed — all endpoints and browser bridge exhausted.\n\n\
@@ -744,7 +328,6 @@ impl Tool for WebSearchTool {
             });
         }
 
-        // Apply domain filters
         let filtered: Vec<_> = results
             .into_iter()
             .filter(|(_, url, _)| {
@@ -766,10 +349,11 @@ impl Tool for WebSearchTool {
         if filtered.is_empty() {
             return Ok(ToolOutput {
                 content: format!(
-                    "No results found for '{query}'. Try different keywords or check allowed_domains/blocked_domains filters."
+                    "No results found for '{query}'. Try different keywords or check domain filters."
                 ),
                 is_error: false,
-             ..Default::default() });
+                ..Default::default()
+            });
         }
 
         let lines: Vec<String> = filtered
@@ -803,7 +387,6 @@ mod tests {
 
     #[test]
     fn test_parse_real_ddg_html() {
-        // Simulated DDG HTML result snippet
         let html = r#"
         <html><body>
         <div class="result">
@@ -838,7 +421,6 @@ mod tests {
         <a class="result-link" href="https://example.com/page">Example</a>
         "#;
         let results = WebSearchTool::parse_results(html, 5);
-        // The first result should be example.com, not duckduckgo internal
         if !results.is_empty() {
             assert!(
                 !results[0].1.contains("duckduckgo.com"),
@@ -850,7 +432,6 @@ mod tests {
 
     #[test]
     fn test_parse_ddg_redirect_unwraps_uddg() {
-        // DDG lite/html wraps real URLs in //duckduckgo.com/l/?uddg=<encoded>.
         let html = r#"<a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Frust-lang.org%2F">Rust Programming Language</a>"#;
         let results = WebSearchTool::parse_results(html, 5);
         assert_eq!(results.len(), 1);
@@ -861,8 +442,6 @@ mod tests {
 
     #[test]
     fn test_parse_challenge_returns_empty() {
-        // Anti-bot challenge page must yield NO results (so the next endpoint
-        // is tried), instead of mistaking the footer "here" link for a result.
         let html = r#"<html><body>
             <script src="anomaly.js"></script>
             <form id="challenge-form"></form>
@@ -915,7 +494,7 @@ mod tests {
         assert_eq!(truncate_at("hello", 10), "hello");
         assert_eq!(
             truncate_at("hello world this is a test", 12),
-            "hello world …"
+            "hello world \u{2026}"
         );
     }
 
@@ -935,14 +514,12 @@ mod tests {
 
     #[test]
     fn test_encode_url_query_special_chars() {
-        // & and # must be percent-encoded or they break the URL
         assert_eq!(encode_url_query("rust & crates"), "rust+%26+crates");
         assert_eq!(encode_url_query("c# vs rust"), "c%23+vs+rust");
     }
 
     #[test]
     fn test_encode_url_query_cjk() {
-        // Non-ASCII must be percent-encoded as UTF-8 bytes
         let encoded = encode_url_query("你好");
         assert!(
             encoded.starts_with("%"),
@@ -952,14 +529,12 @@ mod tests {
 
     #[test]
     fn test_engines_defined() {
-        // Bing (default, mainland-friendly) + at least one DDG fallback.
         assert!(ENGINES.len() >= 2);
-        assert_eq!(ENGINES[0], SearchEngine::BingCn); // Bing must be tried first
+        assert_eq!(ENGINES[0], SearchEngine::BingCn);
     }
 
     #[test]
     fn test_parse_bing_html() {
-        // Bing returns real URLs directly (no uddg redirect wrapper).
         let html = r#"<li class="b_algo">
             <h2><a href="https://www.rust-lang.org/" h="ID=SERP,5000.1">Rust Programming Language</a></h2>
             <p>A language empowering everyone to build reliable and efficient software.</p>
@@ -983,7 +558,6 @@ mod tests {
 
     #[test]
     fn test_parse_filters_bing_internal() {
-        // Bing nav/ad links (ck/a click-redirect, account) must be skipped.
         let html = r#"<a href="https://www.bing.com/ck/a?...">Ad</a>
         <a href="https://www.bing.com/account/preferences">Settings</a>
         <a href="https://example.com/real">Real Result</a>"#;
@@ -995,5 +569,60 @@ mod tests {
         assert!(!results
             .iter()
             .any(|(_, u, _)| u.contains("bing.com/account")));
+    }
+
+    // ── Edge case / crash resistance ─────────────────────────────────
+
+    #[test]
+    fn test_extract_href_malformed() {
+        assert_eq!(extract_href(""), None);
+        assert_eq!(extract_href("no equals sign"), None);
+        assert_eq!(extract_href(r#"href=""#,), None); // unclosed quote
+        assert_eq!(extract_href(r#"href=""#), None);         // empty value
+    }
+
+    #[test]
+    fn test_strip_html_tags_nested() {
+        assert_eq!(strip_html_tags("<div><span>text</span></div>"), "text");
+        assert_eq!(strip_html_tags("<a href='x'>link</a>"), "link");
+    }
+
+    #[test]
+    fn test_truncate_at_edge_cases() {
+        assert_eq!(truncate_at("", 5), "");
+        assert_eq!(truncate_at("hi", 5), "hi");
+        // Unicode: each char counts as 1
+        assert_eq!(truncate_at("你好世界", 2), "你好\u{2026}");
+    }
+
+    #[test]
+    fn test_encode_url_query_roundtrip() {
+        // Alphanumeric should pass through unchanged
+        assert_eq!(encode_url_query("hello123"), "hello123");
+        // Special chars should be encoded
+        let encoded = encode_url_query("test&query=1");
+        assert!(!encoded.contains('&'));
+        assert!(!encoded.contains('='));
+    }
+
+    #[test]
+    fn test_is_challenge_page_never_panics() {
+        // Very long input, binary-ish content — must not panic
+        let big = "x".repeat(10000);
+        let _ = is_challenge_page(&big);
+        // Empty
+        let _ = is_challenge_page("");
+        // Garbage
+        let _ = is_challenge_page("\x00\x01\x02\x03");
+    }
+
+    #[test]
+    fn test_substr_pos_edge_cases() {
+        let chars: Vec<char> = "hello world".chars().collect();
+        assert_eq!(substr_pos(&chars, 0, "hello"), Some(0));
+        assert_eq!(substr_pos(&chars, 0, "world"), Some(6));
+        assert_eq!(substr_pos(&chars, 0, "xyz"), None);
+        assert_eq!(substr_pos(&chars, 100, "hello"), None);
+        assert_eq!(substr_pos(&[], 0, "hello"), None);
     }
 }

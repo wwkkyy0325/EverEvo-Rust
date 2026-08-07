@@ -85,6 +85,141 @@ impl EverEvoError {
     }
 }
 
+// ── HTTP API Error ──────────────────────────────────────────────────────
+
+use axum_core::response::{IntoResponse, Response};
+use http::StatusCode;
+use serde::Serialize;
+
+/// Machine-readable error code — one per failure mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ErrorCode {
+    NotFound,
+    InvalidInput,
+    Conflict,
+    Forbidden,
+    Unauthorized,
+    TooManyRequests,
+    Internal,
+    DatabaseError,
+    LlmProviderError,
+    SandboxError,
+    NetworkError,
+    IoError,
+    ConfigError,
+    AgentError,
+    ToolError,
+    BootstrapError,
+    Timeout,
+    ServiceUnavailable,
+}
+
+impl ErrorCode {
+    pub fn status_code(self) -> StatusCode {
+        match self {
+            Self::NotFound => StatusCode::NOT_FOUND,
+            Self::InvalidInput => StatusCode::BAD_REQUEST,
+            Self::Conflict => StatusCode::CONFLICT,
+            Self::Forbidden => StatusCode::FORBIDDEN,
+            Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
+            Self::Timeout => StatusCode::GATEWAY_TIMEOUT,
+            Self::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::NetworkError => StatusCode::BAD_GATEWAY,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+/// Unified HTTP API error. Every route returns this.
+/// JSON envelope: `{"error":{"code":"NOT_FOUND","message":"...","details":null}}`
+#[derive(Debug)]
+pub struct ApiError {
+    pub code: ErrorCode,
+    pub message: String,
+    pub details: Option<serde_json::Value>,
+}
+
+impl ApiError {
+    pub fn not_found(msg: impl Into<String>) -> Self {
+        Self { code: ErrorCode::NotFound, message: msg.into(), details: None }
+    }
+    pub fn bad_request(msg: impl Into<String>) -> Self {
+        Self { code: ErrorCode::InvalidInput, message: msg.into(), details: None }
+    }
+    pub fn conflict(msg: impl Into<String>) -> Self {
+        Self { code: ErrorCode::Conflict, message: msg.into(), details: None }
+    }
+    pub fn forbidden(msg: impl Into<String>) -> Self {
+        Self { code: ErrorCode::Forbidden, message: msg.into(), details: None }
+    }
+    pub fn internal(msg: impl Into<String>) -> Self {
+        Self { code: ErrorCode::Internal, message: msg.into(), details: None }
+    }
+    pub fn timeout(msg: impl Into<String>) -> Self {
+        Self { code: ErrorCode::Timeout, message: msg.into(), details: None }
+    }
+
+    #[allow(dead_code)]
+    pub fn with_details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(details);
+        self
+    }
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{}] {}", self.code.status_code().as_u16(), self.message)
+    }
+}
+
+impl std::error::Error for ApiError {}
+
+/// Map EverEvoError → ApiError with correct status codes.
+impl From<EverEvoError> for ApiError {
+    fn from(e: EverEvoError) -> Self {
+        let code = match &e {
+            EverEvoError::NotFound(_) => ErrorCode::NotFound,
+            EverEvoError::InvalidInput(_) => ErrorCode::InvalidInput,
+            EverEvoError::Config(_) => ErrorCode::ConfigError,
+            EverEvoError::Database(_) => ErrorCode::DatabaseError,
+            EverEvoError::LlmProvider(_) => ErrorCode::LlmProviderError,
+            EverEvoError::Agent(_) => ErrorCode::AgentError,
+            EverEvoError::Tool { .. } => ErrorCode::ToolError,
+            EverEvoError::Sandbox(_) => ErrorCode::SandboxError,
+            EverEvoError::Bootstrap(_) => ErrorCode::BootstrapError,
+            EverEvoError::Network(_) => ErrorCode::NetworkError,
+            EverEvoError::Io(_) => ErrorCode::IoError,
+            _ => ErrorCode::Internal,
+        };
+        Self { code, message: e.to_string(), details: None }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let status = self.code.status_code();
+        let body = serde_json::json!({
+            "error": {
+                "code": self.code,
+                "message": self.message,
+                "details": self.details,
+            }
+        });
+        Response::builder()
+            .status(status)
+            .header(
+                http::header::CONTENT_TYPE,
+                http::header::HeaderValue::from_static("application/json"),
+            )
+            .body(axum_core::body::Body::new(
+                serde_json::to_string(&body).unwrap_or_default(),
+            ))
+            .unwrap()
+    }
+}
+
 pub type Result<T> = std::result::Result<T, EverEvoError>;
 
 #[cfg(test)]

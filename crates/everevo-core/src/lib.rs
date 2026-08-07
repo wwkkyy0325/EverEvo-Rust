@@ -25,7 +25,7 @@ pub use agent::{Agent, AgentContext, AgentOutput};
 pub use context::{
     default_pipeline, ContextBuildContext, ContextFragment, ContextPipeline, ContextStage,
 };
-pub use error::EverEvoError;
+pub use error::{ApiError, ErrorCode, EverEvoError};
 pub use llm::{
     FinishReason, ImageData, LlmMessage, LlmProvider, LlmResponse, LlmRole, StreamEvent, ToolSchema,
 };

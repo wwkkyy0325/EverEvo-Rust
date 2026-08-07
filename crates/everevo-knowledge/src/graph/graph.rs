@@ -172,6 +172,54 @@ impl KnowledgeGraph {
             .count()
     }
 
+    /// Add a many-to-many relation (no supersede semantics).
+    ///
+    /// Unlike `add_relation()`, this does NOT supersede existing relations
+    /// with the same `(from, predicate)` pair. Use for `DependsOn`,
+    /// `HasCapability`, and other one-to-many predicates.
+    pub fn add_relation_many(&mut self, relation: Relation) {
+        // Only skip if the EXACT same relation already exists
+        let already_exists = self.relations.iter().any(|r| {
+            r.from == relation.from
+                && r.predicate == relation.predicate
+                && r.to == relation.to
+                && r.status == RelationStatus::Active
+        });
+        if !already_exists {
+            self.relations.push(Relation {
+                status: RelationStatus::Active,
+                ..relation
+            });
+        }
+    }
+
+    /// Find active relations matching a given predicate.
+    ///
+    /// Matches on the predicate string directly (both raw strings and
+    /// `SymbolPredicate::as_uri_fragment()` values).
+    pub fn find_relations_by_predicate(
+        &self,
+        from: &str,
+        predicate: &str,
+    ) -> Vec<&Relation> {
+        self.relations
+            .iter()
+            .filter(|r| {
+                r.from == from
+                    && r.predicate == predicate
+                    && r.status == RelationStatus::Active
+            })
+            .collect()
+    }
+
+    /// Find all active relations where the predicate matches (any from/to).
+    pub fn find_relations_by_predicate_any(&self, predicate: &str) -> Vec<&Relation> {
+        self.relations
+            .iter()
+            .filter(|r| r.predicate == predicate && r.status == RelationStatus::Active)
+            .collect()
+    }
+
     /// Seed the knowledge graph with project structure entities so
     /// `memory kg_search` returns useful results immediately — no empty
     /// "no entities" response on first use.
@@ -378,6 +426,9 @@ impl KnowledgeGraph {
                             "Concept" => EntityType::Concept,
                             "File" => EntityType::File,
                             "Event" => EntityType::Event,
+                            "Capability" => EntityType::Capability,
+                            "KnowledgeSource" => EntityType::KnowledgeSource,
+                            "Constraint" => EntityType::Constraint,
                             other => EntityType::Other(other.into()),
                         },
                         properties: sol

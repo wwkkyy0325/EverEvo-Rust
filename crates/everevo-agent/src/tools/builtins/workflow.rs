@@ -51,6 +51,10 @@ pub struct WorkflowTool {
     shared_pending: Option<super::delegate::SharedPending>,
     /// Shared results backlog (from TaskTool) — auto-continue loop drains this.
     shared_backlog: Option<super::delegate::SharedBacklog>,
+    /// Result sender — feeds subagent_rx so the main loop injects [SubAgent Result].
+    /// Mirrors TaskTool.result_tx; shared across tools so Workflow/Team results
+    /// flow through the same channel as TaskTool results.
+    result_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 impl WorkflowTool {
@@ -66,6 +70,7 @@ impl WorkflowTool {
             max_concurrent: 4,
             shared_pending: None,
             shared_backlog: None,
+            result_tx: None,
         }
     }
 
@@ -80,6 +85,16 @@ impl WorkflowTool {
     ) -> Self {
         self.shared_pending = Some(pending);
         self.shared_backlog = Some(backlog);
+        self
+    }
+
+    /// Wire the result sender so sub-agent results flow back to the main loop
+    /// via subagent_rx (same channel TaskTool uses).
+    pub fn with_result_tx(
+        mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> Self {
+        self.result_tx = Some(tx);
         self
     }
 
@@ -274,12 +289,17 @@ impl Tool for WorkflowTool {
             let statuses_c = Arc::clone(&self.statuses);
             let shared_pending = self.shared_pending.clone();
             let shared_backlog = self.shared_backlog.clone();
+            let result_tx = self.result_tx.clone();
             let task_id_str = task_id.to_string();
 
             tokio::spawn(async move {
                 let _permit = permit; // hold semaphore permit until task completes
                 let content = run_workflow_agent(&prompt, llm_c, tools_c, &sandbox_c, cancel).await;
                 let summary = format!("## {desc}\n\n{content}");
+                // Feed into subagent_rx so the main loop injects [SubAgent Result]
+                if let Some(ref tx) = result_tx {
+                    let _ = tx.send(summary.clone());
+                }
                 results_c
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -341,6 +361,6 @@ async fn run_workflow_agent(
         LlmMessage::user(prompt),
     ];
 
-    let agent = crate::AgentLoop::new().with_max_turns(3);
+    let agent = crate::AgentLoop::sub_agent(3);
     agent.run_subagent(llm, tools, messages, cancel).await
 }

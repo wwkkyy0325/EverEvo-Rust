@@ -4,6 +4,7 @@ use crate::app_state::AppState;
 use axum::extract::{Path, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use everevo_core::ApiError;
 use std::sync::Arc;
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -51,23 +52,20 @@ async fn list_servers(State(state): State<Arc<AppState>>) -> Json<serde_json::Va
 async fn reconnect_server(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     // Find the server config
-    let srv = match state.config.mcp_servers.iter().find(|s| s.name == name) {
-        Some(s) => s.clone(),
-        None => {
-            return Json(serde_json::json!({
-                "error": format!("MCP server '{name}' not found in config"),
-                "success": false,
-            }));
-        }
-    };
+    let srv = state
+        .config
+        .mcp_servers
+        .iter()
+        .find(|s| s.name == name)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found(format!("MCP server '{name}' not found in config")))?;
 
     if !srv.enabled {
-        return Json(serde_json::json!({
-            "error": format!("MCP server '{name}' is disabled in config"),
-            "success": false,
-        }));
+        return Err(ApiError::bad_request(format!(
+            "MCP server '{name}' is disabled in config"
+        )));
     }
 
     // Drop old connection (kills old process for stdio)
@@ -86,20 +84,16 @@ async fn reconnect_server(
         Ok((client, tools)) => {
             tracing::info!(%name, tool_count = tools.len(), "MCP server reconnected");
             state.mcp_clients.write().await.insert(name.clone(), client);
-            Json(serde_json::json!({
+            Ok(Json(serde_json::json!({
                 "success": true,
                 "name": name,
                 "tool_count": tools.len(),
                 "message": format!("Reconnected — {} tools available", tools.len()),
-            }))
+            })))
         }
         Err(e) => {
             tracing::warn!(%name, error = %e, "MCP server reconnect failed");
-            Json(serde_json::json!({
-                "success": false,
-                "name": name,
-                "error": e,
-            }))
+            Err(ApiError::internal(format!("MCP server '{name}' reconnect failed: {e}")))
         }
     }
 }

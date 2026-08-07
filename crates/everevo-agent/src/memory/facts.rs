@@ -42,18 +42,20 @@ pub type FactWriteTx = tokio::sync::mpsc::UnboundedSender<FactWriteTask>;
 ///   1. **MD files** (FactManager) — human-readable source of truth
 ///   2. **SQLite FTS5** (everevo.db, `facts` table) — sub-millisecond keyword search
 ///   3. **Vector store** (RagPipeline) — semantic search index (if configured)
+#[derive(Clone)]
 pub struct FactManager {
     facts_dir: PathBuf,
     index_path: PathBuf,
     max_facts: usize,
     /// Optional RAG pipeline for real-time vector indexing on save.
-    rag: Arc<std::sync::Mutex<Option<Arc<crate::rag::RagPipeline>>>>,
+    /// Set once during init, read-only thereafter — `OnceLock` avoids lock overhead.
+    rag: Arc<std::sync::OnceLock<Arc<crate::rag::RagPipeline>>>,
     /// Optional DB handle for SQLite FTS5 indexing on save.
-    db: Arc<std::sync::Mutex<Option<Arc<everevo_db::Database>>>>,
+    db: Arc<std::sync::OnceLock<Arc<everevo_db::Database>>>,
     /// Serialized FTS5 writer channel. When set, fact upserts are enqueued here
     /// instead of fire-and-forget spawned — eliminates concurrent FTS5
     /// external-content trigger conflicts ("SQL logic error").
-    write_queue: Arc<std::sync::Mutex<Option<FactWriteTx>>>,
+    write_queue: Arc<std::sync::OnceLock<FactWriteTx>>,
 }
 
 impl FactManager {
@@ -67,9 +69,9 @@ impl FactManager {
             facts_dir,
             index_path,
             max_facts: 200,
-            rag: Arc::new(std::sync::Mutex::new(None)),
-            db: Arc::new(std::sync::Mutex::new(None)),
-            write_queue: Arc::new(std::sync::Mutex::new(None)),
+            rag: Arc::new(std::sync::OnceLock::new()),
+            db: Arc::new(std::sync::OnceLock::new()),
+            write_queue: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -80,17 +82,12 @@ impl FactManager {
 
     /// Attach a RAG pipeline for real-time vector indexing on each save.
     pub fn set_rag(&self, rag: Arc<crate::rag::RagPipeline>) {
-        if let Ok(mut guard) = self.rag.lock() {
-            *guard = Some(rag);
-        }
+        let _ = self.rag.set(rag);
     }
 
     /// Attach a Database handle for SQLite FTS5 indexing on each save.
     pub fn set_db(&self, db: Arc<everevo_db::Database>) {
-        if let Ok(mut guard) = self.db.lock() {
-            // Ensure FTS5 table exists on first use
-            *guard = Some(db);
-        }
+        let _ = self.db.set(db);
     }
 
     /// Attach a serialized writer channel. When set, `save()` enqueues FTS5
@@ -98,12 +95,14 @@ impl FactManager {
     /// concurrent FTS5 external-content trigger conflicts that produced
     /// "SQL logic error" (code 1) under burst saves.
     pub fn set_write_queue(&self, tx: FactWriteTx) {
-        if let Ok(mut guard) = self.write_queue.lock() {
-            *guard = Some(tx);
-        }
+        let _ = self.write_queue.set(tx);
     }
 
     /// Save a fact to disk, regenerate the index, and auto-index into RAG.
+    ///
+    /// Synchronous — uses `std::fs` directly. For async contexts, prefer
+    /// [`save_async`] which wraps the entire save+index pipeline in `spawn_blocking`
+    /// to avoid blocking the tokio runtime thread.
     pub fn save(&self, fact: &MemoryFact) -> Result<(), EverEvoError> {
         let existing = load_all_facts(&self.facts_dir)?;
         let is_update = existing.iter().any(|f| f.name == fact.name);
@@ -162,55 +161,59 @@ impl FactManager {
         // Prefer the serialized writer queue to avoid concurrent FTS5
         // external-content trigger conflicts ("SQL logic error"). Falls back
         // to a fire-and-forget spawn when no queue is attached (e.g. tests).
-        if let Ok(guard) = self.db.lock() {
-            if let Some(ref db) = *guard {
-                let task = FactWriteTask {
-                    id: fact.name.clone(),
-                    description: fact.description.clone(),
-                    content: format!("{}: {}", fact.name, fact.content),
-                    fact_type: "project".to_string(),
-                };
-                let queued = self
-                    .write_queue
-                    .lock()
-                    .ok()
-                    .and_then(|wq| wq.as_ref().map(|tx| tx.send(task.clone()).is_ok()))
-                    .unwrap_or(false);
-                if !queued {
-                    let db = Arc::clone(db);
-                    tokio::spawn(async move {
-                        if let Err(e) = db
-                            .upsert_fact(
-                                &task.id,
-                                &task.description,
-                                &task.content,
-                                &task.fact_type,
-                            )
-                            .await
-                        {
-                            tracing::warn!(error = %e, "Fact SQLite indexing failed");
-                        }
-                    });
-                }
+        if let Some(db) = self.db.get() {
+            let task = FactWriteTask {
+                id: fact.name.clone(),
+                description: fact.description.clone(),
+                content: format!("{}: {}", fact.name, fact.content),
+                fact_type: "project".to_string(),
+            };
+            let queued = self
+                .write_queue
+                .get()
+                .map(|tx| tx.send(task.clone()).is_ok())
+                .unwrap_or(false);
+            if !queued {
+                let db = Arc::clone(db);
+                tokio::spawn(async move {
+                    if let Err(e) = db
+                        .upsert_fact(
+                            &task.id,
+                            &task.description,
+                            &task.content,
+                            &task.fact_type,
+                        )
+                        .await
+                    {
+                        tracing::warn!(error = %e, "Fact SQLite indexing failed");
+                    }
+                });
             }
         }
 
         // Real-time vector indexing
-        if let Ok(guard) = self.rag.lock() {
-            if let Some(ref rag) = *guard {
-                let chunk = crate::rag::make_chunk_with_sources(
-                    format!("{}: {}", fact.name, fact.content),
-                    everevo_vector::ChunkType::Fact,
-                    fact.projection.source_pointers.clone(),
-                );
-                if let Err(e) = rag.ingest_into("memory", vec![chunk]) {
-                    tracing::warn!(error = %e, "Fact vector indexing failed");
-                }
+        if let Some(rag) = self.rag.get() {
+            let chunk = crate::rag::make_chunk_with_sources(
+                format!("{}: {}", fact.name, fact.content),
+                everevo_vector::ChunkType::Fact,
+                fact.projection.source_pointers.clone(),
+            );
+            if let Err(e) = rag.ingest_into("memory", vec![chunk]) {
+                tracing::warn!(error = %e, "Fact vector indexing failed");
             }
         }
 
         tracing::info!(name = %fact.name, updated = is_update, "Fact saved");
         Ok(())
+    }
+
+    /// Async wrapper — runs the full save+index+vector pipeline on the blocking
+    /// thread pool so the tokio runtime stays responsive under concurrent saves.
+    pub async fn save_async(&self, fact: MemoryFact) -> Result<(), EverEvoError> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || this.save(&fact))
+            .await
+            .map_err(|e| EverEvoError::Internal(format!("Fact save panicked: {e}")))?
     }
 
     /// Load a single fact by name.

@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use crate::app_state::AppState;
 use everevo_core::llm::LlmProvider;
+use everevo_core::ApiError;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct LlmProviderConfig {
@@ -83,7 +84,7 @@ async fn get_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
 async fn put_config(
     State(state): State<Arc<AppState>>,
     Json(body): Json<AppSettings>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let providers = body.llm.clone().unwrap_or_default();
     let existing = load_settings(&state).await;
     let merged = AppSettings {
@@ -119,9 +120,9 @@ async fn put_config(
             if !new_map.is_empty() {
                 state.llm_notify.notify_one();
             }
-            Json(serde_json::json!({ "data": { "saved": true } }))
+            Ok(Json(serde_json::json!({ "data": { "saved": true } })))
         }
-        Err(e) => Json(serde_json::json!({ "error": format!("Save failed: {e}") })),
+        Err(e) => Err(ApiError::internal(format!("Save failed: {e}"))),
     }
 }
 
@@ -214,7 +215,7 @@ async fn get_routing(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
 async fn put_routing(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let mut settings = load_settings(&state).await;
     let tiers: Vec<CascadeTier> = body
         .get("tiers")
@@ -251,8 +252,8 @@ async fn put_routing(
         main_effort,
     });
     match save_settings(&state, &settings).await {
-        Ok(_) => Json(serde_json::json!({ "ok": true })),
-        Err(e) => Json(serde_json::json!({ "ok": false, "error": e })),
+        Ok(_) => Ok(Json(serde_json::json!({ "ok": true }))),
+        Err(e) => Err(ApiError::internal(e)),
     }
 }
 

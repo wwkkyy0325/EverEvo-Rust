@@ -3,16 +3,16 @@
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::app_state::AppState;
+use everevo_core::ApiError;
 
-type Result<T> = std::result::Result<T, (StatusCode, String)>;
+type HandlerResult<T> = std::result::Result<T, ApiError>;
 
-fn err<E: ToString>(e: E) -> (StatusCode, String) {
-    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+fn err<E: ToString>(e: E) -> ApiError {
+    ApiError::internal(e.to_string())
 }
 
 #[derive(Serialize)]
@@ -48,8 +48,8 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelsResponse>
                 active: m.active,
             })
             .collect(),
-        active: active.name.clone(),
-        active_dim: active.dim,
+        active: active.map(|a| a.name.clone()).unwrap_or_default(),
+        active_dim: active.map(|a| a.dim).unwrap_or(0),
     })
 }
 
@@ -62,7 +62,7 @@ struct ActivateRequest {
 async fn activate_model(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ActivateRequest>,
-) -> Result<Json<ModelInfo>> {
+) -> HandlerResult<Json<ModelInfo>> {
     let mut reg = state.model_registry.write().map_err(err)?;
     let meta = reg.activate(&req.model).map_err(err)?;
     Ok(Json(ModelInfo {
@@ -84,17 +84,13 @@ struct ReindexResponse {
 async fn reindex_collection(
     State(state): State<Arc<AppState>>,
     Json(req): Json<serde_json::Value>,
-) -> Result<Json<ReindexResponse>> {
+) -> HandlerResult<Json<ReindexResponse>> {
     let collection = req
         .get("collection")
         .and_then(|v| v.as_str())
         .unwrap_or("memory");
-    let rag = state.rag_pipeline.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "RAG pipeline not initialized".into(),
-        )
-    })?;
+    let rag = state.rag_pipeline.as_ref()
+        .ok_or_else(|| ApiError::bad_request("RAG pipeline not initialized"))?;
 
     let start = std::time::Instant::now();
     let count = state.fact_manager.index_into_rag(rag).map_err(err)?;
@@ -105,7 +101,7 @@ async fn reindex_collection(
     }))
 }
 
-pub fn routes() -> axum::Router<Arc<AppState>> {
+pub fn router() -> axum::Router<Arc<AppState>> {
     axum::Router::new()
         .route("/api/models", axum::routing::get(list_models))
         .route("/api/models/activate", axum::routing::post(activate_model))

@@ -11,7 +11,7 @@ use everevo_core::types::RiskLevel;
 use everevo_core::EverEvoError;
 use tokio_util::sync::CancellationToken;
 
-use crate::knowledge::graph::KnowledgeGraph;
+use everevo_knowledge::graph::KnowledgeGraph;
 use crate::memory::facts::FactManager;
 
 pub struct MemoryTool {
@@ -106,7 +106,7 @@ impl MemoryTool {
             links: Vec::new(),
         };
 
-        match self.manager.save(&fact) {
+        match self.manager.save_async(fact.clone()).await {
             Ok(()) => Ok(ToolOutput {
                 content: format!("Memory saved: {name}"),
                 is_error: false,

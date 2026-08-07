@@ -224,3 +224,75 @@ Agent 在规划任务时，PersonaStage 注入的思维范式会影响它的决�
 1. **PersonaStage 就是一个 ContextStage**——和 MemoryStage 完全一样的模式，半小时能写完
 2. **Agent 协同层需要人格注入**——子 Agent 没有 persona context，行为会和主 Agent 不一致
 3. **profile.json 可以先手工维护**——LLM 自动提取是锦上添花，手动写一个 profile 就能验证整个链路
+
+---
+
+## 8. Agent Character（agent 自身说话风格 / 人格）
+
+> 与 §1–7（**用户** persona：如何适应用户）不同，本节定义 **agent 自己**的声音、
+> 语气、性格。两者正交：PersonaStage 决定"以什么方式适应用户"，
+> AgentCharacterStage 决定"agent 本身是什么样的人"。
+
+### 8.1 定位
+
+```
+[0] SystemPrompt       ← 工具规则 + 基础身份
+[0] AgentCharacter     ← agent 自身声音（稳定排序紧跟 SystemPrompt）  ← 本节
+[1] Persona            ← 用户沟通风格
+[2] BestPractices / Skills
+...
+```
+
+`AgentCharacterStage` priority=0，与 `SystemPromptStage` 同级；Rust 稳定排序保证它
+排在 system prompt 之后、`PersonaStage`(1) 之前。
+
+### 8.2 数据源（`data/memory/agent/`）
+
+- **`character.json`** — 结构化字段：
+  - `name` / `identity`（一行"你是谁"）
+  - `traits`（广义特质，Anthropic 风格：好奇、诚实、务实）
+  - `tone`（语气描述）
+  - `style_guidelines`（具体可执行的说话规则）
+  - `values`（优先级——"缺席的价值观"会被推断，故显式声明）
+  - `voice_samples`（**自由文本**：粘贴聊天记录 / 文献摘录 / 笔记，原文注入）
+- **`sources/*.md | *.txt`** — 拖入即加载的碎片文件，按文件名排序确定性拼接。
+
+首次运行自动生成专业直率型默认 profile（融合 Anthropic 研究 + 项目 ethos：
+简洁、直接、code-first、诚实承认卡住）。
+
+### 8.3 渲染
+
+`render_character(profile, sources)` 产出 `## Character & Voice` 块（user-role 消息，
+与 codebase 约定一致），结尾以"_作为性情而非僵化规则_"收尾（Anthropic：nudge 非 rule）。
+`build_character_block(path)` 是一站式便捷函数（load + sources + render），
+主 stage 与子 agent 继承共用，保证输出一致。
+
+### 8.4 子 Agent 不继承人格（研究决策）
+
+子 agent 是**任务导向的纯 worker**（researcher / reviewer / file operator），其产出返回给主
+agent 再综合给用户——声音基本不可见。故子 agent **不注入** `AgentCharacter`。
+
+**依据**：Claude Code 官方 "focused subagents… description as routing hint，more than a persona"
+（[docs](https://code.claude.com/docs/en/sub-agents)）；arXiv 2311.10054 "Personas in System
+Prompts Do Not Improve…"（效果随机）；system prompt 每次调用都付费，人格是持续的 token 成本。
+
+**保留的是用户 persona**（`SubAgentContext.persona`，语言/格式偏好，如"用中文"）——这是**功能性**
+的：子 agent 用正确语言产出，主 agent 才能直接复用。主 agent 独自承担声音；子 agent 仅有任务
+专属 system prompt（见 `delegate.rs::stype_guidance`、`team.rs` 角色 prompt）。
+
+### 8.5 研究依据
+
+- Anthropic《Claude's Character》：广义特质 > 狭隘观点；诚实同行（非谄媚）；
+  特质是轻推而非规则；自我认知（"我是 AI"）。
+-《Your System Prompt Is a Character Sheet》：系统提示词 = 选角简报（casting brief），
+  模型推断"什么样的实体会说这些话"。审计维度：权威关系（专家同行）、
+  失败时性格（坦白卡住、不伪造成功）、缺席的价值观（显式声明）。
+
+### 8.6 自动蒸馏 + 编辑器（Phase 2，已实现）
+
+- **LLM 蒸馏**：`synthesize_character(path, llm)` 把 `voice_samples` + `sources/` 喂给 LLM，
+  蒸馏成结构化 traits 写回 `character.json`（镜像 memory curator 的 `llm.chat→JSON` 模式）。
+  稳健合并——只覆盖 LLM 实际提供的字段，`voice_samples` 原样保留。手动触发：聊天框输入
+  `/character sync`（避免静默改写精心调过的性格）；`/character show` 查看当前渲染块。
+- **前端编辑器**：设置 → 🎭 人格声音 tab（`CharacterConfig.tsx`），可视化编辑全部字段，
+  `GET/PUT /api/character` 持久化。

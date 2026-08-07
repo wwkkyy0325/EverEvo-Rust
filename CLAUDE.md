@@ -32,18 +32,20 @@ cd frontend && npx tsc --noEmit && npx vite build
 ```
 EverEvo-Rust/
 ├── crates/
-│   ├── everevo-core/       # Shared types, traits, context pipeline, LLM types
-│   ├── everevo-agent/      # Agent loop, tools, memory, persona, skills, code search
-│   ├── everevo-server/     # Axum HTTP server, SSE chat, routes, app state
+│   ├── everevo-core/       # Shared types, traits, errors (ApiError), context pipeline, LLM types, telemetry
+│   ├── everevo-agent/      # Agent loop (catch_unwind), 22 tools, memory, persona, skills, code search
+│   ├── everevo-server/     # Axum HTTP server, SSE chat, 14 route modules, orchestration (SessionCoordinator)
 │   ├── everevo-db/         # SQLite via SQLx, migrations, message persistence
-│   ├── everevo-sandbox/    # Tiered sandbox execution with permission levels
-│   ├── everevo-vector/     # ONNX embeddings, HNSW vector store, chunk constructors
+│   ├── everevo-sandbox/    # Tiered sandbox execution with 4 permission levels
+│   ├── everevo-vector/     # ONNX embeddings, HNSW vector store (LanceDB replaced)
 │   ├── everevo-knowledge/  # Knowledge graph (Oxigraph) + domain document ingestion
+│   ├── everevo-a2a/        # A2A protocol gateway (v0.3.0), agent cards, task execution
 │   ├── everevo-bootstrap/  # First-run runtime & model provisioning
 │   ├── everevo-downloader/ # Multi-mirror resumable concurrent download engine
 │   ├── everevo-mcp/        # MCP client (stdio + HTTP transports)
 │   ├── everevo-workflow/   # JSON-defined multi-step automation workflows
-│   └── everevo-bundler/    # Standalone asset bundler binary (CLI)
+│   ├── everevo-bundler/    # Standalone asset bundler binary (CLI, no lib.rs)
+│   └── everevo-webagent/   # Standalone MCP search service binary (no lib.rs)
 ├── frontend/               # React + Vite + Zustand + Tailwind v4
 └── migrations/             # SQL migration files (auto-applied by sqlx)
 ```

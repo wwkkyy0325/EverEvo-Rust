@@ -11,7 +11,7 @@
 //! The `handles` and `statuses` fields enable monitoring and cancellation
 //! via `GET /api/agent/tasks` and `POST /api/agent/tasks/{id}/cancel`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,26 +40,11 @@ pub type SharedBacklog = Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
 /// Shared pending sub-agent counter — auto-continue loop watches this.
 pub type SharedPending = Arc<std::sync::atomic::AtomicUsize>;
 
-// ── Sub-agent Handle & Status ───────────────────────────────────────────
+mod spawn;
+mod types;
 
-/// Handle to a running sub-agent — enables monitoring and cancellation.
-#[derive(Clone)]
-pub struct SubAgentHandle {
-    pub id: Uuid,
-    pub description: String,
-    pub started_at: chrono::DateTime<chrono::Utc>,
-    pub cancel: CancellationToken,
-}
-
-/// Snapshot of sub-agent status for API reporting.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct SubAgentStatus {
-    pub id: Uuid,
-    pub description: String,
-    pub started_at: String,
-    pub status: String, // "running" | "completed" | "failed" | "timeout" | "cancelled"
-    pub elapsed_ms: u64,
-}
+pub use types::*;
+use spawn::*;
 
 // ── TaskTool ──────────────────────────────────────────────────────────────
 
@@ -124,7 +109,10 @@ impl TaskTool {
 
     /// Set the parent agent's work directory so sub-agents can access its files.
     pub fn set_parent_work_dir(&self, dir: std::path::PathBuf) {
-        *self.parent_work_dir.write().unwrap() = Some(dir);
+        *self
+            .parent_work_dir
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(dir);
     }
 
     /// Get a receiver for the AgentLoop and store the sender.
@@ -134,8 +122,17 @@ impl TaskTool {
         rx
     }
 
+    /// Clone the result sender so other tools (WorkflowTool, TeamTool) can
+    /// feed sub-agent results into the same channel that the main loop drains.
+    pub fn result_sender(&self) -> Option<tokio::sync::mpsc::UnboundedSender<String>> {
+        self.result_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     pub fn set_persona(&self, persona: String) {
-        *self.persona.write().unwrap() = Some(persona);
+        *self.persona.write().unwrap_or_else(|e| e.into_inner()) = Some(persona);
     }
 
     /// Get status of all sub-agents (running + recently completed).
@@ -265,7 +262,11 @@ impl TaskTool {
         // Clone all needed state for the spawned task
         let tools = Arc::clone(&self.base_tools);
         let llm = self.llm.clone();
-        let ctx = self.subagent_ctx.read().unwrap().clone();
+        let ctx = self
+            .subagent_ctx
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let tx = self
             .result_tx
             .lock()
@@ -590,149 +591,6 @@ impl Tool for CancelTaskTool {
             ..Default::default()
         })
     }
-}
-
-/// Type-specific guidance injected into the sub-agent system prompt.
-fn stype_guidance(stype: &str) -> String {
-    match stype {
-        "reviewer" => "\n\n## Role: Code Reviewer\n\
-            You are a critical code reviewer. Focus on:\n\
-            - Correctness bugs and edge cases\n\
-            - Security vulnerabilities\n\
-            - Performance issues\n\
-            - Adherence to project conventions\n\
-            - Test coverage gaps\n\
-            Be thorough and adversarial — find every issue.\n"
-            .into(),
-        "research" | "code-explorer" => "\n\n## Role: Researcher\n\
-            You are a thorough researcher. Focus on:\n\
-            - Exploring all relevant files and patterns\n\
-            - Finding connections across modules\n\
-            - Documenting your findings with file paths and line numbers\n\
-            - Providing a structured, comprehensive report\n\
-            Leave no stone unturned.\n"
-            .into(),
-        "file" => "\n\n## Role: File Operations\n\
-            You are a precise file operator. Focus on:\n\
-            - Making the requested file changes exactly as specified\n\
-            - Verifying each change with tests or checks\n\
-            - Leaving no unintended side effects\n\
-            - Reporting what was changed and why.\n"
-            .into(),
-        _ => "\n\n## Role: General Assistant\n\
-            Complete the assigned task thoroughly and return a structured result.\n"
-            .into(),
-    }
-}
-
-// ── spawn_single ──────────────────────────────────────────────────────────
-
-#[allow(clippy::too_many_arguments)]
-async fn spawn_single(
-    sandbox_root: &Path,
-    base_tools: &everevo_core::tool::ToolRegistry,
-    llm: Arc<crate::llm::HttpClient>,
-    desc: &str,
-    stype: &str,
-    sub_ctx: &SubAgentContext,
-    max_turns: usize,
-    cancel: CancellationToken,
-) -> String {
-    // Increment recursion depth for this sub-agent's children
-    let mut child_ctx = sub_ctx.clone();
-    child_ctx.depth = sub_ctx.depth.saturating_add(1);
-
-    // Pass ALL tools from base_tools — not just shell+memory.
-    // Each delegation level would lose tools otherwise (cascading tool loss).
-    let mut sub_tools = everevo_core::tool::ToolRegistry::new();
-    for name in base_tools.names() {
-        if let Some(tool) = base_tools.get(name) {
-            sub_tools.register(Arc::clone(tool));
-        }
-    }
-
-    // Build the full system prompt with type-specific guidance.
-    let mut system_prompt = child_ctx.build_system_prompt(desc);
-    system_prompt.push_str(&stype_guidance(stype));
-
-    let messages = vec![
-        everevo_core::llm::LlmMessage::system(&system_prompt),
-        everevo_core::llm::LlmMessage::user(format!(
-            "Execute this task and return the result:\n\n{desc}\n\n\
-             If you need to run shell commands, use the shell tool.\n\
-             Report ALL findings including empty results.",
-        )),
-    ];
-
-    // Run with max_turns limit — uses shared AgentLoop::run_subagent().
-    let start = std::time::Instant::now();
-    let sa_id = Uuid::new_v4();
-    let agent_loop = crate::AgentLoop::new().with_max_turns(max_turns);
-    let final_text = agent_loop
-        .run_subagent(llm, Arc::new(sub_tools), messages, cancel)
-        .await;
-    let duration_ms = start.elapsed().as_millis() as u64;
-
-    // Persist telemetry (completion record)
-    let persist_dir = sandbox_root
-        .parent()
-        .unwrap_or(sandbox_root)
-        .join("telemetry")
-        .join("subagent_tasks");
-    std::fs::create_dir_all(&persist_dir).ok();
-    let content_len = final_text.len();
-    let meta_note = if content_len == 0 {
-        "empty response — likely channel drop or LLM connection failure"
-    } else if duration_ms < 3000 && final_text.starts_with("Error:") {
-        "fast failure — likely LLM API error"
-    } else {
-        "sub-agent completed"
-    };
-    let _ = std::fs::write(
-        persist_dir.join(format!("{}.json", sa_id)),
-        serde_json::to_string_pretty(&serde_json::json!({
-            "id": sa_id.to_string(),
-            "task": desc,
-            "success": !final_text.is_empty() && !final_text.starts_with("Error:"),
-            "duration_ms": duration_ms,
-            "content_len": content_len,
-            "note": meta_note,
-            "content": &final_text[..500.min(final_text.len())],
-        }))
-        .unwrap_or_default(),
-    );
-
-    // Detect errors that run_subagent returns as normal text (see mod.rs + http.rs).
-    // HTTP errors come as StreamEvent::Text with patterns like:
-    // "Authentication failed (HTTP 401)...", "Server error (HTTP 500)...", etc.
-    let is_error = final_text.is_empty()
-        || final_text.starts_with("Error:")
-        || final_text.contains("[Cancelled]")
-        || final_text.starts_with("Timeout")
-        || final_text.starts_with("Authentication failed")
-        || final_text.starts_with("Rate limited")
-        || final_text.starts_with("Server error")
-        || final_text.starts_with("Model overloaded")
-        || final_text.starts_with("Bad request")
-        || final_text.starts_with("Connection failed")
-        || final_text.starts_with("Network error")
-        || final_text.starts_with("API error")
-        || final_text.starts_with("Invalid request")
-        || final_text.starts_with("Failed to read response");
-    let meta = serde_json::json!({
-        "agent_id": sa_id.to_string(),
-        "task": desc,
-        "status": if is_error { "FAILED" } else { "SUCCESS" },
-        "duration_ms": duration_ms,
-        "content_len": final_text.len(),
-        "timestamp": Utc::now().to_rfc3339(),
-        "schema_version": "1.0",
-    });
-    format!(
-        "---SUBAGENT_RESULT---\n{}\n---END_RESULT---\n\n{}",
-        serde_json::to_string_pretty(&meta).unwrap_or_default(),
-        final_text
-    )
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────

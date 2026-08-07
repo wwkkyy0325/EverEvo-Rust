@@ -92,14 +92,23 @@ impl ModelRegistry {
         Ok(Self { models, active })
     }
 
-    /// The currently active model.
-    pub fn active(&self) -> &ModelMeta {
-        &self.models[&self.active]
+    /// Create an empty registry — used as fallback when no ONNX models are
+    /// available. RAG/vector features will be disabled.
+    pub fn empty() -> Self {
+        Self {
+            models: HashMap::new(),
+            active: String::new(),
+        }
     }
 
-    /// Active model's embedding dimension.
+    /// The currently active model, or None if registry is empty.
+    pub fn active(&self) -> Option<&ModelMeta> {
+        self.models.get(&self.active)
+    }
+
+    /// Active model's embedding dimension, or 0 if no models.
     pub fn active_dim(&self) -> usize {
-        self.active().dim
+        self.active().map(|m| m.dim).unwrap_or(0)
     }
 
     /// List all discovered models.
@@ -213,7 +222,7 @@ mod tests {
         let reg = ModelRegistry::discover(dir.path(), None).unwrap();
         assert_eq!(reg.list().len(), 1);
         assert_eq!(reg.active_dim(), 768);
-        assert_eq!(reg.active().display_name, "test/model");
+        assert_eq!(reg.active().unwrap().display_name, "test/model");
     }
 
     #[test]
@@ -246,9 +255,9 @@ mod tests {
         }
 
         let mut reg = ModelRegistry::discover(dir.path(), Some("a")).unwrap();
-        assert_eq!(reg.active().name, "a");
+        assert_eq!(reg.active().unwrap().name, "a");
         reg.activate("b").unwrap();
-        assert_eq!(reg.active().name, "b");
+        assert_eq!(reg.active().unwrap().name, "b");
     }
 
     #[test]

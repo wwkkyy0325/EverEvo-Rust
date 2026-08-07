@@ -167,6 +167,11 @@ pub enum FactType {
     Project,
     /// External reference (URL, paper, documentation).
     Reference,
+    /// A reusable action paradigm — a parameterized strategy for a class of problems.
+    /// Stored with contrastive metadata (success vs failure divergence point).
+    Paradigm,
+    /// A symbol ontology entry (auto-generated from tool/agent registries).
+    Symbol,
 }
 
 impl FactType {
@@ -176,6 +181,8 @@ impl FactType {
             Self::Feedback => "feedback",
             Self::Project => "project",
             Self::Reference => "reference",
+            Self::Paradigm => "paradigm",
+            Self::Symbol => "symbol",
         }
     }
 
@@ -188,6 +195,8 @@ impl FactType {
             "feedback" => Some(Self::Feedback),
             "project" => Some(Self::Project),
             "reference" => Some(Self::Reference),
+            "paradigm" => Some(Self::Paradigm),
+            "symbol" => Some(Self::Symbol),
             _ => None,
         }
     }
@@ -202,6 +211,8 @@ impl std::str::FromStr for FactType {
             "feedback" => Ok(Self::Feedback),
             "project" => Ok(Self::Project),
             "reference" => Ok(Self::Reference),
+            "paradigm" => Ok(Self::Paradigm),
+            "symbol" => Ok(Self::Symbol),
             _ => Err(format!("unknown FactType: {s}")),
         }
     }
@@ -215,6 +226,72 @@ pub struct MemoryIndexEntry {
     pub name: String,
     pub description: String,
     pub fact_type: FactType,
+}
+
+// ── Action Paradigm Types ──────────────────────────────────────────────────
+
+/// Contrastive metadata for an action paradigm.
+///
+/// Paradigms are extracted from execution trajectories and stored as
+/// `FactType::Paradigm` facts. The metadata captures what made successful
+/// trajectories diverge from failed ones — the key decision fork.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParadigmMeta {
+    /// Problem class this paradigm applies to (e.g. "dependency_installation").
+    pub problem_class: String,
+    /// Preconditions: what must be true for this paradigm to apply.
+    /// Each entry is a capability or entity reference.
+    pub preconditions: Vec<String>,
+    /// The approach strategy (short label, e.g. "HTTPS-over-SSH").
+    pub approach: String,
+    /// Parameters that can be varied (e.g. "package_name", "target_dir").
+    #[serde(default)]
+    pub parameters: Vec<String>,
+    /// Expected success indicators.
+    #[serde(default)]
+    pub success_signals: Vec<String>,
+    /// Known failure modes to watch for.
+    #[serde(default)]
+    pub failure_modes: Vec<String>,
+    /// The step where successful trajectories split from failed ones.
+    /// e.g. "at turn 3, successful runs used web_search, failed runs retried shell"
+    #[serde(default)]
+    pub divergence_point: Option<String>,
+    /// The approach that did NOT work in a similar context (anti-pattern).
+    #[serde(default)]
+    pub anti_pattern: Option<String>,
+    /// Extraction level: micro (single-turn), meso (intra-task), macro (cross-task).
+    pub extraction_level: ParadigmLevel,
+}
+
+/// Granularity level at which a paradigm was extracted.
+///
+/// Mirrors SAMULE's three-level reflection hierarchy:
+/// - **Micro**: single-turn lesson ("don't use SSH for git clone here")
+/// - **Meso**: intra-task pattern across turns of the same task type
+/// - **Macro**: inter-task principle that transfers across different task types
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ParadigmLevel {
+    Micro,
+    Meso,
+    Macro,
+}
+
+impl ParadigmLevel {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Micro => "micro",
+            Self::Meso => "meso",
+            Self::Macro => "macro",
+        }
+    }
+}
+
+impl std::fmt::Display for ParadigmLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -260,6 +337,8 @@ mod tests {
             FactType::Feedback,
             FactType::Project,
             FactType::Reference,
+            FactType::Paradigm,
+            FactType::Symbol,
         ] {
             let s = ty.as_str();
             let parsed = FactType::from_str(s).unwrap();

@@ -21,7 +21,7 @@ pub async fn resolve_and_load(
                 .map_err(|e| OrchestrationError::new("session", format!("DB lookup: {e}")))?
                 .ok_or_else(|| OrchestrationError::new("session", "Session not found"))?;
             if !state.sandboxes.read().await.contains_key(&id) {
-                let level = super::super::routes::chat::resolve_permission(
+                let level = super::super::routes::chat::helpers::resolve_permission(
                     &state.config.default_permission_level,
                 );
                 let _ = state.create_sandbox(id, level, None).await;
@@ -29,12 +29,12 @@ pub async fn resolve_and_load(
             id
         }
         None => {
-            let title = super::super::routes::chat::truncate_for_title(message);
+            let title = super::super::routes::chat::helpers::truncate_for_title(message);
             let row =
                 state.db.create_session(&title).await.map_err(|e| {
                     OrchestrationError::new("session", format!("Create session: {e}"))
                 })?;
-            let level = super::super::routes::chat::resolve_permission(
+            let level = super::super::routes::chat::helpers::resolve_permission(
                 &state.config.default_permission_level,
             );
             let _ = state.create_sandbox(row.id, level, None).await;
@@ -52,7 +52,7 @@ pub async fn resolve_and_load(
         .iter()
         .filter(|m| m.role != "tool") // keep assistant tool-use messages, skip raw tool results
         .map(|m| {
-            let mut msg = super::super::routes::chat::db_message_to_llm(m);
+            let mut msg = super::super::routes::chat::helpers::db_message_to_llm(m);
             // Strip stale tool_calls from history — past turns' tool_use blocks
             // without paired tool_results would fail API validation.
             // Text content is preserved so the LLM can see its own reasoning.

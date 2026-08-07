@@ -61,7 +61,15 @@ impl Tool for McpTool {
         params: serde_json::Value,
         cancel: Option<&CancellationToken>,
     ) -> Result<ToolOutput, EverEvoError> {
-        let mut client = self.client.lock().await;
+        let mut client = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.client.lock(),
+        )
+        .await
+        .map_err(|_| EverEvoError::Tool {
+            tool: self.name.clone(),
+            message: "MCP client lock timeout (10s) — server may be hung".into(),
+        })?;
         match client.call_tool(&self.name, params, cancel).await {
             Ok((text, images)) => {
                 // When images are present (e.g. browser_screenshot), annotate

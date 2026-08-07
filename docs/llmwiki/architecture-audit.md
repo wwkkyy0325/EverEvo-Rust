@@ -1,152 +1,182 @@
-# Architecture Audit
+# Architecture Audit — 2026-08-06
 
-Audited 2026-07-17 against three reference frameworks:
-- **ripgrep layered pattern** (Rust workspace best practices)
-- **Hexagonal Ports-Adapter** (domain-driven design)
-- **Agent orchestration papers** (Google ADK 8 patterns, FoA, Blackboard)
+## 1. Crate Dependency & Layering
 
----
-
-## Audit Results
-
-### ✅ Passed (17 items)
-
-| # | Check | Evidence |
-|---|-------|----------|
-| 1 | `everevo-core` zero IO deps | No tokio/sqlx/reqwest/axum imports |
-| 2 | Dependency flow one-way | DAG: core ← db/downloader/bootstrap ← agent ← server |
-| 3 | No circular dependencies | Verified by dependency matrix |
-| 4 | `Tool` trait in core | `crates/everevo-core/src/tool.rs` |
-| 5 | `LlmProvider` trait in core | `crates/everevo-core/src/llm.rs` |
-| 6 | Workspace unified deps | `[workspace.dependencies]` in root Cargo.toml |
-| 7 | `pub(crate)` default visibility | Minimal public API surface per crate |
-| 8 | `#[deny(unsafe_code)]` | Workspace-level lint |
-| 9 | Mock injection via traits | `MockLlmProvider` implements `LlmProvider` |
-| 10 | 4-layer test pyramid | L1 (unit) → L2 (mock agent) → L3 (integration) → L4 (real LLM) |
-| 11 | SQLite :memory: for DB tests | Zero filesystem footprint |
-| 12 | Async throughout | Tokio-based, async_trait for provider/tool traits |
-| 13 | CancellationToken support | Downloader supports graceful cancellation |
-| 14 | Semaphore-based concurrency | Downloader chunk workers |
-| 15 | Observability via tracing | Structured logging with EnvFilter |
-| 16 | Thin binary entry | `main.rs` → config → bootstrap check → build app → serve |
-| 17 | Configuration via env vars | `AppConfig::load()` with env override |
-
-### ⚠️ Fixed During Audit (2 items)
-
-| # | Was | Now |
-|---|-----|-----|
-| 1 | `LlmProvider` trait defined in `everevo-agent` | Moved to `everevo-core/src/llm.rs` |
-| 2 | `ShellTool` used blocking `std::process::Command` in async fn | Changed to `tokio::process::Command` |
-
-### ⬜ Deferred (non-blocking for Phase 1-2)
-
-| # | Item | Severity | When |
-|---|------|----------|------|
-| 1 | No `Sandbox` trait — `ShellTool` bypasses sandbox abstraction | Medium | Phase 2 |
-| 2 | No structured `#[tracing::instrument]` spans on key async fns | Medium | Phase 2 |
-| 3 | `AppConfig` env-only, no file config support | Low | Post-Phase 1 |
-| 4 | No OpenAPI/Swagger for API routes | Low | Phase 4 |
-| 5 | No rate limiting on chat endpoint | Low | Phase 4 |
-| 6 | No `Agent` trait — multi-agent orchestration blocked | Medium | Phase 3 |
-| 7 | `everevo-agent` becoming "god crate" (depends on all 4 crates) | Medium | Phase 3 (split plan below) |
-
----
-
-## Agent Crate Split Plan (Phase 3)
-
-When `everevo-agent` exceeds ~25 source files, split into:
+### Dependency Graph
 
 ```
-crates/everevo-agent/          # Agent loop + session + memory (core orchestration)
-crates/everevo-tools/          # All built-in tool impls (currently in agent/tools/builtins)
-crates/everevo-sandbox/        # TieredSandbox + WASM + Docker executors
-crates/everevo-kg/             # Knowledge graph (Oxigraph wrapper)
-crates/everevo-rag/            # RAG pipeline (LanceDB + fastembed)
-crates/everevo-llmwiki/        # llmwiki manager
+everevo-core  ←──  12 crates (foundation — zero workspace deps) ✅
+
+everevo-agent ←──  everevo-core, everevo-db, everevo-sandbox,
+                   everevo-vector, everevo-mcp, everevo-knowledge,
+                   everevo-downloader, everevo-workflow (8 deps)
+
+everevo-server ←── everevo-core, everevo-db, everevo-sandbox,
+                   everevo-vector, everevo-mcp, everevo-agent,
+                   everevo-a2a, everevo-bootstrap (8 deps)
 ```
 
-**Trigger:** split when any module exceeds 500 lines or needs a different dependency profile.
+**Verdict: ✅ Clean DAG layering. No circular dependencies.**
+
+Confirmed by full Cargo.toml audit — all `path = "../everevo-*"` edges point from higher to lower layers.
+
+### 🔴 Concern: `axum` in `everevo-core`
+
+`everevo-core/Cargo.toml` declares `axum` as a dependency solely for `impl IntoResponse for ApiError` in `error.rs`. This pulls axum (and transitively `hyper`, `tower`, `sync_wrapper`, `http-body`) into **every** dependent crate — including `everevo-db`, `everevo-sandbox`, `everevo-vector`, `everevo-mcp`, `everevo-workflow` — none of which serve HTTP.
+
+**Impact:** 5+ crates compile a full web framework they don't use. **Recommendation:** Either:
+- Move `IntoResponse` impl to `everevo-server` (requires `ApiError` in server, but we already have `pub use`)
+- Or feature-gate: `axum = { workspace = true, optional = true }` behind an `http-error` feature
+
+### ⚠️ Unused workspace dependency: `pin-project-lite`
+
+Declared in root `Cargo.toml` `[workspace.dependencies]` but imported by zero crates. Dead weight.
+
+- `everevo-core` depends on zero workspace crates — correct foundation
+- `everevo-agent` is the integration layer (8 deps) — expected
+- `everevo-server` is the top-level aggregator (8 deps) — expected
+
+### ⚠️ Concern: everevo-agent re-exports everevo-knowledge
+
+`everevo-agent/src/lib.rs:17`: `pub use everevo_knowledge as knowledge;`
+
+This lets consumers do `use everevo_agent::knowledge::*` — bypassing the standalone `everevo-knowledge` crate. Creates unnecessary coupling and confuses the dependency graph. **Recommendation:** Server should depend on `everevo-knowledge` directly.
+
+### Core module count: 14
+
+Each module is used by 2+ crates (cross-cutting). `slash_command` could move to server (only used there), but low priority.
 
 ---
 
-## Multi-Agent Readiness
+## 2. Coupling Assessment
 
-The current architecture supports ADK's orchestration patterns:
+### 🔴 God Object: AppState (1029 lines, 40+ public fields)
 
-| Pattern | EverEvo Support |
-|---------|----------------|
-| Sequential | ✅ `Tool` trait + `ToolRegistry` = agent-as-tool |
-| Coordinator/Dispatcher | ✅ LLM routing via tool descriptions |
-| Parallel Fan-Out | ⬜ Needs `ParallelAgent` wrapper (Phase 3) |
-| Generator-Critic Loop | ⬜ Needs `LoopAgent` with exit condition |
-| Blackboard | ⬜ KG already serves as shared state, missing event subscription |
-
-**Missing key abstraction:** `Agent` trait. Currently only `Tool` trait exists. An agent wrapping another agent requires agents to implement a common interface. This is deferred to Phase 3 when multi-agent orchestration becomes a requirement.
-
----
-
-## Security Posture
-
-| Control | Status |
+| Problem | Detail |
 |---------|--------|
-| `#[deny(unsafe_code)]` | ✅ |
-| Shell command isolation | ⚠️ Sandbox bypassed in Phase 1, TieredSandbox in Phase 2 |
-| Dependency audit | ⬜ `cargo-deny` + `cargo-audit` not yet in CI |
-| Input validation | ⚠️ Basic per-tool, no framework |
-| Rate limiting | ⬜ Not implemented |
+| 40+ fields | Spans 10+ crate types — Config, LLM, Sandbox, MCP, Fact, Diary, Dreaming, KnowledgeGraph, Telemetry, Skills, Commands, Workspace, A2A |
+| Monolithic init | `new()` spans ~200 lines initializing ALL subsystems at once |
+| Tight coupling | Server directly accesses `everevo_agent::memory::FactManager`, `everevo_agent::knowledge::KnowledgeGraph` internals |
+
+**Recommendation:** Extract focused subsystems (not a rewrite — extract method + move fields):
+- `LlmState` — clients map + notify + model registry
+- `SandboxState` — sandbox lifecycle + confirmations + permission levels
+- `MemoryState` — fact_manager, diary_manager, scheduler, dreaming_engine, wiki_generator
+- `OrchestrationState` — session_actors, subagent_handles, bg_sessions, context_snapshots
+
+### ⚠️ Server → Agent internal module access (9 modules)
+
+Server directly imports from these `everevo_agent::` paths:
+- `memory` (FactManager, DiaryManager, DreamingEngine, Scheduler)
+- `knowledge` (KnowledgeGraph)
+- `skill` (SkillRegistry)
+- `subagent_context`, `subagent_pool`
+- `tools` (TodoStore)
+- `build_character_block`, `load_character`, `synthesize_character`
+
+**Not wrong but fragile.** Recommendation: Declare a stable integration facade in `everevo_agent/src/lib.rs` that re-exports these with doc comments labeling them as "Server integration surface."
 
 ---
 
-## Development Rules (from issues encountered)
+## 3. Async Patterns
 
-### Database: SQLite path handling on Windows
+| Pattern | Count | Assessment |
+|---------|-------|------------|
+| `std::fs::*` | ~260 total; ~80 on hot paths | ⚠️ FactManager/DiaryManager/LlmwikiManager use blocking I/O in async call chains |
+| `tokio::spawn` | 34 | ✅ Fire-and-forget with backpressure (semaphore in team.rs) |
+| `tokio::sync::Mutex` | 17 | ✅ Correctly used where locks span `.await` (MCP clients) |
+| `std::sync::Mutex/RwLock` | ~98 | ✅ No instances found held across `.await` — this anti-pattern is **absent** |
 
-**Rule:** `Database::connect()` takes `&Path`, not a URL string.
+### 🔴 std::fs blocking on hot async paths (5 confirmed sites)
 
-**Why:** `sqlite://` URL construction breaks on Windows paths with backslashes and drive letters.
-`SqliteConnectOptions::new().filename(path)` handles all platforms natively.
+These synchronous I/O calls run on the tokio runtime worker threads:
 
-```rust
-// ✅ Correct
-Database::connect(&db_path).await
+| Location | Context | Impact |
+|----------|---------|--------|
+| `FactManager::save()` → `std::fs::write` + `regenerate_index()` | Called from `extract_from_turn()`, `reflect_on_turn()`, `execute_deep()`, `memory_tool::add()` — all async | Blocks runtime thread for each fact save + index write |
+| `DreamingEngine::write_themes()` → `std::fs::write` | Called from `async fn execute_rem()` | Write per REM phase |
+| `DreamingEngine::read_themes()` → `std::fs::read_to_string` | Called from `async fn execute_deep()` | Read per DEEP phase |
+| `delegate/mod.rs` → `std::fs::create_dir_all` + `std::fs::write` | Called from sync `dispatch_one()` which is called from `async fn execute()` | Telemetry writes block runtime |
+| `spawn.rs` → `std::fs::create_dir_all` + `std::fs::write` | Inside `async fn spawn_single()` | Sub-agent telemetry persistence |
 
-// ❌ Never do this on Windows
-let url = format!("sqlite://{}", path.display()); // fails with "unable to open database file"
-Database::connect(&url).await
-```
+**Assessment:** Small-file I/O with `std::fs` is common Rust practice. Currently not broken under normal load, but:
 
-### Config: `create_dir_all` must propagate errors
+- `spawn_blocking` for diary/wiki generation (>10ms latency)
+- `spawn_blocking` or a dedicated thread for MDINDEX fact regeneration
+- Telemetry writes (delegate/spawn.rs) can stay blocking — they're fire-and-forget anyway
 
-**Rule:** Never use `.ok()` on `create_dir_all` — use `?` or `map_err`.
+### ✅ No Mutex-across-await bugs — **confirmed absent**
 
-**Why:** Silent directory creation failures surface as confusing downstream errors
-("unable to open database file" vs "failed to create data/db/: permission denied").
+Full audit: all `std::sync::Mutex`/`RwLock` guards are short-lived. `tokio::sync::Mutex` correctly used where guards survive `.await`. `RwLock::read()` used in async MCP health checker (`app_state.rs:330`) is a minor concern — `std::sync::RwLock` can block if a writer holds the lock.
 
-```rust
-// ✅ Correct
-std::fs::create_dir_all(&dir).map_err(|e| EverEvoError::Config(...))?;
+### ⚠️ Fire-and-forget spawns (26 with no JoinHandle)
 
-// ❌ Never do this
-std::fs::create_dir_all(&dir).ok(); // swallows the real error
-```
+| Location | Risk |
+|----------|------|
+| `post_turn.rs` ×4 | Memory extraction, reflection — panics are silent but don't crash main loop |
+| `workflow.rs:295` | Spawn in a loop — unbounded concurrency if many tasks |
+| `bootstrap.rs:75` | Init pipeline runner |
+| `facts.rs:181` | Fact SQLite indexing fallback |
 
-### Server: LLM is optional
+Panics in these tasks kill the task but NOT the process (tokio catches spawn panics by default). However, the `post_turn.rs` spawns have no error recovery — if memory extraction panics, the turn's reflection is silently lost.
 
-**Rule:** `AppState.llm` is `Option<Arc<LlmClient>>` — server starts without API keys.
+### ⚠️ Missing timeouts (4 sites)
 
-**Why:** Bootstrap UI and health checks must work before any LLM credentials are configured.
-The chat route returns a helpful message when `llm` is `None`.
+| Location | Risk |
+|----------|------|
+| MCP client `lock().await` | Hung MCP server → permanent lock |
+| `semaphore.acquire_owned()` in team dispatch | Hung tasks → dispatch waits forever |
+| SQLx queries in dreaming pipeline | Slow DB → blocks progress |
+| WebSocket sends in browser_bridge | Hung write → indefinite block |
 
-### Start first, fix later
+### ✅ tokio::spawn patterns
 
-When a startup error occurs, check in this order:
-1. Is `data/` and its subdirectories actually created?
-2. Is the SQLite connection using `&Path`, not a URL string?
-3. Are LLM API keys optional or required?
+- Agent loop: fire-and-forget, result via channel (now with catch_unwind)
+- Sub-agents: fire-and-forget, result via backlog + pending decrement
+- Semaphore permits (`_permit`) held correctly until task completes
+- Disconnect watchdog: spawned once per session
 
 ---
 
-## Conclusion
+## 4. Design Patterns — Consistency Scorecard
 
-**Phase 1-2 Ready.** The two critical findings (trait placement, blocking I/O) are fixed.
-The 7 deferred items are all Phase 2-4 scope. No architectural debt that blocks current development.
+| Pattern | Status | Notes |
+|---------|--------|-------|
+| Error handling (REST) | ✅ Consistent | ApiError envelope on all 14 route modules |
+| Error handling (SSE) | ✅ Consistent | AgentEvent::Error via catch_unwind boundaries |
+| Panic defense | ✅ Consistent | Dual catch_unwind at agent-loop + chat-handler |
+| Tool registration | ✅ Single entry | orchestration/tools.rs, now documented |
+| Context pipeline | ✅ Clean | ContextStage trait + priority ordering |
+| State management | ⚠️ Mixed | AppState (global) vs SessionCoordinator (per-session) — split is correct but undocumented |
+| Channel patterns | ✅ Consistent | mpsc for streaming, broadcast for events, oneshot for confirmations |
+| Configuration | ✅ Consistent | AppConfig + env vars + file config |
+
+---
+
+## 5. Recommendations (Priority-Ordered)
+
+### 🔴 High Priority
+
+1. **Move `axum` out of `everevo-core`** — `IntoResponse` impl forces axum into 5+ non-HTTP crates. Feature-gate or move to server.
+
+2. **`spawn_blocking` for fact I/O** — `FactManager::save()` and `regenerate_index()` use `std::fs` on async runtime threads. Move to `spawn_blocking`.
+
+3. **Document Mutex discipline** — Add to CONTRIBUTING.md: "Never hold `std::sync::Mutex` across `.await`." (No bugs found — preventative.)
+
+### 🟡 Medium Priority
+
+4. **Split AppState** — Extract `LlmState`, `SandboxState`, `MemoryState`, `OrchestrationState`.
+
+5. **Add timeouts** — 4 sites: MCP lock acquire, semaphore in team dispatch, SQLx in dreaming, WS sends in browser_bridge.
+
+6. **Add backpressure to workflow spawns** — `workflow.rs:295` spawns in a loop; cap at semaphore or use JoinSet.
+
+7. **`spawn_blocking` for `std::sync::RwLock` read in MCP health checker** — `app_state.rs:330` reads a std::sync::RwLock in an async task — could block runtime.
+
+### 🟢 Low Priority
+
+6. **Test coverage** — Add unit tests for route handlers. Add property-based tests (`proptest`) for parsers.
+
+7. **Benchmark suite** — `criterion` for: tool execution, LLM streaming latency, fact save/load, context assembly.
+
+8. **Core split planning** — If `everevo-core` exceeds 20 modules, split into `everevo-core` (types + traits) + `everevo-common` (implementations).

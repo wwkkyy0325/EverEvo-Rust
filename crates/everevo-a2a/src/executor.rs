@@ -132,8 +132,7 @@ impl A2aAgentExecutor for EverEvoExecutor {
         let llm_messages = Self::to_llm_messages(message);
 
         // Run the agent loop — same as workflow/scheduler sub-agent
-        let result = everevo_agent::AgentLoop::new()
-            .with_max_turns(self.max_turns)
+        let result = everevo_agent::AgentLoop::sub_agent(self.max_turns)
             .run_subagent(
                 Arc::clone(&self.llm),
                 Arc::clone(&self.tools),

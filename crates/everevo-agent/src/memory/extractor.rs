@@ -61,7 +61,7 @@ pub async fn extract_from_turn(
                     ),
                     links: vec![],
                 };
-                match fact_manager.save(&fact) {
+                match fact_manager.save_async(fact.clone()).await {
                     Ok(()) => saved += 1,
                     Err(e) => {
                         tracing::debug!(name = %fact.name, error = %e, "Extracted fact dedup'd or rejected")

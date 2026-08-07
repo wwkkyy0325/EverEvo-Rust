@@ -103,7 +103,7 @@ pub async fn assemble(
         ),
     ));
     registry.register(Arc::new(everevo_agent::tools::builtins::SkillTool::new(
-        state.config.data_dir.join("skills"),
+        state.skill_registry.clone(),
     )));
     registry.register(Arc::new(everevo_agent::tools::builtins::VerifyTool));
     registry.register(Arc::new(everevo_agent::tools::builtins::WebFetchTool));
@@ -506,8 +506,17 @@ pub async fn assemble(
             .with_shared_counters(pending.clone(), task_backlog.clone()),
     ));
 
+    // ── Review gate (PRE-ACT) — blocks unsafe/redundant tool calls ──
+    registry.add_hook(Arc::new(
+        everevo_agent::tools::review_gate::ReviewGateHook::new(everevo_core::types::RiskLevel::High),
+    ));
+
     // ── Audit hook — logs every tool call ──
     registry.add_hook(Arc::new(everevo_agent::tools::audit_hook::AuditHook::new()));
+
+    // ── Reflect gate (POST-ACT) — quick error check + trajectory recording ──
+    let reflect_gate = Arc::new(everevo_agent::tools::reflect_gate::ReflectGateHook::new());
+    registry.add_hook(reflect_gate);
 
     // ── MCP tools — register tools from connected MCP servers ──
     {
@@ -539,6 +548,15 @@ pub async fn assemble(
 
     let tools = Arc::new(registry);
     tracing::info!(tool_count = tools.len(), "Agent tools ready");
+
+    // ── Symbol registry: populate knowledge graph with tool entities ──
+    // Idempotent — re-running doesn't duplicate entities.
+    let sr = everevo_knowledge::graph::SymbolRegistry::new(Some(Arc::clone(
+        &state.knowledge_graph,
+    )));
+    if let Err(e) = sr.register_tools(&tools) {
+        tracing::warn!(error = %e, "Symbol registry: tool registration failed (non-fatal)");
+    }
 
     AssembledTools {
         tools,

@@ -200,6 +200,8 @@ pub struct TeamTool {
     shared_pending: Option<super::delegate::SharedPending>,
     /// Shared results backlog (from TaskTool) — auto-continue loop drains this.
     shared_backlog: Option<super::delegate::SharedBacklog>,
+    /// Result sender — feeds subagent_rx so the main loop injects [SubAgent Result].
+    result_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 impl TeamTool {
@@ -214,6 +216,7 @@ impl TeamTool {
             results: Arc::new(std::sync::Mutex::new(HashMap::new())),
             shared_pending: None,
             shared_backlog: None,
+            result_tx: None,
             max_concurrent: 8,
         }
     }
@@ -243,6 +246,16 @@ impl TeamTool {
     ) -> Self {
         self.shared_pending = Some(pending);
         self.shared_backlog = Some(backlog);
+        self
+    }
+
+    /// Wire the result sender so team results flow back to the main loop
+    /// via subagent_rx (same channel TaskTool uses).
+    pub fn with_result_tx(
+        mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> Self {
+        self.result_tx = Some(tx);
         self
     }
 
@@ -308,8 +321,14 @@ impl TeamTool {
             elapsed_ms: 0,
         };
 
-        self.handles.lock().unwrap().push(handle);
-        self.statuses.lock().unwrap().push(status);
+        self.handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(handle);
+        self.statuses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(status);
         self.pending
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         // Also bump shared pending for auto-continue
@@ -322,13 +341,13 @@ impl TeamTool {
         let results = self.results.clone();
         let shared_pending = self.shared_pending.clone();
         let shared_backlog = self.shared_backlog.clone();
+        let result_tx = self.result_tx.clone();
         let subagent_id_str = subagent_id.to_string();
         let desc_clone = desc.clone();
 
         tokio::spawn(async move {
             let _permit = _permit; // hold semaphore permit until task completes
-            let config = crate::loop_::AgentLoop::new()
-                .with_max_turns(max_turns)
+            let config = crate::loop_::AgentLoop::sub_agent(max_turns)
                 .with_tool_result_budget(4000)
                 .with_context_budget(40000);
 
@@ -336,10 +355,15 @@ impl TeamTool {
                 .run_subagent(llm, tools, messages, CancellationToken::new())
                 .await;
 
+            // Feed into subagent_rx so the main loop injects [SubAgent Result]
+            if let Some(ref tx) = result_tx {
+                let _ = tx.send(result_text.clone());
+            }
+
             // Store result in team's own map
             results
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .insert(subagent_id_str.clone(), result_text.clone());
 
             // Push into shared backlog so auto-continue loop can read it
@@ -458,18 +482,39 @@ impl Tool for TeamTool {
             let role = TeamRole::parse(role_str);
             let focus = member["focus"].as_str().unwrap_or(task);
 
-            // Block until a permit is available (backpressure instead of unlimited spawn)
-            let permit = semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("semaphore closed");
+            // Block until a permit is available (30s timeout to prevent hanging)
+            let permit = match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                semaphore.clone().acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(p)) => p,
+                Ok(Err(_)) => {
+                    tracing::error!("Team semaphore closed unexpectedly — aborting dispatch");
+                    return Err(everevo_core::EverEvoError::Tool {
+                        tool: "team".into(),
+                        message: "Semaphore closed unexpectedly".into(),
+                    });
+                }
+                Err(_elapsed) => {
+                    tracing::error!("Team dispatch timed out waiting for slot (30s)");
+                    return Err(everevo_core::EverEvoError::Tool {
+                        tool: "team".into(),
+                        message: "Timed out waiting for concurrent task slot".into(),
+                    });
+                }
+            };
             let id = self.dispatch_one(focus, role, task, max_turns, permit);
             member_ids.push((
                 id,
                 format!("- **{}**: {}", role.as_str(), role.description()),
             ));
-            dispatched.push(member_ids.last().unwrap().1.clone());
+            let member_name = member_ids
+                .last()
+                .map(|(_, name)| name.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            dispatched.push(member_name);
         }
 
         // Give sub-agents a brief window to start and return fast results.
@@ -478,7 +523,10 @@ impl Tool for TeamTool {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         // Collect any results that arrived so far
-        let results = self.results.lock().unwrap();
+        let results = self
+            .results
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut synthesis = format!(
             "## Team Dispatch: {task}\n\n**{count} members dispatched:**\n{members}\n\n---\n\n",
             count = dispatched.len(),

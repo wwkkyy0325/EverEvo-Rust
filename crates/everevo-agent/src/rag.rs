@@ -48,7 +48,9 @@ pub struct RagPipeline {
 impl RagPipeline {
     /// Create a RAG pipeline using the active model from the registry.
     pub fn new(data_dir: &Path, registry: &ModelRegistry) -> Result<Self, EverEvoError> {
-        let active = registry.active();
+        let active = registry.active().ok_or_else(|| {
+            EverEvoError::Config("No active embedding model available".into())
+        })?;
         let memory_vector_dir = data_dir.join("memory").join("vector");
         let domain_vector_dir = data_dir.join("domain").join("vector");
         let old_vector_dir = data_dir.join("vector");
@@ -139,7 +141,9 @@ impl RagPipeline {
         data_dir: &Path,
         registry: &ModelRegistry,
     ) -> Result<(), EverEvoError> {
-        let active = registry.active();
+        let active = registry.active().ok_or_else(|| {
+            EverEvoError::Config("No active embedding model available".into())
+        })?;
         let models_dir = data_dir.join("models");
         let memory_vector_dir = data_dir.join("memory").join("vector");
         let domain_vector_dir = data_dir.join("domain").join("vector");

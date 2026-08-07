@@ -22,6 +22,10 @@ tokio-util = { workspace = true, features = ["rt"] }
 sqlx = { workspace = true, features = ["sqlite"] }
 tokio = { workspace = true, features = ["rt"] }
 
+# HTTP types for ApiError::IntoResponse
+axum-core = { workspace = true }
+http = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tempfile = "3"

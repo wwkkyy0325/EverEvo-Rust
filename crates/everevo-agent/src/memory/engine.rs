@@ -71,7 +71,7 @@ pub struct DreamingEngine {
     message_buffer: std::sync::Mutex<Vec<(String, String, String, String)>>,
     /// Shared knowledge graph for entity extraction during DEEP.
     /// When set, DEEP writes here instead of opening a new KG instance.
-    knowledge_graph: Option<Arc<std::sync::RwLock<crate::knowledge::graph::KnowledgeGraph>>>,
+    knowledge_graph: Option<Arc<std::sync::RwLock<everevo_knowledge::graph::KnowledgeGraph>>>,
 }
 
 impl DreamingEngine {
@@ -102,7 +102,7 @@ impl DreamingEngine {
     /// Attach the shared knowledge graph for entity extraction during DEEP.
     pub fn set_knowledge_graph(
         &mut self,
-        kg: Arc<std::sync::RwLock<crate::knowledge::graph::KnowledgeGraph>>,
+        kg: Arc<std::sync::RwLock<everevo_knowledge::graph::KnowledgeGraph>>,
     ) {
         self.knowledge_graph = Some(kg);
     }
@@ -387,8 +387,9 @@ impl DreamingEngine {
                 let body = response.content.unwrap_or_default();
 
                 let themes = parse_themes_from_response(&body);
-                self.write_themes(&themes)?;
-                tracing::info!(count = themes.len(), "REM phase — themes extracted via LLM");
+                let theme_count = themes.len();
+                self.write_themes_async(themes).await?;
+                tracing::info!(count = theme_count, "REM phase — themes extracted via LLM");
                 Ok(())
             }
             None => {
@@ -430,7 +431,7 @@ impl DreamingEngine {
         }
 
         // Read themes from REM phase output
-        let themes = self.read_themes().unwrap_or_default();
+        let themes = self.read_themes_async().await.unwrap_or_default();
 
         let mut actions = 0u32;
 
@@ -452,7 +453,7 @@ impl DreamingEngine {
             let action = consolidator.consolidate(&fact, &facts);
             match &action {
                 ConsolidationAction::Add => {
-                    self.fact_manager.save(&fact)?;
+                    self.fact_manager.save_async(fact.clone()).await?;
                     actions += 1;
                     tracing::info!(name = %fact.name, "DEEP phase — new fact promoted");
                 }
@@ -460,7 +461,7 @@ impl DreamingEngine {
                     existing_name,
                     reason,
                 } => {
-                    self.fact_manager.save(&fact)?;
+                    self.fact_manager.save_async(fact.clone()).await?;
                     if fact.name != *existing_name {
                         let _ = self.fact_manager.delete(existing_name);
                     }
@@ -518,7 +519,7 @@ impl DreamingEngine {
         if let Some(ref llm) = self.llm {
             if let Ok(all_facts) = self.fact_manager.load_all() {
                 for fact in &all_facts {
-                    let prompt = crate::knowledge::graph::build_extraction_prompt(&fact.content);
+                    let prompt = everevo_knowledge::graph::build_extraction_prompt(&fact.content);
                     match llm
                         .chat(&[everevo_core::llm::LlmMessage::user(&prompt)], &[])
                         .await
@@ -539,7 +540,7 @@ impl DreamingEngine {
                                     .unwrap_or(std::path::Path::new("data/memory"))
                                     .join("graph");
                                 if let Ok(mut kg) =
-                                    crate::knowledge::graph::KnowledgeGraph::open(&kg_dir)
+                                    everevo_knowledge::graph::KnowledgeGraph::open(&kg_dir)
                                 {
                                     extract_and_write_to_kg(&text, &fact.name, &mut kg);
                                 }
@@ -560,6 +561,7 @@ impl DreamingEngine {
         self.dreams_dir.join("themes.jsonl")
     }
 
+    #[allow(dead_code)] // retained for tests; async consumers use read_themes_async
     fn read_themes(&self) -> Result<Vec<Theme>, EverEvoError> {
         let path = self.themes_path();
         if !path.exists() {
@@ -579,6 +581,7 @@ impl DreamingEngine {
         Ok(themes)
     }
 
+    #[allow(dead_code)] // retained for tests; async consumers use write_themes_async
     fn write_themes(&self, themes: &[Theme]) -> Result<(), EverEvoError> {
         let path = self.themes_path();
         let mut content = String::new();
@@ -590,6 +593,48 @@ impl DreamingEngine {
         std::fs::write(&path, &content)
             .map_err(|e| EverEvoError::Internal(format!("Write themes: {e}")))?;
         Ok(())
+    }
+
+    /// Async wrapper — runs theme file read on the blocking thread pool.
+    pub async fn read_themes_async(&self) -> Result<Vec<Theme>, EverEvoError> {
+        let path = self.themes_path();
+        tokio::task::spawn_blocking(move || {
+            if !path.exists() {
+                return Ok(Vec::new());
+            }
+            let content = std::fs::read_to_string(&path).unwrap_or_default();
+            let mut themes = Vec::new();
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(t) = serde_json::from_str::<Theme>(line) {
+                    themes.push(t);
+                }
+            }
+            Ok(themes)
+        })
+        .await
+        .map_err(|e| EverEvoError::Internal(format!("Theme read panicked: {e}")))?
+    }
+
+    /// Async wrapper — runs theme file write on the blocking thread pool.
+    pub async fn write_themes_async(&self, themes: Vec<Theme>) -> Result<(), EverEvoError> {
+        let path = self.themes_path();
+        let mut content = String::new();
+        for theme in &themes {
+            let line = serde_json::to_string(theme)
+                .map_err(|e| EverEvoError::Internal(format!("Serialize theme: {e}")))?;
+            content.push_str(&line);
+            content.push('\n');
+        }
+        tokio::task::spawn_blocking(move || {
+            std::fs::write(&path, &content)
+                .map_err(|e| EverEvoError::Internal(format!("Write themes: {e}")))
+        })
+        .await
+        .map_err(|e| EverEvoError::Internal(format!("Theme write panicked: {e}")))?
     }
 }
 
@@ -667,9 +712,9 @@ fn theme_to_memory_fact(theme: &Theme) -> MemoryFact {
 fn extract_and_write_to_kg(
     json_text: &str,
     _source: &str,
-    kg: &mut crate::knowledge::graph::KnowledgeGraph,
+    kg: &mut everevo_knowledge::graph::KnowledgeGraph,
 ) {
-    use crate::knowledge::graph::{Entity, EntityType, Relation, RelationStatus};
+    use everevo_knowledge::graph::{Entity, EntityType, Relation, RelationStatus};
     let cleaned = json_text
         .trim()
         .trim_start_matches("```json")

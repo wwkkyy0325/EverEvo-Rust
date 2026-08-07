@@ -49,6 +49,12 @@ pub enum EntityType {
     Concept,
     File,
     Event,
+    /// An agent capability (e.g. can_read, can_execute, can_delegate).
+    Capability,
+    /// A knowledge source (e.g. memory store, RAG pipeline, domain doc).
+    KnowledgeSource,
+    /// A runtime constraint (e.g. max_tokens, permission_level, sandbox_tier).
+    Constraint,
     Other(String),
 }
 
@@ -61,6 +67,9 @@ impl EntityType {
             Self::Concept => "Concept",
             Self::File => "File",
             Self::Event => "Event",
+            Self::Capability => "Capability",
+            Self::KnowledgeSource => "KnowledgeSource",
+            Self::Constraint => "Constraint",
             Self::Other(s) => s.as_str(),
         }
     }
@@ -98,4 +107,70 @@ pub enum RelationStatus {
     Active,
     Superseded,
     Contradicted,
+}
+
+// ── Symbol Predicate ─────────────────────────────────────────────────────
+
+/// Standardized relation predicates for the symbol ontology.
+///
+/// Used by `SymbolRegistry` when connecting entities in the knowledge graph.
+/// Each variant maps to a URI under `http://everevo.io/`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SymbolPredicate {
+    /// Entity A depends on entity B for its operation.
+    DependsOn,
+    /// Entity A has a capability B.
+    HasCapability,
+    /// Entity A implements interface/behaviour B.
+    Implements,
+    /// Entity A is a specialization of entity B.
+    Specializes,
+    /// Entity A conflicts with entity B (cannot coexist).
+    ConflictsWith,
+    /// Entity A requires the presence of entity B.
+    Requires,
+    /// Entity A produces entity B as output.
+    Produces,
+    /// Entity A is constrained by constraint entity B.
+    ConstrainedBy,
+    /// Escape hatch for custom predicates not in the standard set.
+    Custom(String),
+}
+
+impl SymbolPredicate {
+    /// Return the URI fragment for this predicate (used in SPARQL).
+    pub fn as_uri_fragment(&self) -> String {
+        match self {
+            Self::DependsOn => "dependsOn".into(),
+            Self::HasCapability => "hasCapability".into(),
+            Self::Implements => "implements".into(),
+            Self::Specializes => "specializes".into(),
+            Self::ConflictsWith => "conflictsWith".into(),
+            Self::Requires => "requires".into(),
+            Self::Produces => "produces".into(),
+            Self::ConstrainedBy => "constrainedBy".into(),
+            Self::Custom(s) => s.clone(),
+        }
+    }
+
+    /// Create from a URI fragment string.
+    pub fn from_uri_fragment(s: &str) -> Self {
+        match s {
+            "dependsOn" => Self::DependsOn,
+            "hasCapability" => Self::HasCapability,
+            "implements" => Self::Implements,
+            "specializes" => Self::Specializes,
+            "conflictsWith" => Self::ConflictsWith,
+            "requires" => Self::Requires,
+            "produces" => Self::Produces,
+            "constrainedBy" => Self::ConstrainedBy,
+            other => Self::Custom(other.into()),
+        }
+    }
+}
+
+impl std::fmt::Display for SymbolPredicate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.as_uri_fragment())
+    }
 }

@@ -187,6 +187,12 @@ pub struct ContextBuildContext {
     /// Whether the startup self-check passed all critical tests.
     /// When true, the LLM should trust that ONNX, SQLite, and runtimes work.
     pub startup_verified: bool,
+    /// Feedback from ReflectGate sync quick-check (hook_feedback).
+    /// Set after each tool execution; read by AgentLoop for next-turn injection.
+    pub hook_feedback: Option<String>,
+    /// Hint from Meta-Agent for the current turn.
+    /// Set by background meta_diagnose(); injected at turn start; cleared after use.
+    pub meta_hint: Option<String>,
 }
 
 // ── Context Stage Trait ─────────────────────────────────────────────────

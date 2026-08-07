@@ -2,11 +2,12 @@ import { useEffect, useState, useRef } from 'react';
 import { useStore } from '../store';
 import appIcon from '@/assets/icons/app/everevo.svg';
 
-type SettingsTab = 'llm' | 'routing';
+type SettingsTab = 'llm' | 'routing' | 'character';
 
 const SETTINGS_ITEMS: { key: SettingsTab; icon: string; label: string }[] = [
   { key: 'llm', icon: '⚙️', label: '大语言模型' },
   { key: 'routing', icon: '🧭', label: '模型路由' },
+  { key: 'character', icon: '🎭', label: '人格声音' },
 ];
 
 export default function SessionSidebar({

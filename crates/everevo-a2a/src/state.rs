@@ -8,7 +8,7 @@ impl TaskState {
     /// Check whether a transition from `self` to `next` is valid per the
     /// A2A state machine specification.
     ///
-    /// ```
+    /// ```text
     /// submitted   → working | rejected
     /// working     → completed | failed | canceled | input-required | auth-required
     /// input-required → working | failed

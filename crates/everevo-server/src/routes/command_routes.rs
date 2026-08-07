@@ -35,6 +35,6 @@ async fn list_commands(State(state): State<Arc<AppState>>) -> Json<CommandsRespo
     Json(CommandsResponse { commands })
 }
 
-pub fn routes() -> axum::Router<Arc<AppState>> {
+pub fn router() -> axum::Router<Arc<AppState>> {
     axum::Router::new().route("/api/commands", axum::routing::get(list_commands))
 }

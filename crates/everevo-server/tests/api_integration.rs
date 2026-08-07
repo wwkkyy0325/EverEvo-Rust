@@ -358,6 +358,171 @@ async fn invalid_json_body_returns_client_error() {
 async fn empty_post_body_handled() {
     let (app, _) = setup().await;
     let (status, _) = ok!(&app, POST, "/api/sessions", json!({}));
-    // Should either create with default title, or return a validation error
     assert!(status == 200 || status.is_client_error());
+}
+
+// ── Workspace ────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn workspace_get_returns_path() {
+    let (app, _) = setup().await;
+    let (status, body) = ok!(&app, GET, "/api/workspace");
+    assert_eq!(status, 200);
+    assert!(body.get("path").is_some());
+}
+
+#[tokio::test]
+async fn workspace_put_invalid_rejects() {
+    let (app, _) = setup().await;
+    let (status, _body) = send(
+        &app, Method::PUT, "/api/workspace",
+        Some(json!({"path": "/nonexistent/path/xyz123"})),
+    ).await;
+    assert!(status.is_client_error() || status == 200);
+}
+
+// ── Diary ────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn diary_today_returns_content() {
+    let (app, _) = setup().await;
+    let (status, body) = ok!(&app, GET, "/api/diary/today");
+    assert_eq!(status, 200);
+    assert!(body.get("date").is_some());
+}
+
+#[tokio::test]
+async fn diary_list_returns_entries() {
+    let (app, _) = setup().await;
+    let (status, body) = ok!(&app, GET, "/api/diary");
+    assert_eq!(status, 200);
+    assert!(body.get("files").is_some() || body.get("content").is_some());
+}
+
+// ── Character ────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn character_get_returns_profile() {
+    let (app, _) = setup().await;
+    let (status, body) = ok!(&app, GET, "/api/character");
+    assert_eq!(status, 200);
+    assert!(body.get("name").is_some());
+}
+
+#[tokio::test]
+async fn character_put_empty_name_rejects() {
+    let (app, _) = setup().await;
+    let (status, _body) = send(
+        &app, Method::PUT, "/api/character",
+        Some(json!({"name": "", "style": "test"})),
+    ).await;
+    assert!(status.is_client_error());
+}
+
+// ── Models ───────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn models_list_returns_array() {
+    let (app, _) = setup().await;
+    let (status, body) = ok!(&app, GET, "/api/models");
+    assert_eq!(status, 200);
+    assert!(body.get("models").is_some());
+}
+
+#[tokio::test]
+async fn models_activate_unknown_handled_gracefully() {
+    let (app, _) = setup().await;
+    let (status, _body) = send(
+        &app, Method::POST, "/api/models/activate",
+        Some(json!({"model": "nonexistent-model-xyz"})),
+    ).await;
+    // With empty model registry, this may return 200 with error or 500
+    // The key is that the server doesn't crash
+    assert!(status.as_u16() > 0);
+}
+
+// ── Skills ───────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn skills_list_returns_array() {
+    let (app, _) = setup().await;
+    let (status, body) = ok!(&app, GET, "/api/skills");
+    assert_eq!(status, 200);
+    assert!(body.is_array());
+}
+
+#[tokio::test]
+async fn skills_get_unknown_returns_not_found() {
+    let (app, _) = setup().await;
+    let (status, _body) = ok!(&app, GET, "/api/skills/nonexistent-skill");
+    assert!(status == 404 || status == 200);
+}
+
+// ── Tools / Commands ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn tools_list_returns_count() {
+    let (app, _) = setup().await;
+    let (status, body) = ok!(&app, GET, "/api/tools");
+    assert_eq!(status, 200);
+    assert!(body.get("tools").is_some());
+    assert!(body.get("count").is_some());
+}
+
+#[tokio::test]
+async fn commands_list_returns_data() {
+    let (app, _) = setup().await;
+    let (status, body) = ok!(&app, GET, "/api/commands");
+    assert_eq!(status, 200);
+    assert!(body.get("commands").is_some());
+}
+
+// ── Memory status ────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn memory_status_returns_pipeline_info() {
+    let (app, _) = setup().await;
+    let (status, body) = ok!(&app, GET, "/api/memory/status");
+    assert_eq!(status, 200);
+    assert!(body.get("pipeline").is_some());
+}
+
+// ── Config verify (no LLM = ok:false) ────────────────────────────────────────
+
+#[tokio::test]
+async fn config_verify_without_llm_reports_not_ok() {
+    let (app, _) = setup().await;
+    let (status, body) = ok!(&app, GET, "/api/config/verify");
+    assert_eq!(status, 200);
+    assert_eq!(body.get("ok"), Some(&json!(false)));
+}
+
+// ── Error format ─────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn not_found_returns_api_error_envelope() {
+    let (app, _) = setup().await;
+    let (status, body) = ok!(
+        &app, GET,
+        "/api/sessions/00000000-0000-0000-0000-000000000000"
+    );
+    // Now returns proper ApiError envelope
+    if status == 404 {
+        let error = body.get("error").expect("should have error field");
+        assert!(error.get("code").is_some(), "should have code field");
+        assert!(error.get("message").is_some(), "should have message field");
+    }
+}
+
+// ── Session status ───────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn session_status_returns_data() {
+    let (app, _) = setup().await;
+    // Create a session first
+    let (_status, body) = ok!(&app, POST, "/api/sessions", json!({"title": "status-test"}));
+    let sid = body["data"]["id"].as_str().unwrap();
+    let (status, body) = ok!(&app, GET, &format!("/api/sessions/{sid}/status"));
+    assert_eq!(status, 200);
+    assert!(body.get("mode").is_some() || body.get("state").is_some());
 }

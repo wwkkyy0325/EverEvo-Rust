@@ -11,6 +11,7 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::app_state::AppState;
+use everevo_core::ApiError;
 
 #[derive(Deserialize, Default)]
 struct DiaryQuery {
@@ -26,15 +27,15 @@ pub fn router() -> axum::Router<Arc<AppState>> {
 async fn list_or_read(
     State(state): State<Arc<AppState>>,
     Query(q): Query<DiaryQuery>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     if let Some(date) = q.date {
         match state.diary_manager.read_date(&date) {
-            Ok(content) => Json(serde_json::json!({
+            Ok(content) => Ok(Json(serde_json::json!({
                 "date": date,
                 "content": content,
                 "has_content": !content.is_empty(),
-            })),
-            Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+            }))),
+            Err(e) => Err(ApiError::internal(e.to_string())),
         }
     } else {
         // List recent diary files
@@ -56,20 +57,20 @@ async fn list_or_read(
                         })
                     })
                     .collect();
-                Json(serde_json::json!({"files": entries}))
+                Ok(Json(serde_json::json!({"files": entries})))
             }
-            Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+            Err(e) => Err(ApiError::internal(e.to_string())),
         }
     }
 }
 
-async fn today(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+async fn today(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>, ApiError> {
     match state.diary_manager.read_today() {
-        Ok(content) => Json(serde_json::json!({
+        Ok(content) => Ok(Json(serde_json::json!({
             "date": chrono::Utc::now().format("%Y-%m-%d").to_string(),
             "content": content,
             "has_content": !content.is_empty(),
-        })),
-        Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+        }))),
+        Err(e) => Err(ApiError::internal(e.to_string())),
     }
 }

@@ -18,6 +18,7 @@ use serde::Deserialize;
 
 use crate::app_state::AppState;
 use everevo_agent::memory::scheduler::ScheduledPhase;
+use everevo_core::ApiError;
 
 #[derive(Deserialize)]
 struct DreamTrigger {
@@ -164,21 +165,18 @@ async fn trigger_dream(
     }))
 }
 
-async fn trigger_consolidate(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+async fn trigger_consolidate(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>, ApiError> {
     // Run DEEP consolidator pass on existing facts without REM themes
     match state
         .scheduler
         .trigger_phase(&ScheduledPhase::Deep, &state.dreaming_engine)
         .await
     {
-        Ok(()) => Json(serde_json::json!({
+        Ok(()) => Ok(Json(serde_json::json!({
             "status": "ok",
             "message": "Consolidation pass completed",
             "fact_count": state.fact_manager.count().unwrap_or(0),
-        })),
-        Err(e) => Json(serde_json::json!({
-            "status": "error",
-            "message": format!("Consolidation failed: {e}"),
-        })),
+        }))),
+        Err(e) => Err(ApiError::internal(format!("Consolidation failed: {e}"))),
     }
 }

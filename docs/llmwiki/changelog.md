@@ -4,6 +4,136 @@ All notable changes to EverEvo-Rust. Append-only, newest first.
 
 ---
 
+## 2026-08-06 — Codebase Health & Onboarding (Documentation + File Splits)
+
+**What:** Updated all stale documentation, created onboarding guides, split oversized files, and removed dead code.
+
+**Documentation:**
+- `docs/llmwiki/design.md` — updated crate count (12→14), test count (101→493), tool count (11→22+), LanceDB→HNSW, added missing crates
+- `CLAUDE.md` — synced crate list to 14
+- `CONTRIBUTING.md` — new: complete onboarding guide (add Tool/ContextStage/Route, validation, commit conventions, file size limits)
+- `docs/llmwiki/adr/0001-unified-error-handling.md` — new: ApiError design rationale
+- `docs/llmwiki/adr/0002-session-coordinator.md` — new: SessionCoordinator pattern
+- `docs/llmwiki/adr/0003-catch-unwind-boundaries.md` — new: dual panic defense boundaries
+- `docs/llmwiki/adr/README.md` — new: ADR index + process
+
+**Module docs added:**
+- `orchestration/tools.rs` — registration phases table + "how to add a tool" guide
+- `everevo-webagent` — 5 mod.rs files now have `//!` module-level docs
+
+**File splits (domain boundary, zero behavior change):**
+- `web_search.rs` (999 lines) → `web_search/{mod,parser,engine}.rs` (300+270+90)
+- `delegate.rs` (954 lines) → `delegate/{mod,spawn,types}.rs` (680+115+25)
+
+**Dead code removed:**
+- `config_center.rs` — deleted `ConfigCenter` struct + helpers + tests (~440 lines), kept `defaults_toml_content()` only
+
+**Verification:** `cargo check` 0e 0w, 489 tests pass.
+
+---
+
+## 2026-08-06 — Defensive Error Boundaries (Tool Failure Isolation)
+
+**What:** Added `catch_unwind` at agent-loop and chat-handler spawn sites, plus replaced all production `unwrap()`/`expect()` with poison-safe alternatives. Tool panics no longer crash the main conversation.
+
+**Changes:**
+- `everevo-agent/src/loop_/mod.rs` — `AssertUnwindSafe` + `catch_unwind` around `run_loop()`; tool panics → `AgentEvent::Error`
+- `everevo-server/src/routes/chat/handler.rs` — `catch_unwind` around `handle_chat()`; handler panics → SSE error event
+- `everevo-agent/src/tools/builtins/delegate.rs` — 3× `RwLock::write().unwrap()` → `unwrap_or_else(|e| e.into_inner())`
+- `everevo-agent/src/tools/builtins/team.rs` — 4× `Mutex::lock().unwrap()` → poison-safe; `Semaphore::acquire().expect()` → `match` + `EverEvoError`
+- `everevo-server/src/orchestration/tools.rs` — 2× `result_tx.expect()` → `unwrap_or_else` with fallback channel
+- `everevo-agent/src/tools/builtins/web_search.rs` — `bridge_error.as_deref().unwrap()` → literal string
+
+**Verification:** `cargo check` 0e 0w, 493 tests pass.
+
+---
+
+## 2026-08-06 — Unified Error Handling (Phase 9 Complete)
+
+**What:** All REST endpoints now produce a consistent JSON error envelope via `ApiError`.
+Also added panic-recovery middleware so handler panics don't crash the server.
+
+**Error envelope format:**
+```json
+{"error": {"code": "NOT_FOUND", "message": "...", "details": null}}
+```
+
+**Changes:**
+- `everevo-core/src/error.rs` — `ErrorCode` enum (18 variants) + `ApiError` struct + `From<EverEvoError>` + `IntoResponse`
+- `everevo-core/Cargo.toml` — added `axum` dependency for `IntoResponse` impl
+- `everevo-server/src/middleware.rs` — panic recovery layer (catches handler panics → `ApiError` 500)
+- `everevo-server/src/lib.rs` — registered `pub mod middleware` + panic recovery layer
+- `everevo-server/src/orchestration/mod.rs` — `send_sse_error()` helper for SSE error events
+- Migrated 14 route files from scattered error formats (`Json({"error":...})` / `(StatusCode, String)` / `AppError` / `KgError`) to `ApiError`
+- Deleted ~70 lines of duplicate error type definitions (`AppError`, `KgError`)
+- `docs/llmwiki/api-registry.md` — documented error format and ErrorCode/HTTP mapping
+
+**Verification:** `cargo check` 0e 0w, 493 unit tests pass.
+
+---
+
+## 2026-08-05 — Agent Character Phase 2（LLM 蒸馏 + 前端编辑器）
+
+Phase 1 落地了 `AgentCharacterStage` + `character.json` + `sources/` 原文注入。本阶段补齐
+"通过碎片**做人格**"的闭环 + 可视化编辑：
+
+### Part A — LLM 自动蒸馏（`/character sync`）
+- 新 `synthesize_character()`（[agent_character.rs](crates/everevo-agent/src/stages/agent_character.rs)）：
+  镜像 memory curator 的 `llm.chat→JSON` 模式，把 `voice_samples` + `sources/` 喂给 LLM，
+  蒸馏成结构化 traits 写回 `character.json`。**稳健合并**——只覆盖 LLM 实际提供的字段，
+  `voice_samples` 原样保留。含 `SynthesisReport`（哪些字段变了）。
+- 新 slash 命令 `/character sync|show`（注册 [app_state.rs](crates/everevo-server/src/app_state.rs)，
+  分发 [chat.rs](crates/everevo-server/src/routes/chat.rs)）。手动触发——避免静默改写精心调过的性格。
+- 6 个新测试（MockLlmProvider 驱动），共 18 个 agent_character 测试全过。
+
+### Part B — 前端编辑器 + API
+- 新 `GET/PUT /api/character`（[character_routes.rs](crates/everevo-server/src/routes/character_routes.rs)，
+  镜像 config 路由），挂载于 [lib.rs](crates/everevo-server/src/lib.rs)。
+- 新前端 tab「🎭 人格声音」：[CharacterConfig.tsx](frontend/src/components/CharacterConfig.tsx)——
+  编辑名字/身份/语气/特质/价值观/说话规则/声音样本，保存即生效。tab 接线：App.tsx / SessionSidebar / SettingsView。
+
+### 验证
+`cargo clippy -p everevo-agent -p everevo-server -- -D warnings` ✓、`cargo test -p everevo-agent --lib agent_character`（18）✓、
+`cd frontend && npx tsc --noEmit` ✓、`npx vite build` ✓。
+
+### 子 Agent 不继承人格（研究修正）
+联网调研后修正 Phase 1 的一个过度设计：子 agent 是任务导向 worker，产出返回主 agent、不直接面向
+用户，故**移除** `SubAgentContext.agent_character` 继承。依据：Claude Code 官方"focused subagents，
+description as routing hint，more than a persona"；arXiv 2311.10054"Personas in System Prompts Do Not
+Improve…"（效果随机）；system prompt 每次调用付费，人格是持续 token 成本。保留 `persona`（用户
+语言/格式，功能性）。主 agent 独自承担声音。
+
+---
+
+## 2026-08-05 — Agent Character System（agent 自身说话风格/人格）
+
+**问题**：`SYSTEM_PROMPT` 只有工具规则，EverEvo 没有自己的"声音"；`PersonaStage`
+只适配**用户**，不给 **agent 自身**设定性格。**目标**：默认专业直率 + 用户可自定义 +
+支持从文献/聊天记录/碎片导入塑造人格。
+
+**研究依据**（联网）：Anthropic《Claude's Character》（广义特质、诚实同行、nudge 非规则）
++《Your System Prompt Is a Character Sheet》（系统提示词=选角简报，权威关系/失败时性格/缺席的价值观）。
+
+### 改动
+- 新 `crates/everevo-agent/src/stages/agent_character.rs`：`AgentCharacter` profile
+  + `AgentCharacterStage`（priority 0，稳定排序紧跟 `SystemPromptStage`，先于 `PersonaStage`）。
+  首次运行自动生成默认 profile（Anthropic 风格 + 项目 ethos）。
+- **碎片导入**：`character.json` 的 `voice_samples` 自由文本字段 + 同级
+  `data/memory/agent/sources/*.md|*.txt` 拖入即加载（确定性拼接，无 LLM 步骤）。
+- 子 agent 继承：`SubAgentContext` 新增 `agent_character: Option<String>` 字段，
+  `chat.rs` 注入渲染块，`build_system_prompt` 输出 `## Agent Character` 段。
+- 接线：`stages/mod.rs`、`lib.rs`（re-export `AgentCharacter`/`AgentCharacterStage`/
+  `build_character_block`）、`chat.rs` pipeline + sub_ctx。
+
+### 验证
+`cargo check -p everevo-agent/server` ✓、`cargo test -p everevo-agent --lib agent_character`（12 pass）✓、
+`cargo clippy -p everevo-agent -p everevo-server -- -D warnings` ✓。
+
+### 未做（simplicity first）
+LLM 自动蒸馏 sources→traits、前端编辑器 = 可选后续。
+
+---
+
 ## 2026-07-30 — Self-Evolving Agent（反思 + 总结 + 元 + skill 融合）
 
 让 agent 越用越聪明。调研确认 EverEvo 已有自进化全部零件，缺的是闭环 + 两个 write 路径。

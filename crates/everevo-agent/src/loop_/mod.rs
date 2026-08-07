@@ -35,8 +35,10 @@ pub use event::AgentEvent;
 
 use hooks::execute_with_hooks;
 
+use futures::FutureExt;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -47,6 +49,17 @@ use everevo_core::types::ToolCall;
 use everevo_core::EverEvoError;
 use everevo_core::{AgentTurnRecord, Telemetry};
 use uuid::Uuid;
+
+// ── Panic Recovery ────────────────────────────────────────────────────────
+
+/// Extract a human-readable message from a panic payload caught by catch_unwind.
+fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".into())
+}
 
 // ── Proactivity State ────────────────────────────────────────────────────
 
@@ -260,6 +273,8 @@ pub struct AgentLoop {
     /// Proactivity state — tracks fixation loops and escalation.
     /// Wrapped in Arc<Mutex<>> so run_loop() can update it and the caller can read it.
     proactivity_state: Option<Arc<std::sync::Mutex<ProactivityState>>>,
+    /// Meta-agent state — cross-turn pattern diagnosis and hint injection.
+    meta_agent_state: Option<Arc<std::sync::Mutex<crate::memory::meta_agent::MetaAgentState>>>,
 }
 
 impl AgentLoop {
@@ -275,6 +290,7 @@ impl AgentLoop {
             cancel_token: None,
             compact_focus: None,
             proactivity_state: None,
+            meta_agent_state: None,
         }
     }
 
@@ -288,6 +304,17 @@ impl AgentLoop {
     /// across turns) and injects escalating intervention messages at L1-L3.
     pub fn with_proactivity(mut self, state: Arc<std::sync::Mutex<ProactivityState>>) -> Self {
         self.proactivity_state = Some(state);
+        self
+    }
+
+    /// Enable meta-agent cross-turn pattern diagnosis.
+    /// When enabled, the loop injects meta-agent hints at turn boundaries
+    /// and triggers background diagnosis on interval or escalation.
+    pub fn with_meta_agent(
+        mut self,
+        state: Arc<std::sync::Mutex<crate::memory::meta_agent::MetaAgentState>>,
+    ) -> Self {
+        self.meta_agent_state = Some(state);
         self
     }
 
@@ -327,6 +354,36 @@ impl AgentLoop {
         self
     }
 
+    // ── Factory constructors ────────────────────────────────────────────
+
+    /// Full-featured main session loop (chat in server mode).
+    /// Wires sub-agent channels, cancellation, compaction focus, and proactivity.
+    pub fn main_session(
+        subagent_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+        pending_subagents: Arc<std::sync::atomic::AtomicUsize>,
+        cancel_token: tokio_util::sync::CancellationToken,
+        compact_focus: Arc<std::sync::Mutex<Option<String>>>,
+        proactivity: Arc<std::sync::Mutex<ProactivityState>>,
+    ) -> Self {
+        Self::new()
+            .with_subagent_channel(subagent_rx)
+            .with_pending_subagents(pending_subagents)
+            .with_cancel_token(cancel_token)
+            .with_compact_focus(compact_focus)
+            .with_proactivity(proactivity)
+    }
+
+    /// Standard sub-agent loop (TaskTool, Team, Workflow, Cluster, A2A).
+    /// Sets a turn limit; the caller can chain additional `.with_*()` methods.
+    pub fn sub_agent(max_turns: usize) -> Self {
+        Self::new().with_max_turns(max_turns)
+    }
+
+    /// CLI chat loop (standalone binary mode, 30-turn limit).
+    pub fn cli() -> Self {
+        Self::new().with_max_turns(30)
+    }
+
     /// Run the ReAct loop with streaming output via AgentEvent channel.
     #[allow(clippy::type_complexity)]
     pub async fn run(
@@ -352,6 +409,7 @@ impl AgentLoop {
         let cancel = self.cancel_token.clone();
         let compact_focus = self.compact_focus.clone();
         let proactivity = self.proactivity_state.clone();
+        let meta_agent = self.meta_agent_state.clone();
         tokio::spawn(async move {
             let tool_schemas: Vec<ToolSchema> = tools
                 .as_tool_schemas()
@@ -363,7 +421,7 @@ impl AgentLoop {
                 })
                 .collect();
 
-            if let Err(e) = run_loop(
+            match AssertUnwindSafe(run_loop(
                 &llm,
                 &tools,
                 &tool_schemas,
@@ -380,14 +438,30 @@ impl AgentLoop {
                 cancel.as_ref(),
                 &compact_focus,
                 &proactivity,
-            )
+                &meta_agent,
+            ))
+            .catch_unwind()
             .await
             {
-                let _ = tx
-                    .send(AgentEvent::Error {
-                        message: e.to_string(),
-                    })
-                    .await;
+                Ok(Ok(())) => {} // normal completion
+                Ok(Err(e)) => {
+                    // run_loop returned a normal error
+                    let _ = tx
+                        .send(AgentEvent::Error {
+                            message: e.to_string(),
+                        })
+                        .await;
+                }
+                Err(panic) => {
+                    // run_loop panicked — catch_unwind recovered it
+                    let msg = panic_message(&panic);
+                    tracing::error!(%msg, "Agent loop panicked — recovered by catch_unwind");
+                    let _ = tx
+                        .send(AgentEvent::Error {
+                            message: format!("Internal agent error: {msg}"),
+                        })
+                        .await;
+                }
             }
         });
 
@@ -602,6 +676,7 @@ async fn run_loop(
     cancel: Option<&tokio_util::sync::CancellationToken>,
     compact_focus: &Option<Arc<std::sync::Mutex<Option<String>>>>,
     proactivity: &Option<Arc<std::sync::Mutex<ProactivityState>>>,
+    meta_agent_state: &Option<Arc<std::sync::Mutex<crate::memory::meta_agent::MetaAgentState>>>,
 ) -> Result<(), EverEvoError> {
     let mut turn = 0;
     // Track the previous turn's tool signature for fixation detection.
@@ -923,7 +998,18 @@ async fn run_loop(
             }
         }
 
-        // ── 4.5 Proactivity: detect fixation and inject intervention ─
+        // ── 4.5 Meta-Agent: inject pending hint at turn start ──────
+        if let Some(ref meta_state) = meta_agent_state {
+            let mut ms = meta_state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(hint) = ms.take_hint() {
+                messages.push(LlmMessage::user(format!(
+                    "[META-AGENT HINT]\n{hint}"
+                )));
+                tracing::debug!(hint_len = hint.len(), "Meta-agent hint injected");
+            }
+        }
+
+        // ── 4.6 Proactivity: detect fixation and inject intervention ─
         if let Some(ref state) = proactivity {
             // Collect first-tool info for this turn's fixation tracking.
             let this_tool = tool_calls
@@ -948,6 +1034,62 @@ async fn run_loop(
                 }
 
                 prev_tool_sig = Some((name.clone(), args_h));
+            }
+        }
+
+        // ── 4.7 Meta-Agent: trigger on interval or degradation ─────
+        if let Some(ref meta) = meta_agent_state {
+            let mut ms = meta.lock().unwrap_or_else(|e| e.into_inner());
+            ms.increment_turn();
+            let escalation = proactivity
+                .as_ref()
+                .map(|p| {
+                    let ps = p.lock().unwrap_or_else(|e| e.into_inner());
+                    ps.level as u32
+                })
+                .unwrap_or(0);
+            if ms.should_trigger(escalation) && ms.has_llm() {
+                ms.mark_triggered();
+                // Fire-and-forget: spawn meta-diagnosis in background
+                if let Some(ref llm) = ms.llm {
+                    let llm = Arc::clone(llm);
+                    let fm = ms.fact_manager.clone();
+                    let meta_state = Arc::clone(meta);
+                    // Build a summary of recent messages for the prompt
+                    let recent_summary = messages
+                        .iter()
+                        .rev()
+                        .take(10)
+                        .map(|m| {
+                            let role = match m.role {
+                                everevo_core::llm::LlmRole::User => "U",
+                                everevo_core::llm::LlmRole::Assistant => "A",
+                                _ => "S",
+                            };
+                            let content = if m.content.len() > 100 {
+                                format!("{}…", &m.content[..100])
+                            } else {
+                                m.content.clone()
+                            };
+                            format!("[{role}] {content}")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    tokio::spawn(async move {
+                        let hint = crate::memory::meta_agent::meta_diagnose(
+                            &llm,
+                            fm.as_deref(),
+                            &crate::memory::paradigm::TrajectoryBuffer::default(),
+                            escalation,
+                            &recent_summary,
+                        )
+                        .await;
+                        if let Some(h) = hint {
+                            let mut ms = meta_state.lock().unwrap_or_else(|e| e.into_inner());
+                            ms.set_hint(h);
+                        }
+                    });
+                }
             }
         }
 

@@ -17,6 +17,8 @@
 | `ImageData` | Struct | **Stable** | 2026-07-30 (new — multimodal base64 image) | — |
 | `ToolOutput` | Struct | **Stable** | 2026-07-30 (added `images`, `Default`, `text()` ctor) | — |
 | `EverEvoError` | Enum | **Stable** | 2026-07-30 (added `Network` variant) | — |
+| `ApiError` | Struct | **Stable** | 2026-08-06 (new — unified HTTP error) | — |
+| `ErrorCode` | Enum | **Stable** | 2026-08-06 (new — 18 machine-readable codes) | — |
 | `StreamEvent` | Enum | **Stable** | 2026-07-18 | — |
 
 ## everevo-mcp (MCP Client)
@@ -34,6 +36,10 @@
 | `AgentLoop` | Struct | **Stable** | 2026-07-26 (added `cancel_token`) |
 | `AgentLoop::run()` | Method | **Stable** | 2026-07-26 (added `with_cancel_token`) |
 | `HttpClient::stream_chat()` | Method | **Stable** | 2026-07-26 (added `_cancel` param) |
+| `AgentCharacterStage` / `AgentCharacter` | Struct | **Stable** | 2026-08-05 (new — agent's own voice; priority 0) |
+| `build_character_block(profile_path)` | Fn | **Stable** | 2026-08-05 (new — renders character + sources) |
+| `synthesize_character(path, llm)` / `SynthesisReport` | Fn | **Stable** | 2026-08-05 (new — LLM distills fragments → traits) |
+| `load_character(path)` | Fn | **Stable** | 2026-08-05 (new — load/auto-create profile) |
 
 ## everevo-agent (LLM-facing Tools)
 
@@ -57,6 +63,7 @@
 | `GET /api/health/stats` | JSON | **Stable** | 2026-07-26 |
 | `GET /api/session/{id}/todos` | JSON | **Stable** | 2026-07-26 |
 | `POST /api/chat/{id}/interrupt` | JSON | **Stable** | 2026-07-26 |
+| `GET`/`PUT /api/character` | JSON | **Stable** | 2026-08-05 (new — read/write agent voice profile) |
 
 ## Frontend (Store & Components)
 
@@ -77,3 +84,56 @@
 | **Evolving** | 可能变更，但会尽量向后兼容 |
 | **Unstable** | 随时可能变更，不保证兼容 |
 | **Deprecated** | 将在下个版本移除，已有替代方案 |
+
+---
+
+## Unified Error Format (2026-08-06)
+
+所有 REST 端点统一使用 `ApiError`，产生一致的 JSON 响应：
+
+```json
+{
+  "error": {
+    "code": "NOT_FOUND",
+    "message": "human-readable description",
+    "details": null
+  }
+}
+```
+
+### Error Codes / HTTP Mapping
+
+| ErrorCode | HTTP Status |
+|-----------|------------|
+| `NOT_FOUND` | 404 |
+| `INVALID_INPUT` | 400 |
+| `CONFLICT` | 409 |
+| `FORBIDDEN` | 403 |
+| `UNAUTHORIZED` | 401 |
+| `TOO_MANY_REQUESTS` | 429 |
+| `INTERNAL` | 500 |
+| `DATABASE_ERROR` | 500 |
+| `LLM_PROVIDER_ERROR` | 503 |
+| `SANDBOX_ERROR` | 500 |
+| `NETWORK_ERROR` | 502 |
+| `IO_ERROR` | 500 |
+| `CONFIG_ERROR` | 500 |
+| `AGENT_ERROR` | 500 |
+| `TOOL_ERROR` | 500 |
+| `BOOTSTRAP_ERROR` | 500 |
+| `TIMEOUT` | 504 |
+| `SERVICE_UNAVAILABLE` | 503 |
+
+### 用法
+
+```rust
+// Route handler
+use everevo_core::ApiError;
+
+async fn my_handler(State(state): State<Arc<AppState>>) -> Result<Json<T>, ApiError> {
+    let item = state.db.get(id).await
+        .map_err(ApiError::from)?   // EverEvoError → ApiError auto-mapping
+        .ok_or_else(|| ApiError::not_found("item not found"))?;
+    Ok(Json(item))
+}
+```

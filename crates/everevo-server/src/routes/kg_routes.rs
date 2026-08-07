@@ -8,7 +8,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 
 use crate::app_state::AppState;
-use everevo_core::EverEvoError;
+use everevo_core::ApiError;
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -24,7 +24,7 @@ struct SparqlRequest {
 async fn query_sparql(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SparqlRequest>,
-) -> Result<Json<serde_json::Value>, KgError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let kg = state
         .knowledge_graph
         .read()
@@ -38,7 +38,7 @@ async fn query_sparql(
 async fn get_entity(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-) -> Result<Json<serde_json::Value>, KgError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let kg = state
         .knowledge_graph
         .read()
@@ -47,20 +47,20 @@ async fn get_entity(
     // Search by name or ID
     let entities = kg.search(&name);
     if entities.is_empty() {
-        return Err(KgError::not_found(name));
+        return Err(ApiError::not_found(name));
     }
 
     let entity = &entities[0];
     let outgoing: Vec<serde_json::Value> = kg.outgoing(&entity.id).iter().map(|r| {
         serde_json::json!({
             "predicate": r.predicate, "to": r.to,
-            "status": if r.status == everevo_agent::knowledge::graph::RelationStatus::Active { "active" } else { "superseded" },
+            "status": if r.status == everevo_knowledge::graph::RelationStatus::Active { "active" } else { "superseded" },
         })
     }).collect();
     let incoming: Vec<serde_json::Value> = kg.incoming(&entity.id).iter().map(|r| {
         serde_json::json!({
             "predicate": r.predicate, "from": r.from,
-            "status": if r.status == everevo_agent::knowledge::graph::RelationStatus::Active { "active" } else { "superseded" },
+            "status": if r.status == everevo_knowledge::graph::RelationStatus::Active { "active" } else { "superseded" },
         })
     }).collect();
 
@@ -78,35 +78,3 @@ async fn get_entity(
 
 // ── Error ──────────────────────────────────────────────────────────────
 
-struct KgError {
-    status: axum::http::StatusCode,
-    message: String,
-}
-
-impl KgError {
-    fn not_found(name: String) -> Self {
-        Self {
-            status: axum::http::StatusCode::NOT_FOUND,
-            message: format!("Entity not found: {name}"),
-        }
-    }
-}
-
-impl From<EverEvoError> for KgError {
-    fn from(e: EverEvoError) -> Self {
-        Self {
-            status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            message: e.to_string(),
-        }
-    }
-}
-
-impl axum::response::IntoResponse for KgError {
-    fn into_response(self) -> axum::response::Response {
-        (
-            self.status,
-            Json(serde_json::json!({ "error": self.message })),
-        )
-            .into_response()
-    }
-}

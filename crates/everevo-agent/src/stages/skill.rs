@@ -30,25 +30,55 @@ impl ContextStage for SkillStage {
         "skills"
     }
 
-    fn build(&self, _ctx: &ContextBuildContext) -> Option<ContextFragment> {
+    fn build(&self, ctx: &ContextBuildContext) -> Option<ContextFragment> {
         // Hot-reload: re-scan data/skills/ if changed since last check.
-        // New skills take effect immediately — no restart needed.
         self.registry.check_rescan();
 
-        let metadata = self.registry.list_metadata();
-        if metadata.is_empty() {
-            return None;
+        // Selective injection: only inject skills relevant to the user's message.
+        // Falls back to full metadata list when the message is empty (e.g. first turn).
+        if ctx.user_message.is_empty() {
+            let metadata = self.registry.list_metadata();
+            if metadata.is_empty() {
+                return None;
+            }
+            let content: String = metadata
+                .iter()
+                .map(|(name, desc)| format!("- **{name}**: {desc}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Some(ContextFragment {
+                label: "Available Skills".into(),
+                messages: vec![LlmMessage::user(format!(
+                    "## Available Skills\n\n{content}\n\n\
+                     To use a skill, say \"use the {{name}}\" skill or invoke it by name."
+                ))],
+            });
         }
-        let content: String = metadata
+
+        // Selective: only top-matched skills
+        let matched = self.registry.find_relevant(&ctx.user_message);
+        if matched.is_empty() {
+            return None; // no match → inject nothing, save tokens
+        }
+
+        let content: String = matched
             .iter()
-            .map(|(name, desc)| format!("- **{name}**: {desc}"))
+            .map(|(s, score)| {
+                format!(
+                    "- **{name}** (match {pct:.0}%): {desc}",
+                    name = s.name,
+                    pct = (score / 8.0 * 100.0).min(100.0),
+                    desc = s.description
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
+
         Some(ContextFragment {
-            label: "Available Skills".into(),
+            label: "Relevant Skills".into(),
             messages: vec![LlmMessage::user(format!(
-                "## Available Skills\n\n{content}\n\n\
-                 To use a skill, say \"use the {{name}}\" skill or invoke it by name."
+                "## Relevant Skills\n\n{content}\n\n\
+                 Use the Skill tool (action='load') to read a skill's full instructions."
             ))],
         })
     }
@@ -72,6 +102,10 @@ mod tests {
             when_to_use: vec![],
             persona: None,
             path: PathBuf::from("test"),
+            source: crate::skill::SkillSource::User,
+            disable_model_invocation: false,
+            model_override: None,
+            user_invocable: true,
         }];
         let registry = Arc::new(SkillRegistry {
             skills: RwLock::new(skills),

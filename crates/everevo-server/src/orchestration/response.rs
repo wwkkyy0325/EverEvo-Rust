@@ -97,5 +97,37 @@ pub async fn persist_and_send(
         sb.flush_audit();
     }
 
+    // ── Summarizer: fire-and-forget session summary on close ──
+    // Only runs when there's substantive conversation to summarize.
+    if !full_response.is_empty() && full_response.len() > 50 {
+        let llm = {
+            let guard = state.llm.read().await;
+            guard.values().find_map(|v| v.clone())
+        };
+        if let Some(client) = llm {
+            let fm = state.fact_manager.clone();
+            let sid = session_id;
+            let summary_text = full_response.to_string();
+            tokio::spawn(async move {
+                let buffer = everevo_agent::memory::TrajectoryBuffer::default();
+                let summary = everevo_agent::memory::summarize_session(
+                    &client,
+                    &fm,
+                    &buffer,
+                    sid,
+                    &summary_text,
+                    &summary_text,
+                )
+                .await;
+                tracing::info!(
+                    session_id = %sid,
+                    achieved = summary.goals_achieved.len(),
+                    paradigms = summary.paradigms_extracted,
+                    "Summarizer: session summary saved"
+                );
+            });
+        }
+    }
+
     Ok(())
 }

@@ -11,7 +11,8 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
-use everevo_agent::knowledge::domain::{DocumentParser, Domain, DomainManager};
+use everevo_core::ApiError;
+use everevo_knowledge::domain::{DocumentParser, Domain, DomainManager};
 use everevo_core::llm::LlmProvider;
 use everevo_core::retrieval::Retriever;
 use everevo_core::EverEvoError;
@@ -63,7 +64,7 @@ struct MergeRequest {
 /// GET /api/domains — list all domains with coverage stats.
 async fn list_domains(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let domain_root = state.config.data_dir.join("domain");
     let mgr = DomainManager::load(&domain_root)?;
     let coverage = mgr.coverage();
@@ -98,7 +99,7 @@ async fn list_domains(
 async fn create_domain(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateDomainRequest>,
-) -> Result<Json<Domain>, AppError> {
+) -> Result<Json<Domain>, ApiError> {
     let domain_root = state.config.data_dir.join("domain");
     let mut mgr = DomainManager::load(&domain_root)?;
 
@@ -109,7 +110,7 @@ async fn create_domain(
     };
 
     if mgr.registry.domains.contains_key(&id) {
-        return Err(AppError::conflict(format!("Domain '{id}' already exists")));
+        return Err(ApiError::conflict(format!("Domain '{id}' already exists")));
     }
 
     let description = if req.description.is_empty() {
@@ -142,7 +143,7 @@ async fn create_domain(
 async fn get_domain(
     State(state): State<Arc<AppState>>,
     Path(domain_id): Path<String>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let domain_root = state.config.data_dir.join("domain");
     let mgr = DomainManager::load(&domain_root)?;
 
@@ -184,12 +185,12 @@ async fn get_domain(
 async fn delete_domain(
     State(state): State<Arc<AppState>>,
     Path(domain_id): Path<String>,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<impl IntoResponse, ApiError> {
     let domain_root = state.config.data_dir.join("domain");
     let mut mgr = DomainManager::load(&domain_root)?;
 
     if !mgr.registry.domains.contains_key(&domain_id) {
-        return Err(AppError::not_found(format!(
+        return Err(ApiError::not_found(format!(
             "Domain '{domain_id}' not found"
         )));
     }
@@ -211,13 +212,13 @@ async fn ingest_document(
     State(state): State<Arc<AppState>>,
     Path(domain_id): Path<String>,
     body: String,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let domain_root = state.config.data_dir.join("domain");
     let models_dir = state.config.data_dir.join("models");
     let mut mgr = DomainManager::load_with_onnx(&domain_root, &models_dir)?;
 
     if !mgr.registry.domains.contains_key(&domain_id) {
-        return Err(AppError::not_found(format!(
+        return Err(ApiError::not_found(format!(
             "Domain '{domain_id}' not found"
         )));
     }
@@ -225,8 +226,8 @@ async fn ingest_document(
     let doc_id = Uuid::new_v4();
     let filename = format!("{doc_id}.md");
     let text = DocumentParser::parse(&filename, body.as_bytes()).unwrap_or(body.clone());
-    let _hash = everevo_agent::knowledge::domain::content_hash(&text);
-    let chunker = everevo_agent::knowledge::domain::SemanticChunker::default();
+    let _hash = everevo_knowledge::domain::content_hash(&text);
+    let chunker = everevo_knowledge::domain::SemanticChunker::default();
     let chunks = chunker.chunk(&text);
 
     // Write document to domain's documents directory
@@ -256,7 +257,7 @@ async fn ingest_document(
 /// POST /api/domains/inbox — process the global inbox.
 async fn process_inbox(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let domain_root = state.config.data_dir.join("domain");
     let models_dir = state.config.data_dir.join("models");
     // Auto-detect ONNX embedder from bootstrap models
@@ -296,7 +297,7 @@ async fn merge_domain(
     State(state): State<Arc<AppState>>,
     Path(target_id): Path<String>,
     Json(req): Json<MergeRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let domain_root = state.config.data_dir.join("domain");
     let mut mgr = DomainManager::load(&domain_root)?;
 
@@ -323,9 +324,9 @@ async fn merge_domain(
 async fn search_domains(
     State(state): State<Arc<AppState>>,
     Query(query): Query<SearchQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let domain_root = state.config.data_dir.join("domain");
-    let retriever = everevo_agent::knowledge::domain::DomainRetriever::new(&domain_root);
+    let retriever = everevo_knowledge::domain::DomainRetriever::new(&domain_root);
     let results = retriever.search(&query.q, query.limit);
 
     Ok(Json(serde_json::json!({
@@ -354,7 +355,7 @@ struct RagSearchQuery {
 async fn rag_search(
     State(state): State<Arc<AppState>>,
     Query(query): Query<RagSearchQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let rag = state
         .rag_pipeline
         .as_ref()
@@ -375,7 +376,7 @@ async fn rag_search(
 async fn rag_ingest(
     State(state): State<Arc<AppState>>,
     body: String,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     use everevo_agent::rag::make_chunk;
     use everevo_vector::ChunkType;
     let rag = state
@@ -402,7 +403,7 @@ struct CreateFactRequest {
 async fn create_fact(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateFactRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let ft = everevo_core::memory::FactType::from_str(&req.fact_type)
         .unwrap_or(everevo_core::memory::FactType::User);
     let now = chrono::Utc::now();
@@ -423,16 +424,16 @@ async fn create_fact(
     state
         .fact_manager
         .save(&fact)
-        .map_err(|e| AppError::from(EverEvoError::Internal(e.to_string())))?;
+        .map_err(|e| ApiError::from(EverEvoError::Internal(e.to_string())))?;
     Ok(Json(serde_json::json!({ "created": req.name })))
 }
 
 async fn get_fact(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let facts = everevo_agent::memory::FactStore::load_all(&state.fact_manager)
-        .map_err(|e| AppError::from(EverEvoError::Internal(e.to_string())))?;
+        .map_err(|e| ApiError::from(EverEvoError::Internal(e.to_string())))?;
     match facts.into_iter().find(|f| f.name == name) {
         Some(f) => Ok(Json(serde_json::json!({
             "name": f.name,
@@ -441,7 +442,7 @@ async fn get_fact(
             "fact_type": f.fact_type.as_str(),
             "created_at": f.created_at.to_rfc3339(),
         }))),
-        None => Err(AppError::not_found(format!("Fact '{name}' not found"))),
+        None => Err(ApiError::not_found(format!("Fact '{name}' not found"))),
     }
 }
 
@@ -449,13 +450,13 @@ async fn update_fact(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
     Json(req): Json<CreateFactRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let facts = everevo_agent::memory::FactStore::load_all(&state.fact_manager)
-        .map_err(|e| AppError::from(EverEvoError::Internal(e.to_string())))?;
+        .map_err(|e| ApiError::from(EverEvoError::Internal(e.to_string())))?;
     let existing = facts
         .into_iter()
         .find(|f| f.name == name)
-        .ok_or_else(|| AppError::not_found(format!("Fact '{name}' not found")))?;
+        .ok_or_else(|| ApiError::not_found(format!("Fact '{name}' not found")))?;
 
     let ft = everevo_core::memory::FactType::from_str(&req.fact_type).unwrap_or(existing.fact_type);
     let updated = everevo_core::memory::MemoryFact {
@@ -479,7 +480,7 @@ async fn update_fact(
     state
         .fact_manager
         .save(&updated)
-        .map_err(|e| AppError::from(EverEvoError::Internal(e.to_string())))?;
+        .map_err(|e| ApiError::from(EverEvoError::Internal(e.to_string())))?;
     Ok(Json(serde_json::json!({ "updated": name })))
 }
 
@@ -493,48 +494,3 @@ fn build_domain_description_prompt(name: &str, doc_count: usize) -> String {
     )
 }
 
-// ── AppError wrapper ─────────────────────────────────────────────────
-
-struct AppError {
-    status: StatusCode,
-    message: String,
-}
-
-impl AppError {
-    fn not_found(msg: String) -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            message: msg,
-        }
-    }
-    fn conflict(msg: String) -> Self {
-        Self {
-            status: StatusCode::CONFLICT,
-            message: msg,
-        }
-    }
-}
-
-impl From<EverEvoError> for AppError {
-    fn from(e: EverEvoError) -> Self {
-        let status = match &e {
-            EverEvoError::NotFound(_) => StatusCode::NOT_FOUND,
-            EverEvoError::InvalidInput(_) => StatusCode::BAD_REQUEST,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-        Self {
-            status,
-            message: e.to_string(),
-        }
-    }
-}
-
-impl IntoResponse for AppError {
-    fn into_response(self) -> axum::response::Response {
-        (
-            self.status,
-            Json(serde_json::json!({ "error": self.message })),
-        )
-            .into_response()
-    }
-}

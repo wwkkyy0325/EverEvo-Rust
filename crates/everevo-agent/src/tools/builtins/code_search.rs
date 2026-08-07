@@ -6,7 +6,7 @@
 //! - `code_map` — lightweight Markdown directory overview (CLAUDE.md pattern)
 //!
 //! ### Search Pipeline
-//! ```
+//! ```text
 //! query → [<3 chars? → rg] → [index ready? → FTS5 trigram] → [0 results? → rg]
 //!        → [dedup + identifier-weighted rank] → [hard caps 12×250] → [compact format]
 //! ```

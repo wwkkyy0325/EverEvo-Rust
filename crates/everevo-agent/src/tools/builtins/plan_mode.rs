@@ -6,7 +6,7 @@
 //! available. The agent explores, designs, writes a plan, and gets user
 //! approval BEFORE any code is modified.
 //!
-//! ```
+//! ```text
 //! Normal → EnterPlanMode → PlanMode (write tools blocked, pre-perm saved)
 //! PlanMode → ExitPlanMode  → Normal (permission restored, plan saved)
 //!          → CancelPlanMode → Normal (permission restored, plan discarded)

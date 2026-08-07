@@ -100,7 +100,7 @@ impl ChunkExtractor {
     pub async fn apply_with_kg(
         results: &[ExtractionResult],
         fact_manager: &FactManager,
-        kg: Option<&mut crate::knowledge::graph::KnowledgeGraph>,
+        kg: Option<&mut everevo_knowledge::graph::KnowledgeGraph>,
     ) -> Result<ApplyStats, EverEvoError> {
         let stats = Self::apply(results, fact_manager).await?;
 
@@ -108,7 +108,7 @@ impl ChunkExtractor {
         if let Some(kg) = kg {
             for result in results {
                 for entity in &result.entities {
-                    use crate::knowledge::graph::{Entity, EntityType};
+                    use everevo_knowledge::graph::{Entity, EntityType};
                     let e = Entity {
                         id: entity.id.clone(),
                         label: entity.label.clone(),
@@ -122,7 +122,7 @@ impl ChunkExtractor {
                     kg.upsert_entity(e);
                 }
                 for rel in &result.relations {
-                    use crate::knowledge::graph::{Relation, RelationStatus};
+                    use everevo_knowledge::graph::{Relation, RelationStatus};
                     let r = Relation {
                         from: rel.from.clone(),
                         predicate: rel.predicate.clone(),
@@ -153,11 +153,11 @@ impl ChunkExtractor {
         for result in results {
             match &result.action {
                 ConsolidationAction::Add => {
-                    fact_manager.save(&result.fact)?;
+                    fact_manager.save_async(result.fact.clone()).await?;
                     stats.added += 1;
                 }
                 ConsolidationAction::Update { existing_name, .. } => {
-                    fact_manager.save(&result.fact)?;
+                    fact_manager.save_async(result.fact.clone()).await?;
                     // Delete old fact if name changed
                     if result.fact.name != *existing_name {
                         fact_manager.delete(existing_name)?;

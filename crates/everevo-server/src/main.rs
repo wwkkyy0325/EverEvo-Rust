@@ -246,14 +246,14 @@ async fn cmd_serve(config: everevo_core::AppConfig, host: &str, port: u16) {
     let models_dir = state.config.data_dir.join("models");
     let _domain_watcher_handle = tokio::spawn(async move {
         // Load once with ONNX embedder (non-fatal if models unavailable).
-        let mut mgr = match everevo_agent::knowledge::domain::DomainManager::load_with_onnx(
+        let mut mgr = match everevo_knowledge::domain::DomainManager::load_with_onnx(
             &domain_root,
             &models_dir,
         ) {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(error = %e, "DomainManager load_with_onnx failed, trying fallback");
-                match everevo_agent::knowledge::domain::DomainManager::load(&domain_root) {
+                match everevo_knowledge::domain::DomainManager::load(&domain_root) {
                     Ok(m) => m,
                     Err(e2) => {
                         tracing::error!(error = %e2, "Domain inbox watcher disabled — cannot load DomainManager");
@@ -557,7 +557,7 @@ async fn cmd_chat(config: &everevo_core::AppConfig, message: &str) {
     ));
 
     // ── Agent Loop ───────────────────────────────────────────────────
-    let agent = AgentLoop::new().with_max_turns(30);
+    let agent = AgentLoop::cli();
     let messages = vec![LlmMessage::user(message)];
 
     println!("🤖 EverEvo\n");

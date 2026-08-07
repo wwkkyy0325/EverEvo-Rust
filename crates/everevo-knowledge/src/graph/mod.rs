@@ -18,10 +18,12 @@ pub mod extraction;
 #[allow(clippy::module_inception)]
 pub mod graph;
 pub mod resolver;
+pub mod symbols;
 pub mod types;
 
 // Re-export the public API surface
 pub use extraction::build_extraction_prompt;
 pub use graph::KnowledgeGraph;
 pub use resolver::{EntityResolver, MatchResult, ResolveStats};
-pub use types::{Entity, EntityType, Relation, RelationStatus};
+pub use symbols::{SymbolRegistry, CAP_EXECUTE, CAP_READ, CAP_SEARCH, CAP_WRITE, CAP_DELEGATE, CAP_LEARN, CAP_FETCH};
+pub use types::{Entity, EntityType, Relation, RelationStatus, SymbolPredicate};

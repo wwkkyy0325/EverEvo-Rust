@@ -21,6 +21,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
+use everevo_core::ApiError;
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -125,17 +126,15 @@ struct SessionItem {
 async fn list_sessions(
     State(state): State<Arc<AppState>>,
     Query(q): Query<ListQuery>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let limit = q.limit.min(100);
     let offset = q.offset.max(0);
 
-    let (rows, total) = match tokio::try_join!(
+    let (rows, total) = tokio::try_join!(
         state.db.list_sessions_enriched(limit, offset),
         state.db.count_sessions(),
-    ) {
-        Ok((rows, total)) => (rows, total),
-        Err(e) => return Json(serde_json::json!({ "error": e.to_string() })),
-    };
+    )
+    .map_err(|e| ApiError::internal(e.to_string()))?;
 
     let items: Vec<SessionItem> = rows
         .into_iter()
@@ -156,15 +155,15 @@ async fn list_sessions(
         .collect();
 
     let has_more = offset + limit < total;
-    Json(
+    Ok(Json(
         serde_json::to_value(Paginated {
             data: items,
             next_cursor: None,
             has_more,
             total: Some(total),
         })
-        .unwrap_or_else(|_| serde_json::json!({ "error": "serialization failed" })),
-    )
+        .map_err(|e| ApiError::internal(format!("serialization failed: {e}")))?,
+    ))
 }
 
 // ── Session detail ──────────────────────────────────────────────────────
@@ -181,12 +180,13 @@ struct SessionDetail {
 async fn get_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
-) -> Json<serde_json::Value> {
-    let session = match state.db.get_session(id).await {
-        Ok(Some(s)) => s,
-        Ok(None) => return Json(serde_json::json!({ "error": "Session not found" })),
-        Err(e) => return Json(serde_json::json!({ "error": e.to_string() })),
-    };
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let session = state
+        .db
+        .get_session(id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .ok_or_else(|| ApiError::not_found("Session not found"))?;
 
     // Count messages for this session
     let count = state
@@ -198,7 +198,7 @@ async fn get_session(
         .map(|r| r.message_count)
         .unwrap_or(0);
 
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "data": SessionDetail {
             id: session.id,
             title: session.title,
@@ -206,7 +206,7 @@ async fn get_session(
             updated_at: session.updated_at.to_rfc3339(),
             message_count: count,
         }
-    }))
+    })))
 }
 
 // ── Message history (cursor pagination) ─────────────────────────────────
@@ -227,18 +227,25 @@ async fn get_messages(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
     Query(q): Query<MessagesQuery>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let limit = q.limit.min(100);
 
     // Verify session exists
-    if state.db.get_session(id).await.ok().flatten().is_none() {
-        return Json(serde_json::json!({ "error": "Session not found" }));
+    if state
+        .db
+        .get_session(id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .is_none()
+    {
+        return Err(ApiError::not_found("Session not found"));
     }
 
-    let rows = match state.db.get_messages_before(id, q.before, limit).await {
-        Ok(r) => r,
-        Err(e) => return Json(serde_json::json!({ "error": e.to_string() })),
-    };
+    let rows = state
+        .db
+        .get_messages_before(id, q.before, limit)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
 
     let has_more = if let Some(last) = rows.last() {
         state
@@ -266,15 +273,15 @@ async fn get_messages(
         })
         .collect();
 
-    Json(
+    Ok(Json(
         serde_json::to_value(Paginated {
             data: messages,
             next_cursor,
             has_more,
             total: None,
         })
-        .unwrap_or_else(|_| serde_json::json!({ "error": "serialization failed" })),
-    )
+        .map_err(|e| ApiError::internal(format!("serialization failed: {e}")))?,
+    ))
 }
 
 // ── Create / Update / Delete ────────────────────────────────────────────
@@ -282,37 +289,39 @@ async fn get_messages(
 async fn create_session(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateSessionBody>,
-) -> Json<serde_json::Value> {
-    match state.db.create_session(&body.title).await {
-        Ok(row) => {
-            // Store workspace_dir in DB if provided at creation time
-            if let Some(ref ws) = body.workspace_dir {
-                if !ws.is_empty() {
-                    let _ = state.db.set_session_workspace(row.id, Some(ws)).await;
-                }
-            }
-            // Flush any buffered messages from the previous session before starting new one.
-            state.dreaming_engine.flush_on_session_end().await;
-            // Initialize per-session sandbox — use per-session workspace if set
-            let ws = body.workspace_dir.filter(|w| !w.is_empty());
-            let _ = state
-                .create_sandbox(
-                    row.id,
-                    resolve_permission(&state.config.default_permission_level),
-                    ws,
-                )
-                .await;
-            Json(serde_json::json!({
-                "data": {
-                    "id": row.id,
-                    "title": row.title,
-                    "created_at": row.created_at.to_rfc3339(),
-                    "updated_at": row.updated_at.to_rfc3339(),
-                }
-            }))
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let row = state
+        .db
+        .create_session(&body.title)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    // Store workspace_dir in DB if provided at creation time
+    if let Some(ref ws) = body.workspace_dir {
+        if !ws.is_empty() {
+            let _ = state.db.set_session_workspace(row.id, Some(ws)).await;
         }
-        Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
     }
+    // Flush any buffered messages from the previous session before starting new one.
+    state.dreaming_engine.flush_on_session_end().await;
+    // Initialize per-session sandbox — use per-session workspace if set
+    let ws = body.workspace_dir.filter(|w| !w.is_empty());
+    let _ = state
+        .create_sandbox(
+            row.id,
+            resolve_permission(&state.config.default_permission_level),
+            ws,
+        )
+        .await;
+
+    Ok(Json(serde_json::json!({
+        "data": {
+            "id": row.id,
+            "title": row.title,
+            "created_at": row.created_at.to_rfc3339(),
+            "updated_at": row.updated_at.to_rfc3339(),
+        }
+    })))
 }
 
 /// PUT /api/sessions/{id}/workspace — bind or unbind a workspace directory for a session.
@@ -320,20 +329,23 @@ async fn bind_workspace(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
     Json(body): Json<SetWorkspaceBody>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let ws_path = body.path.as_deref().filter(|p| !p.is_empty());
     // Validate path exists if setting
     if let Some(p) = ws_path {
         if !std::path::Path::new(p).is_dir() {
-            return Json(
-                serde_json::json!({ "error": "Path does not exist or is not a directory" }),
-            );
+            return Err(ApiError::bad_request(
+                "Path does not exist or is not a directory",
+            ));
         }
     }
     // Persist to DB
-    if let Err(e) = state.db.set_session_workspace(id, ws_path).await {
-        return Json(serde_json::json!({ "error": e.to_string() }));
-    }
+    state
+        .db
+        .set_session_workspace(id, ws_path)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
     // Recreate sandbox with new workspace binding
     let _ = state
         .create_sandbox(
@@ -342,39 +354,44 @@ async fn bind_workspace(
             ws_path.map(|s| s.to_string()),
         )
         .await;
-    Json(serde_json::json!({
+
+    Ok(Json(serde_json::json!({
         "data": {
             "session_id": id.to_string(),
             "workspace_dir": ws_path,
         }
-    }))
+    })))
 }
 
 async fn update_title(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateTitleBody>,
-) -> Json<serde_json::Value> {
-    match state.db.update_session_title(id, &body.title).await {
-        Ok(()) => Json(serde_json::json!({ "data": { "updated": true } })),
-        Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
-    }
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state
+        .db
+        .update_session_title(id, &body.title)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(serde_json::json!({ "data": { "updated": true } })))
 }
 
 async fn delete_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     // Flush buffered messages before destroying the session
     state.dreaming_engine.flush_on_session_end().await;
     // Destroy sandbox + audit trail first
     state.destroy_sandbox(id).await;
     // Clean up context snapshots for this session
     state.context_snapshots.write().await.remove(&id);
-    match state.db.delete_session(id).await {
-        Ok(()) => Json(serde_json::json!({ "data": { "deleted": true } })),
-        Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
-    }
+    state
+        .db
+        .delete_session(id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(serde_json::json!({ "data": { "deleted": true } })))
 }
 
 // ── Session Status ────────────────────────────────────────────────────────
@@ -382,24 +399,25 @@ async fn delete_session(
 async fn get_session_status(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
-) -> Json<serde_json::Value> {
-    let session = match state.db.get_session(id).await {
-        Ok(Some(s)) => s,
-        Ok(None) => return Json(serde_json::json!({ "error": "Session not found" })),
-        Err(e) => return Json(serde_json::json!({ "error": e.to_string() })),
-    };
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let session = state
+        .db
+        .get_session(id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .ok_or_else(|| ApiError::not_found("Session not found"))?;
 
     let meta: everevo_core::types::SessionMeta =
         serde_json::from_str(&session.metadata).unwrap_or_default();
     let has_bg = state.bg_sessions.read().await.contains_key(&id);
 
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "id": session.id,
         "mode": meta.mode.as_str(),
         "state": if has_bg { "running" } else { meta.state.as_str() },
         "title": session.title,
         "updated_at": session.updated_at.to_rfc3339(),
-    }))
+    })))
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────

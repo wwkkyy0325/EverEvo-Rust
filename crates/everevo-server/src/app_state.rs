@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Notify, RwLock};
 
-use everevo_agent::knowledge::domain::DomainRegistry;
+use everevo_knowledge::domain::DomainRegistry;
 use everevo_agent::llm::HttpClient;
 use everevo_agent::memory::diary::DiaryManager;
 use everevo_agent::memory::facts::FactManager;
@@ -102,7 +102,7 @@ pub struct AppState {
     pub wiki_generator: Arc<WikiGenerator>,
     /// Knowledge graph — entities + relations via Oxigraph SPARQL.
     /// Shared across requests; loaded from data/memory/graph/knowledge.ttl.
-    pub knowledge_graph: Arc<std::sync::RwLock<everevo_agent::knowledge::KnowledgeGraph>>,
+    pub knowledge_graph: Arc<std::sync::RwLock<everevo_knowledge::KnowledgeGraph>>,
     /// Domain knowledge base registry.
     pub domain_registry: Arc<std::sync::RwLock<DomainRegistry>>,
     /// Telemetry — observability and metrics for agent sessions.
@@ -176,10 +176,10 @@ impl AppState {
         let graph_dir = config.data_dir.join("memory").join("graph");
         std::fs::create_dir_all(&graph_dir).ok();
         let knowledge_graph = Arc::new(std::sync::RwLock::new({
-            let mut kg = everevo_agent::knowledge::KnowledgeGraph::open(&graph_dir)
+            let mut kg = everevo_knowledge::KnowledgeGraph::open(&graph_dir)
                 .unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "Failed to open knowledge graph, starting empty");
-                    everevo_agent::knowledge::KnowledgeGraph::open(&graph_dir).unwrap()
+                    everevo_knowledge::KnowledgeGraph::open(&graph_dir).unwrap()
                 });
             // Seed project structure on first open so `memory kg_search` has
             // entities to return from the very first query.
@@ -231,10 +231,8 @@ impl AppState {
             let preferred = config.embedding_model.as_deref();
             Arc::new(std::sync::RwLock::new(
                 ModelRegistry::discover(models_dir, preferred).unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "Model registry init failed — RAG disabled");
-                    // Return a dummy? No — ModelRegistry::discover fails if no models.
-                    // This should never happen in production (models bundled).
-                    panic!("No embedding models found — cannot start");
+                    tracing::warn!(error = %e, "No embedding models found — RAG disabled, starting without models");
+                    ModelRegistry::empty()
                 }),
             ))
         };
@@ -621,7 +619,7 @@ impl AppState {
     fn init_memory(
         config: &AppConfig,
         llm: &HashMap<String, Option<Arc<HttpClient>>>,
-        knowledge_graph: &Arc<std::sync::RwLock<everevo_agent::knowledge::KnowledgeGraph>>,
+        knowledge_graph: &Arc<std::sync::RwLock<everevo_knowledge::KnowledgeGraph>>,
     ) -> Result<MemoryStack, EverEvoError> {
         let root = config.data_dir.join("memory");
         let fm = Arc::new(
@@ -826,6 +824,17 @@ impl AppState {
     /// Uses the cached runtime_env (computed once at startup) to inject
     /// portable runtime paths. This avoids repeated filesystem scans on
     /// every session creation.
+    /// Build a memory stage wired with all available backends (KG, RAG, workflows, telemetry).
+    pub fn build_memory_stage(&self, _trace_id: Option<uuid::Uuid>) -> everevo_agent::MemoryStage {
+        let mut stage = everevo_agent::MemoryStage::new(self.fact_manager.clone())
+            .with_knowledge_graph(self.knowledge_graph.clone())
+            .with_workflows_dir(self.config.data_dir.join("workflows"));
+        if let Some(ref rag) = self.rag_pipeline {
+            stage = stage.with_rag(Arc::clone(rag));
+        }
+        stage
+    }
+
     /// Create a sandbox for a session. If `session_workspace` is provided, it
     /// takes precedence over the global workspace_dir for this session only.
     /// Default (None/null) uses the isolated sandbox directory.

@@ -10,7 +10,7 @@ import AppStatusBar from './components/AppStatusBar';
 import { Dialog } from './components/ui/dialog';
 
 type View = 'bootstrap' | 'chat' | 'settings' | 'devpanel';
-type SettingsTab = 'llm' | 'routing';
+type SettingsTab = 'llm' | 'routing' | 'character';
 
 function App() {
   const [view, setView] = useState<View>('bootstrap');
