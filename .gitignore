@@ -39,3 +39,4 @@ src-tauri/gen/
 *.log
 tmp/
 sample-project/*
+*.bak
