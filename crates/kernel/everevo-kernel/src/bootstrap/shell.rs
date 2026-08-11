@@ -14,7 +14,9 @@ pub struct BootstrapShell;
 #[async_trait]
 #[allow(clippy::disallowed_methods)] // kernel privilege: direct process execution for self-repair
 impl Tool for BootstrapShell {
-    fn name(&self) -> &str { "shell" }
+    fn name(&self) -> &str {
+        "shell"
+    }
 
     fn description(&self) -> &str {
         "Execute a shell command on the host system. Used for plugin compilation \
@@ -39,7 +41,9 @@ impl Tool for BootstrapShell {
         })
     }
 
-    fn risk_level(&self) -> RiskLevel { RiskLevel::High }
+    fn risk_level(&self) -> RiskLevel {
+        RiskLevel::High
+    }
 
     async fn execute(
         &self,

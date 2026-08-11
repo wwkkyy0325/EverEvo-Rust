@@ -10,14 +10,18 @@ use everevo_core::tool::{Tool, ToolOutput};
 use everevo_core::types::RiskLevel;
 use everevo_core::EverEvoError;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
+use crate::memory::facts::{fact_visible_to, FactManager};
 use everevo_knowledge::graph::KnowledgeGraph;
-use crate::memory::facts::FactManager;
 
 pub struct MemoryTool {
     manager: Arc<FactManager>,
     db: Option<everevo_db::Database>,
     kg: Option<Arc<std::sync::RwLock<KnowledgeGraph>>>,
+    /// Originating session. New facts are tagged with it (session-scoped
+    /// working memory, 分层记忆) unless the caller requests `scope: "global"`.
+    session_id: Option<Uuid>,
 }
 
 impl MemoryTool {
@@ -26,6 +30,7 @@ impl MemoryTool {
             manager,
             db: None,
             kg: None,
+            session_id: None,
         }
     }
     pub fn with_db(mut self, db: everevo_db::Database) -> Self {
@@ -34,6 +39,10 @@ impl MemoryTool {
     }
     pub fn with_kg(mut self, kg: Arc<std::sync::RwLock<KnowledgeGraph>>) -> Self {
         self.kg = Some(kg);
+        self
+    }
+    pub fn with_session_id(mut self, session_id: Option<Uuid>) -> Self {
+        self.session_id = session_id;
         self
     }
 }
@@ -45,9 +54,12 @@ impl Tool for MemoryTool {
     }
 
     fn description(&self) -> &str {
-        "Manage persistent memories across sessions. \
+        "Manage layered memories (分层记忆). \
          Actions: add (save a fact), search (find by keyword), delete (remove outdated). \
-         Facts are stored as Markdown files and loaded automatically at session start."
+         Facts are stored as Markdown files and loaded automatically at session start. \
+         Two tiers: by default a saved fact is SESSION-SCOPED working memory (visible only to \
+         this session — strictly isolated). Pass scope=\"global\" to promote it to cross-session \
+         long-term memory (visible to all sessions, injected on demand)."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -59,6 +71,7 @@ impl Tool for MemoryTool {
                 "content": { "type": "string", "description": "Full markdown content. Required for add." },
                 "description": { "type": "string", "description": "One-line summary." },
                 "fact_type": { "type": "string", "enum": ["user", "feedback", "project", "reference"] },
+                "scope": { "type": "string", "enum": ["session", "global"], "description": "Memory tier: 'session' (default) = this session only; 'global' = cross-session long-term memory." },
                 "query": { "type": "string", "description": "Keyword search. Used by search." }
             },
             "required": ["action"]
@@ -94,6 +107,13 @@ impl MemoryTool {
         let ft = FactType::from_str(p["fact_type"].as_str().unwrap_or("project"))
             .unwrap_or(FactType::Project);
 
+        // Memory tier (分层记忆): default session-scoped working memory;
+        // `scope: "global"` promotes to cross-session long-term memory.
+        let session = match p["scope"].as_str().unwrap_or("session") {
+            "global" => Some("global".into()),
+            _ => self.session_id.map(|sid| sid.to_string()),
+        };
+
         let now = chrono::Utc::now();
         let fact = MemoryFact {
             name: name.to_string(),
@@ -104,6 +124,7 @@ impl MemoryTool {
             updated_at: now,
             projection: ProjectionMetadata::new("2.0.0", "llm-extracted", vec![], 0.85),
             links: Vec::new(),
+            session,
         };
 
         match self.manager.save_async(fact.clone()).await {
@@ -123,19 +144,34 @@ impl MemoryTool {
     async fn search(&self, p: &serde_json::Value) -> Result<ToolOutput, EverEvoError> {
         let query = p["query"].as_str().unwrap_or("").to_lowercase();
 
-        // Use SQLite FTS5 indexed search when available (O(log n))
+        // Use SQLite FTS5 indexed search when available (O(log n)).
+        // The FTS table has no session column — filter hits to facts visible
+        // to this session (分层记忆 strict isolation).
         if let Some(ref db) = self.db {
             match db.search_facts(&query, 20).await {
                 Ok(rows) if !rows.is_empty() => {
-                    let lines: Vec<String> = rows
-                        .iter()
-                        .map(|r| format!("- [{}] {} ({})", r.id, r.description, r.fact_type))
+                    let visible: Vec<_> = rows
+                        .into_iter()
+                        .filter(|r| {
+                            self.manager
+                                .load(&r.id)
+                                .ok()
+                                .flatten()
+                                .map(|f| fact_visible_to(&f, self.session_id.as_ref()))
+                                .unwrap_or(true)
+                        })
                         .collect();
-                    return Ok(ToolOutput {
-                        content: format!("{} memories:\n{}", rows.len(), lines.join("\n")),
-                        is_error: false,
-                        ..Default::default()
-                    });
+                    if !visible.is_empty() {
+                        let lines: Vec<String> = visible
+                            .iter()
+                            .map(|r| format!("- [{}] {} ({})", r.id, r.description, r.fact_type))
+                            .collect();
+                        return Ok(ToolOutput {
+                            content: format!("{} memories:\n{}", visible.len(), lines.join("\n")),
+                            is_error: false,
+                            ..Default::default()
+                        });
+                    }
                 }
                 Ok(_) => { /* fall through to linear scan */ }
                 Err(e) => {
@@ -144,8 +180,14 @@ impl MemoryTool {
             }
         }
 
-        // Linear scan fallback (O(n), file-based)
-        let facts = self.manager.load_all().unwrap_or_default();
+        // Linear scan fallback (O(n), file-based) — session-filtered.
+        let facts: Vec<_> = self
+            .manager
+            .load_all()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|f| fact_visible_to(f, self.session_id.as_ref()))
+            .collect();
         let matched: Vec<_> = if query.is_empty() {
             facts.iter().collect()
         } else {

@@ -156,6 +156,14 @@ impl ModelRegistry {
         let config_path = dir.join("config.json");
         let dim = Self::read_dim(&config_path)?;
 
+        // Skip reranker / cross-encoder models — they output a per-pair score
+        // (dim 1), not an embedding. If picked as the "active" model they would
+        // insert 1-dim vectors into the HNSW index and panic on dimension check.
+        if Self::is_reranker(&config_path) {
+            tracing::debug!(dir = %dir.display(), "Skipping reranker model");
+            return None;
+        }
+
         let name = dir.file_name()?.to_string_lossy().to_string();
         let display_name = if config_path.exists() {
             Self::read_display_name(&config_path).unwrap_or_else(|| name.clone())
@@ -171,6 +179,32 @@ impl ModelRegistry {
             path: dir.to_path_buf(),
             active: false,
         })
+    }
+
+    /// Detect reranker / cross-encoder models by name or architecture.
+    /// Cross-encoders produce a 1-dim relevance score per input pair, not a
+    /// dense embedding, so they must never be selected as the active embedder.
+    fn is_reranker(config_path: &Path) -> bool {
+        if let Ok(content) = std::fs::read_to_string(config_path) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(archs) = json.get("architectures").and_then(|v| v.as_array()) {
+                    if archs.iter().any(|a| {
+                        a.as_str()
+                            .map(|s| s.contains("SequenceClassification"))
+                            .unwrap_or(false)
+                    }) {
+                        return true;
+                    }
+                }
+                if let Some(path) = json.get("_name_or_path").and_then(|v| v.as_str()) {
+                    let p = path.to_ascii_lowercase();
+                    if p.contains("reranker") || p.contains("cross-encoder") {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     fn read_dim(config_path: &Path) -> Option<usize> {

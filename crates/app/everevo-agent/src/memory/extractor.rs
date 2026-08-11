@@ -18,9 +18,13 @@ use crate::memory::facts::FactManager;
 ///
 /// Called after the assistant response is persisted. Runs as a background
 /// tokio task — failures are logged, never returned to the user.
+///
+/// Extracted facts are the session's own working memory — tagged with
+/// `session_id` (分层记忆) so other sessions' recall stays strictly isolated.
 pub async fn extract_from_turn(
     llm: &HttpClient,
     fact_manager: &FactManager,
+    session_id: Option<uuid::Uuid>,
     user_msg: &str,
     assistant_msg: &str,
 ) {
@@ -60,6 +64,8 @@ pub async fn extract_from_turn(
                         0.7,
                     ),
                     links: vec![],
+                    // Session working memory — strictly isolated to this session.
+                    session: session_id.map(|sid| sid.to_string()),
                 };
                 match fact_manager.save_async(fact.clone()).await {
                     Ok(()) => saved += 1,

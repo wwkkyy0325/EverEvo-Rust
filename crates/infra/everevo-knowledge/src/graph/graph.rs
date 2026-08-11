@@ -20,6 +20,8 @@ const NS: &str = "http://everevo.io/";
 
 /// Standard RDF type predicate IRI.
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+/// RDF namespace IRI (used for SPARQL prefixes).
+const RDF_NS: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 
 /// Build the full IRI for an entity node.
 fn entity_iri(id: &str) -> NamedNode {
@@ -197,17 +199,11 @@ impl KnowledgeGraph {
     ///
     /// Matches on the predicate string directly (both raw strings and
     /// `SymbolPredicate::as_uri_fragment()` values).
-    pub fn find_relations_by_predicate(
-        &self,
-        from: &str,
-        predicate: &str,
-    ) -> Vec<&Relation> {
+    pub fn find_relations_by_predicate(&self, from: &str, predicate: &str) -> Vec<&Relation> {
         self.relations
             .iter()
             .filter(|r| {
-                r.from == from
-                    && r.predicate == predicate
-                    && r.status == RelationStatus::Active
+                r.from == from && r.predicate == predicate && r.status == RelationStatus::Active
             })
             .collect()
     }
@@ -391,7 +387,7 @@ impl KnowledgeGraph {
     /// Populate HashMap entities from the Oxigraph Store (on load).
     fn sync_from_store(&mut self) {
         let sparql = format!(
-            "PREFIX rdf: <{RDF_TYPE}> \
+            "PREFIX rdf: <{RDF_NS}> \
              PREFIX evo: <{NS}> \
              SELECT ?id ?label ?type ?created ?updated ?merged ?props ?srcs \
              WHERE {{ \
@@ -406,56 +402,71 @@ impl KnowledgeGraph {
                BIND(STRAFTER(STR(?e), \"{NS}e/\") AS ?id) \
              }}"
         );
-        if let Ok(QueryResults::Solutions(solutions)) = self.store.query(&sparql) {
-            for sol in solutions.flatten() {
-                let id = sol.get("id").map(term_value).unwrap_or_default();
-                let label = sol.get("label").map(term_value).unwrap_or_default();
-                let etype = sol.get("type").map(term_value).unwrap_or_default();
-                if id.is_empty() {
-                    continue;
-                }
-                self.entities.insert(
-                    id.clone(),
-                    Entity {
-                        id,
-                        label,
-                        entity_type: match etype.as_str() {
-                            "Person" => EntityType::Person,
-                            "Project" => EntityType::Project,
-                            "Tool" => EntityType::Tool,
-                            "Concept" => EntityType::Concept,
-                            "File" => EntityType::File,
-                            "Event" => EntityType::Event,
-                            "Capability" => EntityType::Capability,
-                            "KnowledgeSource" => EntityType::KnowledgeSource,
-                            "Constraint" => EntityType::Constraint,
-                            other => EntityType::Other(other.into()),
+        match self.store.query(&sparql) {
+            Ok(QueryResults::Solutions(solutions)) => {
+                let mut count = 0usize;
+                for sol in solutions.flatten() {
+                    count += 1;
+                    let id = sol.get("id").map(term_value).unwrap_or_default();
+                    let label = sol.get("label").map(term_value).unwrap_or_default();
+                    let etype = sol.get("type").map(term_value).unwrap_or_default();
+                    if id.is_empty() {
+                        continue;
+                    }
+                    self.entities.insert(
+                        id.clone(),
+                        Entity {
+                            id,
+                            label,
+                            entity_type: match etype.as_str() {
+                                "Person" => EntityType::Person,
+                                "Project" => EntityType::Project,
+                                "Tool" => EntityType::Tool,
+                                "Concept" => EntityType::Concept,
+                                "File" => EntityType::File,
+                                "Event" => EntityType::Event,
+                                "Capability" => EntityType::Capability,
+                                "KnowledgeSource" => EntityType::KnowledgeSource,
+                                "Constraint" => EntityType::Constraint,
+                                other => EntityType::Other(other.into()),
+                            },
+                            properties: sol
+                                .get("props")
+                                .map(term_value)
+                                .and_then(|s| serde_json::from_str(&s).ok())
+                                .unwrap_or_default(),
+                            sources: sol
+                                .get("srcs")
+                                .map(term_value)
+                                .and_then(|s| serde_json::from_str(&s).ok())
+                                .unwrap_or_default(),
+                            created_at: sol
+                                .get("created")
+                                .map(term_value)
+                                .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
+                                .map(|dt| dt.with_timezone(&chrono::Utc))
+                                .unwrap_or_else(chrono::Utc::now),
+                            updated_at: sol
+                                .get("updated")
+                                .map(term_value)
+                                .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
+                                .map(|dt| dt.with_timezone(&chrono::Utc))
+                                .unwrap_or_else(chrono::Utc::now),
+                            merged_into: sol.get("merged").map(term_value),
                         },
-                        properties: sol
-                            .get("props")
-                            .map(term_value)
-                            .and_then(|s| serde_json::from_str(&s).ok())
-                            .unwrap_or_default(),
-                        sources: sol
-                            .get("srcs")
-                            .map(term_value)
-                            .and_then(|s| serde_json::from_str(&s).ok())
-                            .unwrap_or_default(),
-                        created_at: sol
-                            .get("created")
-                            .map(term_value)
-                            .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
-                            .map(|dt| dt.with_timezone(&chrono::Utc))
-                            .unwrap_or_else(chrono::Utc::now),
-                        updated_at: sol
-                            .get("updated")
-                            .map(term_value)
-                            .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
-                            .map(|dt| dt.with_timezone(&chrono::Utc))
-                            .unwrap_or_else(chrono::Utc::now),
-                        merged_into: sol.get("merged").map(term_value),
-                    },
+                    );
+                }
+                tracing::debug!(
+                    count,
+                    inserted = self.entities.len(),
+                    "sync_from_store: loaded entities from Turtle"
                 );
+            }
+            Ok(_) => {
+                tracing::debug!("sync_from_store: query returned non-Solutions result");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "sync_from_store: SPARQL query failed");
             }
         }
     }
@@ -646,5 +657,337 @@ mod tests {
             sources: vec![],
         });
         assert_eq!(kg.expand("a", 2).len(), 3);
+    }
+
+    // ── Enhanced tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_expand_depth_zero() {
+        let d = TempDir::new().unwrap();
+        let mut kg = KnowledgeGraph::open(d.path()).unwrap();
+        kg.upsert_entity(e("root", "Root", EntityType::Concept));
+        kg.upsert_entity(e("child", "Child", EntityType::Concept));
+        let n = chrono::Utc::now();
+        kg.add_relation(Relation {
+            from: "root".into(),
+            predicate: "has".into(),
+            to: "child".into(),
+            status: RelationStatus::Active,
+            valid_from: n,
+            valid_until: None,
+            sources: vec![],
+        });
+        // depth=0 should only return the starting node
+        let results = kg.expand("root", 0);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "root");
+    }
+
+    #[test]
+    fn test_expand_nonexistent_start() {
+        let d = TempDir::new().unwrap();
+        let kg = KnowledgeGraph::open(d.path()).unwrap();
+        let results = kg.expand("nonexistent", 2);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_expand_cycle() {
+        let d = TempDir::new().unwrap();
+        let mut kg = KnowledgeGraph::open(d.path()).unwrap();
+        kg.upsert_entity(e("a", "A", EntityType::Concept));
+        kg.upsert_entity(e("b", "B", EntityType::Concept));
+        let n = chrono::Utc::now();
+        // Create a cycle: a → b → a
+        kg.add_relation(Relation {
+            from: "a".into(),
+            predicate: "links_to".into(),
+            to: "b".into(),
+            status: RelationStatus::Active,
+            valid_from: n,
+            valid_until: None,
+            sources: vec![],
+        });
+        kg.add_relation(Relation {
+            from: "b".into(),
+            predicate: "links_to".into(),
+            to: "a".into(),
+            status: RelationStatus::Active,
+            valid_from: n,
+            valid_until: None,
+            sources: vec![],
+        });
+        // Should terminate, not infinite loop
+        let results = kg.expand("a", 5);
+        assert_eq!(results.len(), 2); // a and b, no duplicates
+    }
+
+    #[test]
+    fn test_merge_entity_properties() {
+        let d = TempDir::new().unwrap();
+        let mut kg = KnowledgeGraph::open(d.path()).unwrap();
+        let mut target = e("target", "Target", EntityType::Concept);
+        target.properties.insert("key1".into(), "val1".into());
+        let mut source = e("source", "Source", EntityType::Concept);
+        source
+            .properties
+            .insert("key1".into(), "val1_original".into()); // should NOT overwrite
+        source.properties.insert("key2".into(), "val2".into());
+
+        kg.upsert_entity(target);
+        kg.upsert_entity(source);
+        kg.merge_entities("target", "source");
+
+        let merged = kg.get_entity("target").unwrap();
+        assert_eq!(merged.properties.get("key1").unwrap(), "val1"); // original preserved
+        assert_eq!(merged.properties.get("key2").unwrap(), "val2"); // new key added
+        assert!(kg.get_entity("source").unwrap().merged_into.is_some());
+    }
+
+    #[test]
+    fn test_merge_entity_sources_dedup() {
+        let d = TempDir::new().unwrap();
+        let mut kg = KnowledgeGraph::open(d.path()).unwrap();
+        let msg_id = uuid::Uuid::new_v4();
+        let sess_id = uuid::Uuid::new_v4();
+
+        let mut target = e("target", "T", EntityType::Concept);
+        target
+            .sources
+            .push(everevo_core::memory::SourcePointer::new(
+                sess_id, msg_id, "shared",
+            ));
+        let mut source = e("source", "S", EntityType::Concept);
+        source
+            .sources
+            .push(everevo_core::memory::SourcePointer::new(
+                sess_id, msg_id, "shared", // same message_id
+            ));
+
+        kg.upsert_entity(target);
+        kg.upsert_entity(source);
+        kg.merge_entities("target", "source");
+
+        let merged = kg.get_entity("target").unwrap();
+        // Same message_id should be deduplicated
+        assert_eq!(merged.sources.len(), 1);
+    }
+
+    #[test]
+    fn test_merge_entity_self() {
+        let d = TempDir::new().unwrap();
+        let mut kg = KnowledgeGraph::open(d.path()).unwrap();
+        kg.upsert_entity(e("x", "X", EntityType::Concept));
+        kg.merge_entities("x", "x"); // should be no-op
+        let entity = kg.get_entity("x").unwrap();
+        assert!(entity.merged_into.is_none());
+    }
+
+    #[test]
+    fn test_sparql_select() {
+        let d = TempDir::new().unwrap();
+        let mut kg = KnowledgeGraph::open(d.path()).unwrap();
+        kg.upsert_entity(e("test1", "Test One", EntityType::Project));
+        kg.upsert_entity(e("test2", "Test Two", EntityType::Tool));
+        kg.save().unwrap();
+
+        let rows = kg
+            .query_sparql(
+                "PREFIX evo: <http://everevo.io/> \
+             SELECT ?label WHERE { ?e evo:label ?label } ORDER BY ?label",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_sparql_ask() {
+        let d = TempDir::new().unwrap();
+        let mut kg = KnowledgeGraph::open(d.path()).unwrap();
+        kg.upsert_entity(e("ask_test", "Ask Entity", EntityType::Concept));
+        kg.save().unwrap();
+
+        // ASK returns boolean result — no rows but succeeds
+        let result = kg.query_sparql(
+            "PREFIX evo: <http://everevo.io/> \
+             ASK { ?e evo:label \"Ask Entity\" }",
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_save_writes_turtle_file() {
+        // Verifies that save() produces a valid Turtle file containing entity data.
+        let d = TempDir::new().unwrap();
+        let mut kg = KnowledgeGraph::open(d.path()).unwrap();
+        kg.upsert_entity(e("persist", "Persist Me", EntityType::Project));
+        kg.save().unwrap();
+
+        let ttl_path = d.path().join("knowledge.ttl");
+        assert!(ttl_path.exists(), "Turtle file should exist after save");
+        let content = std::fs::read_to_string(&ttl_path).unwrap();
+        assert!(
+            content.contains("Persist Me"),
+            "Turtle should contain entity label"
+        );
+        assert!(
+            content.contains("http://everevo.io/"),
+            "Turtle should use everevo namespace"
+        );
+    }
+
+    #[test]
+    fn test_persistence_roundtrip() {
+        let d = TempDir::new().unwrap();
+        let path = d.path();
+
+        // Create, populate, save
+        {
+            let mut kg = KnowledgeGraph::open(path).unwrap();
+            kg.upsert_entity(e("persist", "Persist Me", EntityType::Project));
+            kg.save().unwrap();
+            // Verify it's in the HashMap before close
+            assert!(
+                kg.get_entity("persist").is_some(),
+                "Entity should be in memory before close"
+            );
+        }
+
+        // Reopen and verify data survived
+        {
+            let kg = KnowledgeGraph::open(path).unwrap();
+            let count = kg.entity_count();
+            let entity = kg.get_entity("persist");
+            assert!(
+                entity.is_some(),
+                "Entity should survive roundtrip. entity_count={count}"
+            );
+            assert_eq!(entity.unwrap().label, "Persist Me");
+        }
+    }
+
+    #[test]
+    fn test_seed_idempotent() {
+        let d = TempDir::new().unwrap();
+        let mut kg = KnowledgeGraph::open(d.path()).unwrap();
+        kg.seed_project_structure(&["crate-a", "crate-b"]);
+        let entity_count_1 = kg.entity_count();
+        let relation_count_1 = kg.relation_count();
+        assert!(entity_count_1 > 0);
+
+        // Second seed should be a no-op
+        kg.seed_project_structure(&["crate-a", "crate-b"]);
+        assert_eq!(kg.entity_count(), entity_count_1);
+        assert_eq!(kg.relation_count(), relation_count_1);
+    }
+
+    #[test]
+    fn test_relation_many_no_duplicate() {
+        let d = TempDir::new().unwrap();
+        let mut kg = KnowledgeGraph::open(d.path()).unwrap();
+        let n = chrono::Utc::now();
+        let rel = Relation {
+            from: "a".into(),
+            predicate: "depends_on".into(),
+            to: "b".into(),
+            status: RelationStatus::Active,
+            valid_from: n,
+            valid_until: None,
+            sources: vec![],
+        };
+        kg.add_relation_many(rel.clone());
+        kg.add_relation_many(rel.clone());
+        // Exact same relation should only appear once
+        assert_eq!(kg.relation_count(), 1);
+    }
+
+    #[test]
+    fn test_find_relations_by_predicate_any() {
+        let d = TempDir::new().unwrap();
+        let mut kg = KnowledgeGraph::open(d.path()).unwrap();
+        let n = chrono::Utc::now();
+        kg.add_relation(Relation {
+            from: "a".into(),
+            predicate: "uses".into(),
+            to: "x".into(),
+            status: RelationStatus::Active,
+            valid_from: n,
+            valid_until: None,
+            sources: vec![],
+        });
+        kg.add_relation(Relation {
+            from: "b".into(),
+            predicate: "uses".into(),
+            to: "y".into(),
+            status: RelationStatus::Active,
+            valid_from: n,
+            valid_until: None,
+            sources: vec![],
+        });
+        kg.add_relation(Relation {
+            from: "c".into(),
+            predicate: "contains".into(),
+            to: "z".into(),
+            status: RelationStatus::Active,
+            valid_from: n,
+            valid_until: None,
+            sources: vec![],
+        });
+
+        let uses = kg.find_relations_by_predicate_any("uses");
+        assert_eq!(uses.len(), 2);
+    }
+
+    #[test]
+    fn test_outgoing_incoming() {
+        let d = TempDir::new().unwrap();
+        let mut kg = KnowledgeGraph::open(d.path()).unwrap();
+        let n = chrono::Utc::now();
+        kg.add_relation(Relation {
+            from: "alice".into(),
+            predicate: "knows".into(),
+            to: "bob".into(),
+            status: RelationStatus::Active,
+            valid_from: n,
+            valid_until: None,
+            sources: vec![],
+        });
+
+        assert_eq!(kg.outgoing("alice").len(), 1);
+        assert_eq!(kg.outgoing("bob").len(), 0);
+        assert_eq!(kg.incoming("bob").len(), 1);
+        assert_eq!(kg.incoming("alice").len(), 0);
+    }
+
+    #[test]
+    fn test_active_entity_count() {
+        let d = TempDir::new().unwrap();
+        let mut kg = KnowledgeGraph::open(d.path()).unwrap();
+        kg.upsert_entity(e("a", "A", EntityType::Concept));
+        kg.upsert_entity(e("b", "B", EntityType::Concept));
+        assert_eq!(kg.entity_count(), 2);
+        assert_eq!(kg.active_entity_count(), 2);
+
+        kg.merge_entities("a", "b");
+        assert_eq!(kg.entity_count(), 2); // both still exist
+        assert_eq!(kg.active_entity_count(), 1); // b is merged_into a
+    }
+
+    /// Regression: Turtle save→reopen roundtrip preserves entity data.
+    /// Found and fixed sync_from_store SPARQL RDF_NS prefix bug (Aug 2026).
+    #[test]
+    fn test_persistence_roundtrip_save_reopen() {
+        let d = TempDir::new().unwrap();
+        let path = d.path();
+        {
+            let mut kg = KnowledgeGraph::open(path).unwrap();
+            kg.upsert_entity(e("roundtrip-2", "Roundtrip Two", EntityType::Tool));
+            kg.save().unwrap();
+        }
+        {
+            let kg = KnowledgeGraph::open(path).unwrap();
+            assert!(kg.get_entity("roundtrip-2").is_some());
+            assert_eq!(kg.get_entity("roundtrip-2").unwrap().label, "Roundtrip Two");
+        }
     }
 }

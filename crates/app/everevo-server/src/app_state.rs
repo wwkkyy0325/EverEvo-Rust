@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Notify, RwLock};
 
-use everevo_knowledge::domain::DomainRegistry;
 use everevo_agent::llm::HttpClient;
 use everevo_agent::memory::diary::DiaryManager;
 use everevo_agent::memory::facts::FactManager;
@@ -19,11 +18,12 @@ use everevo_agent::tools::builtins::{SubAgentHandle, SubAgentStatus};
 use everevo_bootstrap::pipeline::InitPipeline;
 use everevo_bootstrap::Bootstrap;
 use everevo_core::context::ContextSnapshot;
+use everevo_knowledge::domain::DomainRegistry;
 use everevo_vector::{ModelRegistry, MultiCollectionStore};
 
 use everevo_core::slash_command::SlashCommandRegistry;
+use everevo_core::{default_telemetry_pipeline, Telemetry, TelemetryConfig, TelemetryPipeline};
 use everevo_core::{AppConfig, EverEvoError};
-use everevo_core::{Telemetry, TelemetryConfig};
 use everevo_db::Database;
 use everevo_downloader::Downloader;
 use everevo_sandbox::{SandboxConfig, SessionSandbox};
@@ -70,11 +70,25 @@ pub struct ConfirmationNotification {
     pub reason: String,
 }
 
+/// A resolved special-purpose provider (vision / compaction) plus its optional
+/// context window (tokens), used to budget context-maintenance summarization.
+#[derive(Clone)]
+pub struct ResolvedProvider {
+    pub client: Arc<HttpClient>,
+    pub context_window: Option<u32>,
+}
+
 pub struct AppState {
     pub config: AppConfig,
     pub db: Database,
     /// Multi-provider LLM clients, keyed by id ("primary", "secondary", ...).
     pub llm: RwLock<HashMap<String, Option<Arc<HttpClient>>>>,
+    /// Vision provider — serves the `describe_image` tool. None → tool falls
+    /// back to deterministic offline scripts (chess_fen.py / fractions_ocr.py).
+    pub vision_llm: RwLock<Option<ResolvedProvider>>,
+    /// Compaction provider — used for rolling-summary / autocompact. None →
+    /// the main execution model is reused ("有哪个用哪个").
+    pub compact_llm: RwLock<Option<ResolvedProvider>>,
     pub bootstrap: Arc<Bootstrap>,
     pub downloader: Arc<Downloader>,
     /// Shared todo store — TodoWrite tool reads/writes per-session task lists.
@@ -105,8 +119,8 @@ pub struct AppState {
     pub knowledge_graph: Arc<std::sync::RwLock<everevo_knowledge::KnowledgeGraph>>,
     /// Domain knowledge base registry.
     pub domain_registry: Arc<std::sync::RwLock<DomainRegistry>>,
-    /// Telemetry — observability and metrics for agent sessions.
-    pub telemetry: Arc<Telemetry>,
+    /// Telemetry — registered emission pipeline + sink for agent sessions.
+    pub telemetry_pipeline: Arc<TelemetryPipeline>,
     /// Skill registry — scans data/skills/ for SKILL.md files.
     pub skill_registry: Arc<SkillRegistry>,
     /// Slash command registry — built-in + plugin slash commands for chat input.
@@ -178,11 +192,10 @@ impl AppState {
         let graph_dir = config.data_dir.join("memory").join("graph");
         std::fs::create_dir_all(&graph_dir).ok();
         let knowledge_graph = Arc::new(std::sync::RwLock::new({
-            let mut kg = everevo_knowledge::KnowledgeGraph::open(&graph_dir)
-                .unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "Failed to open knowledge graph, starting empty");
-                    everevo_knowledge::KnowledgeGraph::open(&graph_dir).unwrap()
-                });
+            let mut kg = everevo_knowledge::KnowledgeGraph::open(&graph_dir).unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "Failed to open knowledge graph, starting empty");
+                everevo_knowledge::KnowledgeGraph::open(&graph_dir).unwrap()
+            });
             // Seed project structure on first open so `memory kg_search` has
             // entities to return from the very first query.
             kg.seed_project_structure(&[
@@ -209,14 +222,23 @@ impl AppState {
         // Without this, LIGHT (diary), REM (themes), DEEP (consolidation),
         // wiki generation, and persona updates NEVER run. All memory features
         // are read-only without the scheduler ticking.
-        let persona_profile = config.data_dir.join("memory").join("persona").join("profile.json");
-        scheduler.start_background(
-            Arc::clone(&dreaming_engine),
-            Arc::clone(&fact_manager),
-            Arc::clone(&wiki_generator),
-            Some(persona_profile),
-        );
-        tracing::info!("Dreaming scheduler started (LIGHT/REM/DEEP + wiki + persona)");
+        let persona_profile = config
+            .data_dir
+            .join("memory")
+            .join("persona")
+            .join("profile.json");
+        // Benchmark mode (EVEREVO_BENCHMARK=1) skips the dreaming scheduler —
+        // its DEEP phase promotes ALL sessions' content into shared global
+        // facts + KG, which would leak answers across GAIA questions.
+        if std::env::var("EVEREVO_BENCHMARK").is_err() {
+            scheduler.start_background(
+                Arc::clone(&dreaming_engine),
+                Arc::clone(&fact_manager),
+                Arc::clone(&wiki_generator),
+                Some(persona_profile),
+            );
+            tracing::info!("Dreaming scheduler started (LIGHT/REM/DEEP + wiki + persona)");
+        }
 
         // Wire SQLite FTS5 for fact keyword search (triple-write: MD + SQLite + Vector)
         fact_manager.set_db(Arc::new(db.clone()));
@@ -260,7 +282,7 @@ impl AppState {
             });
         }
 
-        let telemetry = Self::init_telemetry(&config);
+        let telemetry_pipeline = Self::init_telemetry(&config);
         let domain_registry = Self::init_domain(&config);
         let skill_registry = Self::init_skills(&config);
         let commands = Self::init_commands();
@@ -298,11 +320,7 @@ impl AppState {
 
         // ── A2A Gateway ─────────────────────────────────────────────
         let a2a_gateway = {
-            let base_url = format!(
-                "http://{}:{}",
-                config.server_host,
-                config.server_port
-            );
+            let base_url = format!("http://{}:{}", config.server_host, config.server_port);
             let a2a_config = everevo_a2a::A2aGatewayConfig {
                 base_url,
                 max_turns: 50,
@@ -326,28 +344,27 @@ impl AppState {
         };
 
         // ── Initialize kernel plugin registry ──
-        let plugin_registry = match everevo_kernel::PluginRegistry::open(
-            config.data_dir.join("plugins"),
-        )
-        .await
-        {
-            Ok(reg) => Arc::new(reg),
-            Err(e) => {
-                tracing::warn!(error = %e, "Plugin registry unavailable — using fallback");
-                Arc::new(
-                    everevo_kernel::PluginRegistry::open(
-                        std::env::temp_dir().join("everevo-plugins"),
+        let plugin_registry =
+            match everevo_kernel::PluginRegistry::open(config.data_dir.join("plugins")).await {
+                Ok(reg) => Arc::new(reg),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Plugin registry unavailable — using fallback");
+                    Arc::new(
+                        everevo_kernel::PluginRegistry::open(
+                            std::env::temp_dir().join("everevo-plugins"),
+                        )
+                        .await
+                        .expect("fallback plugin registry"),
                     )
-                    .await
-                    .expect("fallback plugin registry"),
-                )
-            }
-        };
+                }
+            };
 
         let state = Arc::new(Self {
             config,
             db,
             llm: RwLock::new(llm),
+            vision_llm: RwLock::new(None),
+            compact_llm: RwLock::new(None),
             bootstrap,
             downloader,
             init_pipeline,
@@ -364,7 +381,7 @@ impl AppState {
             wiki_generator,
             knowledge_graph,
             domain_registry,
-            telemetry,
+            telemetry_pipeline,
             skill_registry,
             commands,
             runtime_env,
@@ -388,6 +405,8 @@ impl AppState {
         Self::start_webagent(&state).await;
         // Start background MCP health checker
         Self::spawn_mcp_health_checker(&state);
+        // Resolve vision/compact special providers from routing config
+        state.resolve_special_providers().await;
         Ok(state)
     }
 
@@ -532,10 +551,7 @@ impl AppState {
         let env = state.inject_runtime_path(&HashMap::new());
         match everevo_mcp::discover_mcp_tools(&binary, args, &env).await {
             Ok((client, tools)) => {
-                tracing::info!(
-                    tool_count = tools.len(),
-                    "Built-in webagent connected"
-                );
+                tracing::info!(tool_count = tools.len(), "Built-in webagent connected");
                 state
                     .mcp_clients
                     .write()
@@ -695,21 +711,23 @@ impl AppState {
         }
     }
 
-    fn init_telemetry(config: &AppConfig) -> Arc<Telemetry> {
-        Arc::new(
+    fn init_telemetry(config: &AppConfig) -> Arc<TelemetryPipeline> {
+        // Wrap the sink in the default registered emission pipeline so record
+        // producers are injected through `with_telemetry` instead of scattered
+        // `record_*()` call sites.
+        let sink = Telemetry::new(TelemetryConfig {
+            db_path: config.data_dir.join("telemetry").join("metrics.db"),
+            ..Default::default()
+        })
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "Telemetry init failed — disabling");
             Telemetry::new(TelemetryConfig {
-                db_path: config.data_dir.join("telemetry").join("metrics.db"),
+                enabled: false,
                 ..Default::default()
             })
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "Telemetry init failed — disabling");
-                Telemetry::new(TelemetryConfig {
-                    enabled: false,
-                    ..Default::default()
-                })
-                .expect("disabled telemetry")
-            }),
-        )
+            .expect("disabled telemetry")
+        });
+        Arc::new(default_telemetry_pipeline(Arc::new(sink)))
     }
 
     fn init_domain(config: &AppConfig) -> Arc<std::sync::RwLock<DomainRegistry>> {
@@ -800,7 +818,8 @@ impl AppState {
                     // Null bytes → "SQL logic error" (code 1).
                     // Control chars (except \n, \r, \t) also break the tokenizer.
                     // Truncation prevents porter unicode61 tokenizer overflow.
-                    let content = task.content
+                    let content = task
+                        .content
                         .replace('\0', "")
                         .chars()
                         .filter(|c| !c.is_control() || *c == '\n' || *c == '\r' || *c == '\t')
@@ -855,12 +874,22 @@ impl AppState {
     /// portable runtime paths. This avoids repeated filesystem scans on
     /// every session creation.
     /// Build a memory stage wired with all available backends (KG, RAG, workflows, telemetry).
-    pub fn build_memory_stage(&self, _trace_id: Option<uuid::Uuid>) -> everevo_agent::MemoryStage {
+    /// Session-scoped (分层记忆): recall is filtered to the session's own working
+    /// memory + the global tier, so cross-session facts stay strictly isolated.
+    pub fn build_memory_stage(
+        &self,
+        session_id: uuid::Uuid,
+        trace_id: Option<uuid::Uuid>,
+    ) -> everevo_agent::MemoryStage {
         let mut stage = everevo_agent::MemoryStage::new(self.fact_manager.clone())
             .with_knowledge_graph(self.knowledge_graph.clone())
-            .with_workflows_dir(self.config.data_dir.join("workflows"));
+            .with_workflows_dir(self.config.data_dir.join("workflows"))
+            .with_session_id(Some(session_id));
         if let Some(ref rag) = self.rag_pipeline {
             stage = stage.with_rag(Arc::clone(rag));
+        }
+        if let Some(tid) = trace_id {
+            stage = stage.with_telemetry(self.telemetry_pipeline.clone(), tid);
         }
         stage
     }
@@ -1006,8 +1035,12 @@ impl AppState {
             let url = entry.get("base_url").and_then(|v| v.as_str()).unwrap_or("");
             let model = entry.get("model").and_then(|v| v.as_str()).unwrap_or("");
 
-            if !key.is_empty() {
-                plaintext_keys_found = true;
+            // Local providers (e.g. llama-server vision) have no api_key — a
+            // base_url alone is enough to build a working client.
+            if !key.is_empty() || !url.is_empty() {
+                if !key.is_empty() {
+                    plaintext_keys_found = true;
+                }
                 let client = HttpClient::with_proxy(api_fmt, key, url, model, proxy.as_deref());
                 map.insert(id.to_string(), Some(Arc::new(client)));
             }
@@ -1020,6 +1053,104 @@ impl AppState {
                  and read_file tools — plaintext keys are a security risk."
             );
         }
+
+        // Honor `[routing] mainModelId`: re-key that provider as "primary" so the
+        // chat handler deterministically uses the configured main model instead of
+        // whichever entry HashMap iteration happens to return first. Without this,
+        // a stale/duplicate [[llm]] block can silently become the active model.
+        if let Some(main_id) = table
+            .get("routing")
+            .and_then(|r| r.get("mainModelId"))
+            .and_then(|v| v.as_str())
+        {
+            if let Some(client) = map.get(main_id).cloned() {
+                map.insert("primary".to_string(), client);
+                tracing::info!(main_id, "Routing mainModelId set as primary LLM");
+            } else {
+                tracing::warn!(
+                    main_id,
+                    "routing.mainModelId not found among [[llm]] entries"
+                );
+            }
+        }
         map
+    }
+
+    /// Resolve `vision_llm` / `compact_llm` from `[routing] visionModelId` /
+    /// `compactModelId` (with `id == "vision"` fallback convention for vision).
+    /// Reads config.toml fresh so it stays in sync after any PUT /api/config or
+    /// /api/routing save. Idempotent — safe to call after every provider change.
+    pub async fn resolve_special_providers(&self) {
+        let path = self.config.data_dir.join("config.toml");
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let table: toml::Value = match toml::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let llm_arr = match table.get("llm").and_then(|v| v.as_array()) {
+            Some(a) => a,
+            None => return,
+        };
+
+        let mut windows: HashMap<String, u32> = HashMap::new();
+        for entry in llm_arr {
+            let id = entry
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("primary")
+                .to_string();
+            if let Some(w) = entry.get("context_window").and_then(|v| v.as_integer()) {
+                windows.insert(id, w.max(0) as u32);
+            }
+        }
+
+        let routing = table.get("routing");
+        let vision_id = routing
+            .and_then(|r| r.get("visionModelId"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                // Fallback convention: a [[llm]] entry with id "vision" is used
+                // even when visionModelId isn't explicitly set.
+                if llm_arr
+                    .iter()
+                    .any(|e| e.get("id").and_then(|v| v.as_str()) == Some("vision"))
+                {
+                    Some("vision".to_string())
+                } else {
+                    None
+                }
+            });
+        let compact_id = routing
+            .and_then(|r| r.get("compactModelId"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let guard = self.llm.read().await;
+        let resolve = |id: &str| -> Option<ResolvedProvider> {
+            let client = guard.get(id).and_then(|c| c.clone())?;
+            Some(ResolvedProvider {
+                client,
+                context_window: windows.get(id).copied(),
+            })
+        };
+        let vision = vision_id.as_deref().and_then(resolve);
+        let compact = compact_id.as_deref().and_then(resolve);
+        drop(guard);
+
+        let vision_resolved = vision.is_some();
+        let compact_resolved = compact.is_some();
+        *self.vision_llm.write().await = vision;
+        *self.compact_llm.write().await = compact;
+        if vision_resolved || compact_resolved {
+            tracing::info!(
+                "Special providers resolved: vision={}, compact={}",
+                vision_id.unwrap_or_default(),
+                compact_id.unwrap_or_default()
+            );
+        }
     }
 }

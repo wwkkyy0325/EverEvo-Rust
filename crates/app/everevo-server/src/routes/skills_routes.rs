@@ -9,8 +9,8 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::app_state::AppState;
-use everevo_core::ApiError;
 use everevo_agent::skill::SkillSource;
+use everevo_core::ApiError;
 
 /// Skill metadata returned by list endpoint.
 #[derive(Serialize)]
@@ -67,10 +67,23 @@ async fn list_skills(State(state): State<Arc<AppState>>) -> Json<Vec<SkillMeta>>
             SkillMeta {
                 name,
                 description,
-                source: format!("{:?}", skill.as_ref().map(|s| &s.source).unwrap_or(&SkillSource::User)).to_lowercase(),
+                source: format!(
+                    "{:?}",
+                    skill
+                        .as_ref()
+                        .map(|s| &s.source)
+                        .unwrap_or(&SkillSource::User)
+                )
+                .to_lowercase(),
                 tools: skill.as_ref().map(|s| s.tools.clone()).unwrap_or_default(),
-                when_to_use: skill.as_ref().map(|s| s.when_to_use.clone()).unwrap_or_default(),
-                disable_model_invocation: skill.as_ref().map(|s| s.disable_model_invocation).unwrap_or(false),
+                when_to_use: skill
+                    .as_ref()
+                    .map(|s| s.when_to_use.clone())
+                    .unwrap_or_default(),
+                disable_model_invocation: skill
+                    .as_ref()
+                    .map(|s| s.disable_model_invocation)
+                    .unwrap_or(false),
                 user_invocable: skill.as_ref().map(|s| s.user_invocable).unwrap_or(true),
             }
         })
@@ -82,7 +95,10 @@ async fn get_skill(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<SkillDetail>, ApiError> {
-    let skill = state.skill_registry.get(&name).ok_or_else(|| ApiError::not_found("skill not found"))?;
+    let skill = state
+        .skill_registry
+        .get(&name)
+        .ok_or_else(|| ApiError::not_found("skill not found"))?;
     Ok(Json(SkillDetail {
         name: skill.name,
         description: skill.description,
@@ -146,7 +162,8 @@ async fn delete_skill(
     }
     let skill_dir = state.config.data_dir.join("skills").join(&name);
     if skill_dir.exists() {
-        std::fs::remove_dir_all(&skill_dir).map_err(|e| ApiError::internal(format!("IO error: {e}")))?;
+        std::fs::remove_dir_all(&skill_dir)
+            .map_err(|e| ApiError::internal(format!("IO error: {e}")))?;
         let _ = state.skill_registry.rescan();
     }
     Ok((StatusCode::NO_CONTENT, Json(serde_json::json!({}))))

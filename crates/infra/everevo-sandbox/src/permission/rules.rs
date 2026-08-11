@@ -75,7 +75,13 @@ impl Default for PermissionRules {
         Self {
             level: PermissionLevel::SemiAuto,
             network: NetworkPolicy::for_level(PermissionLevel::SemiAuto),
-            filesystem_write_allowlist: vec!["data/sandbox/**".into()],
+            filesystem_write_allowlist: vec![
+                "data/sandbox/**".into(),
+                // Paged tool outputs (spec deliverable 6): the agent loop writes
+                // large tool results to data/sessions/<id>/tool_cache/ so the
+                // context can keep a 2KB preview and pull the full text on demand.
+                "data/sessions/**".into(),
+            ],
             trusted_paths: Vec::new(),
             filesystem_write_denylist: system_deny_paths(),
             shell_deny_patterns: deny_patterns(),
@@ -92,10 +98,16 @@ impl Default for PermissionRules {
 /// Check if a command matches any pattern in the list.
 pub(crate) fn command_matches_any(command: &str, patterns: &[String]) -> bool {
     patterns.iter().any(|pattern| {
-        if pattern.contains('*') {
-            let escaped = regex_lite::escape(pattern);
+        // A leading `^` anchors the pattern to the START of the command, e.g.
+        // `"^at "` matches the `at` scheduler (`at 09:00 cmd`) but never
+        // `cat file.txt` or `data ` mid-command. Patterns with `*` are regex
+        // wildcards; everything else stays a plain case-insensitive substring.
+        if pattern.starts_with('^') || pattern.contains('*') {
+            let body = pattern.strip_prefix('^').unwrap_or(pattern);
+            let escaped = regex_lite::escape(body);
             let re_pattern = escaped.replace(r"\*", ".*");
-            regex_lite::Regex::new(&format!("(?i){}", re_pattern))
+            let anchor = if pattern.starts_with('^') { "^" } else { "" };
+            regex_lite::Regex::new(&format!("(?i){anchor}{re_pattern}"))
                 .map(|re| re.is_match(command))
                 .unwrap_or(false)
         } else {
@@ -107,6 +119,40 @@ pub(crate) fn command_matches_any(command: &str, patterns: &[String]) -> bool {
 /// Check if a command matches deny patterns (used by deny list).
 pub fn command_is_denied(command: &str, deny_patterns: &[String]) -> bool {
     command_matches_any(command, deny_patterns)
+}
+
+/// Does the command WRITE to any of the given paths (rather than just reading)?
+///
+/// Used at SemiAuto to require approval for project-source writes
+/// (user requirement #5: 中度 — 写需审批, 读放行; FullyAuto unchanged).
+/// Conservative by design: only unambiguous writers are flagged, so reads and
+/// build/test flows (which reference no trusted path) still pass.
+fn command_writes_to_any(command: &str, paths: &[String]) -> bool {
+    // 1. Shell redirect target: `> path`, `>> path`, `2>> path`, `&> path`.
+    //    Same shape as `extract_paths`'s redirect regex so targets match.
+    let redir_re = regex_lite::Regex::new(r#"[12]?&?>+\s*([^\s"'&|]+)"#).unwrap();
+    for cap in redir_re.captures_iter(command) {
+        if let Some(target) = cap.get(1) {
+            let t = target.as_str();
+            if paths.iter().any(|p| p == t || p.ends_with(t)) {
+                return true;
+            }
+        }
+    }
+
+    // 2. Unambiguous mutating command as the first meaningful token
+    //    (ignore env/prefix wrappers like `sudo`, `env`, `time`).
+    let lower = command.to_lowercase();
+    let first = lower
+        .split_whitespace()
+        .find(|w| !matches!(*w, "sudo" | "env" | "time" | "nohup" | "doas" | "command"));
+    let first = first.unwrap_or("");
+    const MUTATING_CMDS: &[&str] = &[
+        "cp", "mv", "rm", "rmdir", "mkdir", "touch", "dd", "tee", "install", "truncate", "ln",
+        "chmod", "chown", "chattr", "shred", "unlink", "vi", "vim", "nano", "ed", "write",
+        "mktemp",
+    ];
+    MUTATING_CMDS.contains(&first)
 }
 
 // ── Permission Check (Single Chokepoint) ─────────────────────────────
@@ -137,6 +183,11 @@ pub fn check_permission(command: &str, rules: &PermissionRules) -> PermissionDec
     let mut external_paths = Vec::new();
     let mut trusted_paths_found = Vec::new();
     let mut has_dangerous_traversal_path = false;
+    // A path that hits the PERMANENT write denylist (system_deny_paths).
+    // Distinguished from external_paths (which also includes merely
+    // non-allowlisted paths) so FullyAuto can block host-critical paths
+    // without denying normal absolute-path operations like the uv python.
+    let mut references_denylisted_path = false;
     if rules.scan_absolute_paths {
         let all_paths = extract_paths(command);
         for p in &all_paths {
@@ -153,6 +204,13 @@ pub fn check_permission(command: &str, rules: &PermissionRules) -> PermissionDec
                 || p == "/dev/urandom"
             {
                 continue;
+            }
+            if rules
+                .filesystem_write_denylist
+                .iter()
+                .any(|d| glob_match(d, p))
+            {
+                references_denylisted_path = true;
             }
             if !is_path_allowed(p, rules) {
                 if rules.trusted_paths.iter().any(|t| glob_match(t, p)) {
@@ -180,12 +238,44 @@ pub fn check_permission(command: &str, rules: &PermissionRules) -> PermissionDec
             let is_dangerous = command_matches_any(command, &rules.shell_dangerous_patterns);
             let is_safe = command_matches_any(command, &rules.shell_safe_patterns);
             let has_external_paths = !external_paths.is_empty();
+            // Writes to a trusted (workspace/project) path — require approval.
+            // Runs BEFORE the safe-pattern auto-approve so `cp`/`echo >` to the
+            // project tree don't silently pass at SemiAuto (中度: 写需审批, 读放行).
+            let writes_trusted_path = command_writes_to_any(command, &trusted_paths_found);
 
             if requires_admin {
                 PermissionDecision::Confirm {
                     reason: "此命令需要管理员权限".into(),
                     external_paths,
                     requires_admin: true,
+                }
+            } else if writes_trusted_path {
+                PermissionDecision::Confirm {
+                    reason: format!(
+                        "命令将写入项目/工作区路径: {}. 项目源码写入需审批。",
+                        trusted_paths_found.join(", ")
+                    ),
+                    external_paths,
+                    requires_admin: false,
+                }
+            } else if has_external_paths {
+                // Reads of outside-sandbox paths also require approval, and this
+                // MUST gate before the safe-pattern auto-approve — a "safe"
+                // command (e.g. `cat /etc/hosts`) is still an escape to external
+                // state. (Ordering bug: the old substring `"at "` dangerous
+                // pattern masked this for `cat`-style commands.)
+                PermissionDecision::Confirm {
+                    reason: format!(
+                        "命令引用了沙箱外路径: {}. 可信路径: {}",
+                        external_paths.join(", "),
+                        if trusted_paths_found.is_empty() {
+                            "无"
+                        } else {
+                            "部分"
+                        }
+                    ),
+                    external_paths,
+                    requires_admin: false,
                 }
             } else if is_safe && !is_dangerous {
                 PermissionDecision::Allow
@@ -201,20 +291,6 @@ pub fn check_permission(command: &str, rules: &PermissionRules) -> PermissionDec
                     external_paths,
                     requires_admin: false,
                 }
-            } else if has_external_paths {
-                PermissionDecision::Confirm {
-                    reason: format!(
-                        "命令引用了沙箱外路径: {}. 可信路径: {}",
-                        external_paths.join(", "),
-                        if trusted_paths_found.is_empty() {
-                            "无"
-                        } else {
-                            "部分"
-                        }
-                    ),
-                    external_paths,
-                    requires_admin: false,
-                }
             } else {
                 PermissionDecision::Allow
             }
@@ -226,6 +302,22 @@ pub fn check_permission(command: &str, rules: &PermissionRules) -> PermissionDec
                     reason: "管理员命令需要确认（即使是全自动模式）".into(),
                     external_paths,
                     requires_admin: true,
+                }
+            } else if has_dangerous_traversal_path {
+                // Write confinement (host benchmark safety): escaping `..` to a
+                // sensitive dir (etc/, .ssh, config.toml, *.db, …) is DENIED
+                // even at FullyAuto. Pure `cd ..` stays allowed — only
+                // ../-to-sensitive targets trip this flag.
+                PermissionDecision::Deny {
+                    reason: "命令包含路径穿越到敏感目录 (../) — 全自动模式禁止沙箱外访问".into(),
+                }
+            } else if references_denylisted_path {
+                // A permanently-denied host/system path (C:\Windows, /etc,
+                // ~/.ssh, .git, crates/kernel/**, Cargo.toml, *.db, …) is
+                // referenced — DENIED at FullyAuto so an unattended benchmark
+                // run can never touch host-critical content.
+                PermissionDecision::Deny {
+                    reason: "命令引用了系统/受保护路径 — 全自动模式禁止沙箱外访问".into(),
                 }
             } else {
                 PermissionDecision::Allow
@@ -289,6 +381,34 @@ mod tests {
     }
 
     #[test]
+    fn test_at_pattern_is_anchored_to_command_start() {
+        // Regression: the old bare `"at "` substring flagged every command
+        // containing "at " (cat file.txt, format …, data …) as dangerous at
+        // SemiAuto. Anchoring to command start must stop that while still
+        // catching the real `at` scheduler.
+        let rules = PermissionRules::default();
+
+        let d = check_permission("cat file.txt", &rules);
+        assert_eq!(
+            d,
+            PermissionDecision::Allow,
+            "'cat file.txt' must NOT trip the 'at ' scheduler pattern"
+        );
+
+        let d = check_permission("at 09:00 echo hi", &rules);
+        assert!(
+            matches!(d, PermissionDecision::Confirm { .. }),
+            "'at 09:00 echo hi' is the scheduler and must still Confirm"
+        );
+
+        let d = check_permission("format C:", &rules);
+        assert!(
+            matches!(d, PermissionDecision::Confirm { .. }),
+            "'format C:' must still Confirm via its own pattern entry"
+        );
+    }
+
+    #[test]
     fn test_relative_paths_are_allowed() {
         let rules = PermissionRules::default();
         let d = check_permission("echo hello > ./test.txt", &rules);
@@ -327,6 +447,34 @@ mod tests {
     }
 
     #[test]
+    fn test_fullyauto_denies_host_critical_paths() {
+        // Host-benchmark write confinement: even FullyAuto must not touch
+        // denylisted system paths or traverse `..` into sensitive dirs.
+        let rules = PermissionRules {
+            level: PermissionLevel::FullyAuto,
+            ..Default::default()
+        };
+        // Denylisted absolute path → Deny
+        let d = check_permission("echo pwn > C:\\Windows\\System32\\evil.dll", &rules);
+        assert!(
+            matches!(d, PermissionDecision::Deny { .. }),
+            "write to C:\\Windows at FullyAuto should be Deny, got {d:?}"
+        );
+        // Sensitive traversal via ../ redirect → Deny
+        let d = check_permission("echo x > ../etc/passwd", &rules);
+        assert!(
+            matches!(d, PermissionDecision::Deny { .. }),
+            "traversal to ../etc/passwd at FullyAuto should be Deny, got {d:?}"
+        );
+        // Normal relative writes stay allowed
+        let d = check_permission("echo x > output.txt", &rules);
+        assert_eq!(d, PermissionDecision::Allow);
+        // Non-denylisted absolute path (e.g. a python interpreter) stays allowed
+        let d = check_permission("C:/Users/dev/python.exe script.py", &rules);
+        assert_eq!(d, PermissionDecision::Allow);
+    }
+
+    #[test]
     fn test_dangerous_confirms_destructive() {
         let rules = PermissionRules {
             level: PermissionLevel::FullyAuto,
@@ -347,6 +495,93 @@ mod tests {
         assert!(
             matches!(d, PermissionDecision::Confirm { .. }),
             "rm -rf / should require confirmation at SemiAuto, got {:?}",
+            d
+        );
+    }
+
+    fn trusted_workspace_rules() -> PermissionRules {
+        PermissionRules {
+            trusted_paths: vec!["C:\\workspace\\**".into()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_semiauto_write_to_trusted_path_confirms() {
+        // cp to a trusted workspace path must confirm at SemiAuto (写需审批),
+        // even though `cp` is in the safe-pattern auto-approve list.
+        let rules = trusted_workspace_rules();
+        let d = check_permission("cp C:\\workspace\\a.rs C:\\workspace\\b.rs", &rules);
+        assert!(
+            matches!(d, PermissionDecision::Confirm { .. }),
+            "cp into workspace should Confirm, got {:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn test_semiauto_redirect_write_to_trusted_path_confirms() {
+        // `echo > workspace` is safe-pattern, but the redirect writes a project path.
+        let rules = trusted_workspace_rules();
+        let d = check_permission("echo 'x' > C:\\workspace\\src\\main.rs", &rules);
+        assert!(
+            matches!(d, PermissionDecision::Confirm { .. }),
+            "redirect into workspace should Confirm, got {:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn test_semiauto_read_trusted_path_allowed() {
+        // Reading a workspace file stays auto-allowed (读放行).
+        // (`cat` would Confirm here — it's a pre-existing dangerous pattern;
+        // `ls` is safe-pattern + non-mutating, the correct read probe.)
+        let rules = trusted_workspace_rules();
+        let d = check_permission("ls C:\\workspace\\src\\main.rs", &rules);
+        assert_eq!(
+            d,
+            PermissionDecision::Allow,
+            "read from workspace should Allow, got {:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn test_fullyauto_write_to_trusted_path_allowed() {
+        // FullyAuto unchanged — project writes pass (GAIA unaffected).
+        let rules = PermissionRules {
+            level: PermissionLevel::FullyAuto,
+            trusted_paths: vec!["C:\\workspace\\**".into()],
+            ..Default::default()
+        };
+        let d = check_permission("cp C:\\workspace\\a.rs C:\\workspace\\b.rs", &rules);
+        assert_eq!(d, PermissionDecision::Allow);
+    }
+
+    #[test]
+    fn test_sandbox_relative_write_stays_allowed() {
+        // No trusted workspace bound — relative writes in the sandbox pass.
+        let rules = PermissionRules::default(); // trusted_paths empty
+        let d = check_permission("echo hi > ./out.txt", &rules);
+        assert_eq!(
+            d,
+            PermissionDecision::Allow,
+            "sandbox-relative write should Allow when no workspace bound, got {:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn test_semiauto_write_without_trusted_path_allowed() {
+        // cp between two non-trusted paths (e.g. inside sandbox) — no gate.
+        let rules = PermissionRules::default();
+        let d = check_permission("cp C:\\ws_none\\a.txt C:\\ws_none\\b.txt", &rules);
+        assert!(
+            matches!(
+                d,
+                PermissionDecision::Allow | PermissionDecision::Confirm { .. }
+            ),
+            "no trusted workspace → cp should not hit the project-write gate, got {:?}",
             d
         );
     }

@@ -48,6 +48,7 @@ pub fn apply_limits(limits: &ResourceLimits) -> Result<(), crate::error::Sandbox
 }
 
 #[cfg(unix)]
+#[allow(unsafe_code)]
 fn set_rlimit(resource: libc::__rlimit_resource_t, soft: u64, hard: u64) -> Result<(), String> {
     let rlim = libc::rlimit {
         rlim_cur: soft,

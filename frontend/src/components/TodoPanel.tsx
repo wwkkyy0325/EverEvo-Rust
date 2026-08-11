@@ -4,9 +4,19 @@ import { useStore } from '../store';
  * Claude Code-style TodoWrite panel.
  *
  * Shows the current session's task list with a progress bar and
- * per-task status (pending / in_progress / completed).
+ * per-task status (pending / in_progress / completed / failed /
+ * skipped / deferred).
  * Only visible when there are active (non-completed) todos.
  */
+const STATUS_ICONS: Record<string, string> = {
+  pending: '⏳',
+  in_progress: '🔄',
+  completed: '✅',
+  failed: '❌',
+  skipped: '⏭️',
+  deferred: '⏸️',
+};
+
 export default function TodoPanel() {
   const todos = useStore((s) => s.todos);
 
@@ -41,10 +51,16 @@ export default function TodoPanel() {
         <div className="border-t border-border px-3 py-1.5 space-y-0.5">
           {todos.map((t, i) => (
             <div key={i} className="flex items-center gap-2 text-xs">
-              <span className="shrink-0">
-                {t.status === 'completed' ? '✅' : t.status === 'in_progress' ? '🔄' : '⏳'}
-              </span>
-              <span className={t.status === 'completed' ? 'text-muted-foreground/50 line-through' : 'text-foreground/80'}>
+              <span className="shrink-0">{STATUS_ICONS[t.status] ?? '⏳'}</span>
+              <span
+                className={
+                  t.status === 'completed'
+                    ? 'text-muted-foreground/50 line-through'
+                    : t.status === 'failed'
+                      ? 'text-red-500/80'
+                      : 'text-foreground/80'
+                }
+              >
                 {t.status === 'in_progress' ? (t.activeForm || t.content) : t.content}
               </span>
             </div>

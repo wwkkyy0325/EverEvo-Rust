@@ -269,9 +269,7 @@ impl DreamingScheduler {
                                 // Persona auto-update from accumulated facts
                                 if let Some(ref path) = persona_profile {
                                     let facts = fact_manager.load_all().unwrap_or_default();
-                                    crate::stages::persona::update_persona_from_facts(
-                                        path, &facts,
-                                    );
+                                    crate::stages::persona::update_persona_from_facts(path, &facts);
                                 }
                             }
                             tracing::info!(?phase, "Dreaming phase completed");

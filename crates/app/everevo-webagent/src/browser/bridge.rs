@@ -43,17 +43,23 @@ struct CdpConnection {
 }
 
 impl CdpConnection {
-    fn new(ws: CdpWs) -> Self { Self { ws, next_id: 1 } }
+    fn new(ws: CdpWs) -> Self {
+        Self { ws, next_id: 1 }
+    }
 
     async fn send_command(&mut self, method: &str, params: Value) -> Result<Value, String> {
         let id = self.next_id;
         self.next_id += 1;
         let msg = serde_json::json!({"id":id,"method":method,"params":params}).to_string();
-        self.ws.send(Message::Text(msg)).await.map_err(|e| format!("CDP send: {e}"))?;
+        self.ws
+            .send(Message::Text(msg))
+            .await
+            .map_err(|e| format!("CDP send: {e}"))?;
 
         loop {
             let raw = tokio::time::timeout(Duration::from_secs(30), self.ws.next())
-                .await.map_err(|_| "CDP recv timeout".to_string())?
+                .await
+                .map_err(|_| "CDP recv timeout".to_string())?
                 .ok_or_else(|| "CDP connection closed".to_string())?
                 .map_err(|e| format!("CDP recv: {e}"))?;
 
@@ -61,7 +67,10 @@ impl CdpConnection {
                 let v: Value = serde_json::from_str(&t).map_err(|e| format!("CDP parse: {e}"))?;
                 if v.get("id").and_then(|i| i.as_u64()) == Some(id) {
                     return if v.get("error").is_some() {
-                        Err(format!("CDP {method}: {}", v["error"]["message"].as_str().unwrap_or("unknown")))
+                        Err(format!(
+                            "CDP {method}: {}",
+                            v["error"]["message"].as_str().unwrap_or("unknown")
+                        ))
                     } else {
                         Ok(v.get("result").cloned().unwrap_or(Value::Null))
                     };
@@ -84,22 +93,39 @@ fn find_browser() -> Option<std::path::PathBuf> {
             r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
         ] {
             let p = std::path::Path::new(path);
-            if p.exists() { return Some(p.to_path_buf()); }
+            if p.exists() {
+                return Some(p.to_path_buf());
+            }
         }
     }
     #[cfg(not(target_os = "windows"))]
     {
-        for name in &["google-chrome","chromium","chromium-browser","microsoft-edge","brave-browser"] {
-            if let Ok(p) = which::which(name) { return Some(p); }
+        for name in &[
+            "google-chrome",
+            "chromium",
+            "chromium-browser",
+            "microsoft-edge",
+            "brave-browser",
+        ] {
+            if let Ok(p) = which::which(name) {
+                return Some(p);
+            }
         }
     }
-    which::which("chrome").or_else(|_| which::which("msedge")).or_else(|_| which::which("chromium")).ok()
+    which::which("chrome")
+        .or_else(|_| which::which("msedge"))
+        .or_else(|_| which::which("chromium"))
+        .ok()
 }
 
 /// Launch a browser on the HOST (not sandboxed). The whole purpose of the
 /// browser bridge is to use the host's real browser fingerprint.
 #[allow(clippy::disallowed_methods)]
-async fn launch_browser(browser_path: &std::path::Path, port: u16, headless: bool) -> Result<tokio::process::Child, String> {
+async fn launch_browser(
+    browser_path: &std::path::Path,
+    port: u16,
+    headless: bool,
+) -> Result<tokio::process::Child, String> {
     let temp_dir = std::env::temp_dir().join(format!("everevo-cdp-{}", std::process::id()));
     std::fs::create_dir_all(&temp_dir).map_err(|e| format!("create temp dir: {e}"))?;
 
@@ -112,7 +138,9 @@ async fn launch_browser(browser_path: &std::path::Path, port: u16, headless: boo
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
 
-    if headless { cmd.arg("--headless=new"); }
+    if headless {
+        cmd.arg("--headless=new");
+    }
     cmd.arg("about:blank");
 
     cmd.spawn().map_err(|e| format!("launch browser: {e}"))
@@ -133,8 +161,11 @@ impl BrowserBridge {
         let port = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default().as_nanos().hash(&mut h);
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+                .hash(&mut h);
             (h.finish() % 20000 + 10000) as u16
         };
 
@@ -150,7 +181,8 @@ impl BrowserBridge {
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 if let Ok(resp) = client.get(&version_url).send().await {
                     if let Ok(json) = resp.json::<Value>().await {
-                        if let Some(url) = json.get("webSocketDebuggerUrl").and_then(|v| v.as_str()) {
+                        if let Some(url) = json.get("webSocketDebuggerUrl").and_then(|v| v.as_str())
+                        {
                             ws_url = Some(url.to_string());
                             break;
                         }
@@ -160,13 +192,18 @@ impl BrowserBridge {
 
             match ws_url {
                 Some(_) => {
-                    return Ok(Self { _process: Some(process), port });
+                    return Ok(Self {
+                        _process: Some(process),
+                        port,
+                    });
                 }
                 None if !headless => {
                     drop(process);
                 }
                 None => {
-                    return Err(format!("CDP not available on port {port} after 20s (both modes tried)"));
+                    return Err(format!(
+                        "CDP not available on port {port} after 20s (both modes tried)"
+                    ));
                 }
             }
         }
@@ -176,9 +213,15 @@ impl BrowserBridge {
     async fn page_ws_url(&self) -> Result<String, String> {
         let resp = reqwest::Client::new()
             .get(format!("http://127.0.0.1:{}/json", self.port))
-            .send().await.map_err(|e| format!("CDP list: {e}"))?;
-        let pages: Vec<Value> = resp.json().await.map_err(|e| format!("CDP list parse: {e}"))?;
-        pages.first()
+            .send()
+            .await
+            .map_err(|e| format!("CDP list: {e}"))?;
+        let pages: Vec<Value> = resp
+            .json()
+            .await
+            .map_err(|e| format!("CDP list parse: {e}"))?;
+        pages
+            .first()
             .and_then(|p| p.get("webSocketDebuggerUrl"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
@@ -187,7 +230,9 @@ impl BrowserBridge {
 
     async fn connect_page(&self) -> Result<CdpConnection, String> {
         let ws_url = self.page_ws_url().await?;
-        let (ws, _) = connect_async(&ws_url).await.map_err(|e| format!("CDP connect: {e}"))?;
+        let (ws, _) = connect_async(&ws_url)
+            .await
+            .map_err(|e| format!("CDP connect: {e}"))?;
         Ok(CdpConnection::new(ws))
     }
 
@@ -204,44 +249,58 @@ impl BrowserBridge {
         let fp = super::fingerprint::select_fingerprint(std::process::id() as u64);
 
         // Enable Page + Network domains
-        cdp.send_command("Page.enable", serde_json::json!({})).await?;
-        cdp.send_command("Network.enable", serde_json::json!({})).await?;
+        cdp.send_command("Page.enable", serde_json::json!({}))
+            .await?;
+        cdp.send_command("Network.enable", serde_json::json!({}))
+            .await?;
 
         // Override User-Agent at the network level (TLS handshake sees this)
-        cdp.send_command("Network.setUserAgentOverride", serde_json::json!({
-            "userAgent": fp.user_agent,
-            "platform": fp.platform,
-            "acceptLanguage": fp.language,
-        })).await?;
+        cdp.send_command(
+            "Network.setUserAgentOverride",
+            serde_json::json!({
+                "userAgent": fp.user_agent,
+                "platform": fp.platform,
+                "acceptLanguage": fp.language,
+            }),
+        )
+        .await?;
 
         // Inject stealth JS + fingerprint BEFORE any page script loads
         cdp.send_command(
             "Page.addScriptToEvaluateOnNewDocument",
             stealth::cdp_inject_stealth(),
-        ).await?;
+        )
+        .await?;
         // Inject coherent fingerprint profile (OS-consistent: Win/Mac + screen + timezone)
         let fp_js = super::fingerprint::fingerprint_injection_js(fp);
         cdp.send_command(
             "Page.addScriptToEvaluateOnNewDocument",
             serde_json::json!({"source": fp_js}),
-        ).await?;
+        )
+        .await?;
 
         // Navigate
-        cdp.send_command("Page.navigate", serde_json::json!({"url": search_url})).await?;
+        cdp.send_command("Page.navigate", serde_json::json!({"url": search_url}))
+            .await?;
 
         // Wait for page load
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() { return Err("Page load timeout".to_string()); }
+            if remaining.is_zero() {
+                return Err("Page load timeout".to_string());
+            }
 
-            let raw = tokio::time::timeout(remaining, cdp.ws.next()).await
+            let raw = tokio::time::timeout(remaining, cdp.ws.next())
+                .await
                 .map_err(|_| "Page load timeout".to_string())?
                 .ok_or_else(|| "CDP lost during load".to_string())?
                 .map_err(|e| format!("CDP: {e}"))?;
 
             if let Message::Text(t) = raw {
-                if t.contains("Page.loadEventFired") { break; }
+                if t.contains("Page.loadEventFired") {
+                    break;
+                }
             }
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -255,7 +314,10 @@ impl BrowserBridge {
             }),
         ).await?;
 
-        let page_json: String = dom_state["result"]["value"].as_str().unwrap_or("{}").to_string();
+        let page_json: String = dom_state["result"]["value"]
+            .as_str()
+            .unwrap_or("{}")
+            .to_string();
         let page_data: Value = serde_json::from_str(&page_json).unwrap_or(Value::Null);
         let title = page_data["title"].as_str().unwrap_or("");
         let html = page_data["html"].as_str().unwrap_or("");
@@ -288,7 +350,9 @@ impl BrowserBridge {
                             _ => {}
                         }
                     } else {
-                        return Err(format!("CAPTCHA detected but no solver configured: {challenge:?}"));
+                        return Err(format!(
+                            "CAPTCHA detected but no solver configured: {challenge:?}"
+                        ));
                     }
                 }
             }
@@ -296,48 +360,75 @@ impl BrowserBridge {
 
         // ── Extract results ─────────────────────────────────────────
         let scraper = search_result_scraper_js(limit);
-        let result = cdp.send_command("Runtime.evaluate", serde_json::json!({
-            "expression": scraper,
-            "returnByValue": true,
-        })).await?;
+        let result = cdp
+            .send_command(
+                "Runtime.evaluate",
+                serde_json::json!({
+                    "expression": scraper,
+                    "returnByValue": true,
+                }),
+            )
+            .await?;
 
         let json_str = result["result"]["value"].as_str().unwrap_or("[]");
         let items: Vec<Value> = serde_json::from_str(json_str).unwrap_or_default();
 
-        Ok(items.into_iter().map(|v| crate::search::engines::SearchResult {
-            title: v["title"].as_str().unwrap_or("").to_string(),
-            url: v["url"].as_str().unwrap_or("").to_string(),
-            snippet: v["snippet"].as_str().unwrap_or("").to_string(),
-        }).collect())
+        Ok(items
+            .into_iter()
+            .map(|v| crate::search::engines::SearchResult {
+                title: v["title"].as_str().unwrap_or("").to_string(),
+                url: v["url"].as_str().unwrap_or("").to_string(),
+                snippet: v["snippet"].as_str().unwrap_or("").to_string(),
+            })
+            .collect())
     }
 
     /// Fetch a page and return its full rendered text.
     pub async fn fetch_page_text(&self, url: &str) -> Result<String, String> {
         let mut cdp = self.connect_page().await?;
         let fp = super::fingerprint::select_fingerprint(std::process::id() as u64);
-        cdp.send_command("Page.enable", serde_json::json!({})).await?;
-        cdp.send_command("Network.enable", serde_json::json!({})).await?;
-        cdp.send_command("Network.setUserAgentOverride", serde_json::json!({
-            "userAgent": fp.user_agent,
-            "platform": fp.platform,
-            "acceptLanguage": fp.language,
-        })).await?;
-        cdp.send_command("Page.addScriptToEvaluateOnNewDocument", stealth::cdp_inject_stealth()).await?;
-        cdp.send_command("Page.addScriptToEvaluateOnNewDocument",
-            serde_json::json!({"source": super::fingerprint::fingerprint_injection_js(fp)})).await?;
-        cdp.send_command("Page.navigate", serde_json::json!({"url": url})).await?;
+        cdp.send_command("Page.enable", serde_json::json!({}))
+            .await?;
+        cdp.send_command("Network.enable", serde_json::json!({}))
+            .await?;
+        cdp.send_command(
+            "Network.setUserAgentOverride",
+            serde_json::json!({
+                "userAgent": fp.user_agent,
+                "platform": fp.platform,
+                "acceptLanguage": fp.language,
+            }),
+        )
+        .await?;
+        cdp.send_command(
+            "Page.addScriptToEvaluateOnNewDocument",
+            stealth::cdp_inject_stealth(),
+        )
+        .await?;
+        cdp.send_command(
+            "Page.addScriptToEvaluateOnNewDocument",
+            serde_json::json!({"source": super::fingerprint::fingerprint_injection_js(fp)}),
+        )
+        .await?;
+        cdp.send_command("Page.navigate", serde_json::json!({"url": url}))
+            .await?;
 
         // Wait for load
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() { return Err("Page load timeout".to_string()); }
-            let raw = tokio::time::timeout(remaining, cdp.ws.next()).await
+            if remaining.is_zero() {
+                return Err("Page load timeout".to_string());
+            }
+            let raw = tokio::time::timeout(remaining, cdp.ws.next())
+                .await
                 .map_err(|_| "Timeout".to_string())?
                 .ok_or_else(|| "CDP lost".to_string())?
                 .map_err(|e| format!("CDP: {e}"))?;
             if let Message::Text(t) = raw {
-                if t.contains("Page.loadEventFired") { break; }
+                if t.contains("Page.loadEventFired") {
+                    break;
+                }
             }
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -354,10 +445,16 @@ impl BrowserBridge {
 /// Capture a full-page screenshot via CDP Page.captureScreenshot.
 /// Returns PNG image bytes, or None if the capture fails.
 async fn capture_screenshot(cdp: &mut CdpConnection) -> Option<Vec<u8>> {
-    match cdp.send_command("Page.captureScreenshot", serde_json::json!({
-        "format": "png",
-        "captureBeyondViewport": true,
-    })).await {
+    match cdp
+        .send_command(
+            "Page.captureScreenshot",
+            serde_json::json!({
+                "format": "png",
+                "captureBeyondViewport": true,
+            }),
+        )
+        .await
+    {
         Ok(result) => {
             let data = result["data"].as_str().unwrap_or("");
             // CDP returns base64-encoded PNG; decode to bytes
@@ -378,8 +475,12 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
     let mut buf = 0u32;
     let mut bits = 0u32;
     for c in clean.chars() {
-        if c == '=' { break; }
-        let val = TABLE.iter().position(|&x| x == c as u8)
+        if c == '=' {
+            break;
+        }
+        let val = TABLE
+            .iter()
+            .position(|&x| x == c as u8)
             .ok_or_else(|| format!("Invalid base64 char: {c}"))? as u32;
         buf = (buf << 6) | val;
         bits += 6;
@@ -394,7 +495,8 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
 // ── JavaScript scrapers ──────────────────────────────────────────────────
 
 fn search_result_scraper_js(limit: usize) -> String {
-    format!(r#"(function(){{
+    format!(
+        r#"(function(){{
   var results=[],hostname=window.location.hostname;
   if(hostname.indexOf('bing.com')!==-1){{
     var items=document.querySelectorAll('.b_algo');
@@ -429,7 +531,9 @@ fn search_result_scraper_js(limit: usize) -> String {
     }}
   }}
   return JSON.stringify(results);
-}})()"#, limit=limit)
+}})()"#,
+        limit = limit
+    )
 }
 
 #[cfg(test)]

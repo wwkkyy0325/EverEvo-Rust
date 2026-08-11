@@ -110,6 +110,7 @@ pub fn parse_fact_file(name: &str, content: &str) -> Option<MemoryFact> {
         updated_at,
         projection: ProjectionMetadata::new("2.0.0", "unknown", vec![], 0.85),
         links,
+        session: fm.get("session").cloned(),
     })
 }
 
@@ -129,6 +130,9 @@ pub fn serialize_fact_file_with_meta(fact: &MemoryFact, recall: u32, tier: u8) -
     out.push_str(&format!("updated: {}\n", fact.updated_at.to_rfc3339()));
     out.push_str(&format!("recall: {}\n", recall));
     out.push_str(&format!("tier: {}\n", tier));
+    if let Some(s) = &fact.session {
+        out.push_str(&format!("session: {s}\n"));
+    }
     if !fact.links.is_empty() {
         out.push_str(&format!("links: {}\n", fact.links.join(", ")));
     }
@@ -178,6 +182,7 @@ mod tests {
             updated_at: chrono::Utc::now(),
             projection: ProjectionMetadata::new("test", "none", vec![], 1.0),
             links: vec!["a".into(), "b".into()],
+            session: None,
         };
         let s = serialize_fact_file(&fact);
         let parsed = parse_fact_file("test", &s).unwrap();

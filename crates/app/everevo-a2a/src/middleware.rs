@@ -107,7 +107,8 @@ fn verify_simple_jwt(token: &str, secret: &str) -> bool {
     let signature_b64 = parts[2];
 
     // Decode the expected signature from base64url
-    let expected_sig = match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(signature_b64) {
+    let expected_sig = match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(signature_b64)
+    {
         Ok(s) => s,
         Err(_) => return false,
     };
@@ -172,9 +173,7 @@ where
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
         // Skip auth for AgentCard discovery
-        if req.uri().path() == "/.well-known/agent.json"
-            || req.uri().path() == "/a2a/health"
-        {
+        if req.uri().path() == "/.well-known/agent.json" || req.uri().path() == "/a2a/health" {
             return Box::pin(self.inner.call(req));
         }
 
@@ -192,11 +191,7 @@ where
             }
             None => {
                 if self.config.enabled {
-                    let resp = (
-                        StatusCode::UNAUTHORIZED,
-                        "Authorization required",
-                    )
-                        .into_response();
+                    let resp = (StatusCode::UNAUTHORIZED, "Authorization required").into_response();
                     return Box::pin(async { Ok(resp) });
                 }
             }
@@ -246,7 +241,8 @@ mod tests {
 
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(message.as_bytes());
-        let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&mac.finalize().into_bytes());
+        let sig =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&mac.finalize().into_bytes());
 
         let token = format!("{header_b64}.{payload_b64}.{sig}");
         assert!(verify_simple_jwt(&token, secret));

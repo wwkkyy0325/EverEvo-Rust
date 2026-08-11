@@ -15,10 +15,7 @@ use std::panic::AssertUnwindSafe;
 /// Without this, a panic in any handler takes down the entire server process.
 /// With it, the error is logged, the client gets a proper JSON error envelope,
 /// and the server keeps serving other requests.
-pub async fn panic_recovery(
-    request: Request<Body>,
-    next: axum::middleware::Next,
-) -> Response {
+pub async fn panic_recovery(request: Request<Body>, next: axum::middleware::Next) -> Response {
     let future = AssertUnwindSafe(next.run(request));
     match future.catch_unwind().await {
         Ok(response) => response,

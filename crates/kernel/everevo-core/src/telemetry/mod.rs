@@ -6,6 +6,7 @@
 //! never blocks on I/O.
 
 mod config;
+mod pipeline;
 mod records;
 mod trace;
 mod writer;
@@ -23,6 +24,10 @@ use writer::run_writer;
 
 // Re-exports
 pub use config::TelemetryConfig;
+pub use pipeline::{
+    default_telemetry_pipeline, RetrievalTelemetryStage, StageEmitSnapshot, TelemetryEmitContext,
+    TelemetryPipeline, TelemetryRecord, TelemetrySnapshot, TelemetryStage, TurnTelemetryStage,
+};
 pub use records::{AgentTurnRecord, RetrievalRecord};
 pub use trace::{SpanGuard, Trace};
 
@@ -154,6 +159,8 @@ impl Telemetry {
             latency_ms: record.latency_ms,
             tokens_input: record.tokens_input,
             tokens_output: record.tokens_output,
+            error_type: record.error_type,
+            error_message: record.error_message,
             experiment_id: record.experiment_id,
             variant: record.variant,
         });
@@ -209,6 +216,8 @@ mod tests {
             latency_ms: 1,
             tokens_input: 0,
             tokens_output: 0,
+            error_type: None,
+            error_message: None,
             experiment_id: None,
             variant: None,
         });
@@ -375,6 +384,8 @@ mod tests {
             latency_ms: 1200,
             tokens_input: 1500,
             tokens_output: 800,
+            error_type: Some("tool_error".into()),
+            error_message: Some("1 of 5 tool calls failed".into()),
             experiment_id: Some("exp-2".into()),
             variant: Some("baseline".into()),
         });

@@ -153,6 +153,13 @@ pub struct MemoryFact {
     pub projection: ProjectionMetadata,
     /// Linked memories ([[wikilink]] targets).
     pub links: Vec<String>,
+    /// Session scope (分层记忆 — two-tier model).
+    /// `None` (legacy facts) or `"global"` = cross-session long-term memory,
+    /// visible to every session's recall. `Some(uuid)` = this session's working
+    /// memory, strictly isolated — only that session's recall can see it.
+    /// Promotion to long-term memory is the explicit `scope: "global"` on save.
+    #[serde(default)]
+    pub session: Option<String>,
 }
 
 /// Classification of a memory fact.

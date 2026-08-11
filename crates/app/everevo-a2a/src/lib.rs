@@ -52,20 +52,13 @@ pub struct A2aGateway {
 
 impl A2aGateway {
     /// Create an A2A gateway with the production executor.
-    pub fn new(
-        llm: Arc<HttpClient>,
-        tools: Arc<ToolRegistry>,
-        config: A2aGatewayConfig,
-    ) -> Self {
+    pub fn new(llm: Arc<HttpClient>, tools: Arc<ToolRegistry>, config: A2aGatewayConfig) -> Self {
         let executor = Arc::new(EverEvoExecutor::new(llm, tools, config.max_turns));
         let card = AgentCardBuilder::new(&config.base_url).build();
         let state = Arc::new(A2aState::new(executor, card, config.max_turns));
 
         let auth_config = if config.enable_auth {
-            A2aAuthConfig::production(
-                config.jwt_secret.unwrap_or_default(),
-                config.api_keys,
-            )
+            A2aAuthConfig::production(config.jwt_secret.unwrap_or_default(), config.api_keys)
         } else {
             A2aAuthConfig::dev_mode()
         };
@@ -78,10 +71,7 @@ impl A2aGateway {
     }
 
     /// Create a gateway with a custom executor (for testing).
-    pub fn with_executor(
-        executor: Arc<dyn A2aAgentExecutor>,
-        config: A2aGatewayConfig,
-    ) -> Self {
+    pub fn with_executor(executor: Arc<dyn A2aAgentExecutor>, config: A2aGatewayConfig) -> Self {
         let card = AgentCardBuilder::new(&config.base_url).build();
         let state = Arc::new(A2aState::new(executor, card, config.max_turns));
 

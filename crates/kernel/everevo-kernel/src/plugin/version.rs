@@ -153,8 +153,12 @@ pub struct PluginConfig {
     pub metrics: HashMap<String, PluginMetrics>,
 }
 
-fn default_true() -> bool { true }
-fn default_observe_minutes() -> u64 { 30 }
+fn default_true() -> bool {
+    true
+}
+fn default_observe_minutes() -> u64 {
+    30
+}
 
 // ── Version Store ───────────────────────────────────────────────────────
 
@@ -193,8 +197,8 @@ impl VersionStore {
         let path = self.config_path(plugin_id);
         if path.exists() {
             let content = std::fs::read_to_string(&path)?;
-            let cfg: PluginConfig =
-                toml::from_str(&content).map_err(|e| VersionError::Toml(toml_error::Error::De(e.to_string())))?;
+            let cfg: PluginConfig = toml::from_str(&content)
+                .map_err(|e| VersionError::Toml(toml_error::Error::De(e.to_string())))?;
             Ok(cfg)
         } else {
             Err(VersionError::NotFound {
@@ -205,11 +209,7 @@ impl VersionStore {
     }
 
     /// Save plugin config to registry.toml.
-    pub fn save_config(
-        &self,
-        plugin_id: &str,
-        config: &PluginConfig,
-    ) -> Result<(), VersionError> {
+    pub fn save_config(&self, plugin_id: &str, config: &PluginConfig) -> Result<(), VersionError> {
         let path = self.config_path(plugin_id);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -263,12 +263,7 @@ impl VersionStore {
     }
 
     /// Set canary version and traffic percentage.
-    pub fn set_canary(
-        &self,
-        plugin_id: &str,
-        version: &str,
-        pct: f64,
-    ) -> Result<(), VersionError> {
+    pub fn set_canary(&self, plugin_id: &str, version: &str, pct: f64) -> Result<(), VersionError> {
         let mut config = self.load_config(plugin_id)?;
         config.canary = Some(version.to_string());
         config.canary_pct = pct.clamp(0.0, 1.0);
@@ -319,11 +314,7 @@ impl VersionStore {
     }
 
     /// Record a crash for a plugin version.
-    pub fn record_crash(
-        &self,
-        plugin_id: &str,
-        version: &str,
-    ) -> Result<(), VersionError> {
+    pub fn record_crash(&self, plugin_id: &str, version: &str) -> Result<(), VersionError> {
         let mut config = self.load_config(plugin_id)?;
         config
             .metrics
@@ -335,11 +326,7 @@ impl VersionStore {
     }
 
     /// Verify a plugin binary's checksum.
-    pub fn verify_checksum(
-        &self,
-        plugin_id: &str,
-        version: &str,
-    ) -> Result<(), VersionError> {
+    pub fn verify_checksum(&self, plugin_id: &str, version: &str) -> Result<(), VersionError> {
         let exe = self.exe_path(plugin_id, version);
         let checksum_path = exe.parent().unwrap().join("checksum.sha256");
 
@@ -408,9 +395,7 @@ mod tests {
         std::fs::write(&fake_exe, b"fake binary").unwrap();
 
         // Stage it
-        store
-            .stage("test-plugin", "v1.0.0", &fake_exe)
-            .unwrap();
+        store.stage("test-plugin", "v1.0.0", &fake_exe).unwrap();
 
         // Verify checksum was generated
         let checksum_path = store
@@ -421,9 +406,7 @@ mod tests {
         assert!(checksum_path.exists());
 
         // Verify checksum passes
-        store
-            .verify_checksum("test-plugin", "v1.0.0")
-            .unwrap();
+        store.verify_checksum("test-plugin", "v1.0.0").unwrap();
     }
 
     #[test]
@@ -463,10 +446,7 @@ mod tests {
 
         let store = VersionStore::open(".").unwrap();
         for _ in 0..100 {
-            assert_eq!(
-                store.resolve(&config, Uuid::new_v4()),
-                "v1.0.0"
-            );
+            assert_eq!(store.resolve(&config, Uuid::new_v4()), "v1.0.0");
         }
     }
 

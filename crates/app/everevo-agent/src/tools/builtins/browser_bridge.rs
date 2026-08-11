@@ -94,9 +94,7 @@ impl CdpConnection {
         // Read responses until we get the one matching our id.
         // CDP events (no `id` field) are interleaved — skip them.
         loop {
-            let raw = self
-                .recv_text_timeout(Duration::from_secs(30))
-                .await?;
+            let raw = self.recv_text_timeout(Duration::from_secs(30)).await?;
             let v: Value = serde_json::from_str(&raw)
                 .map_err(|e| EverEvoError::Internal(format!("CDP parse: {e}")))?;
 
@@ -126,7 +124,9 @@ impl CdpConnection {
 
         match msg {
             Message::Text(t) => Ok(t.to_string()),
-            Message::Close(_) => Err(EverEvoError::Internal("CDP: browser closed connection".into())),
+            Message::Close(_) => Err(EverEvoError::Internal(
+                "CDP: browser closed connection".into(),
+            )),
             other => Ok(other.to_string()),
         }
     }
@@ -158,8 +158,13 @@ fn find_browser() -> Option<std::path::PathBuf> {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        for name in &["google-chrome", "chromium", "chromium-browser", "microsoft-edge", "brave-browser"]
-        {
+        for name in &[
+            "google-chrome",
+            "chromium",
+            "chromium-browser",
+            "microsoft-edge",
+            "brave-browser",
+        ] {
             if let Ok(p) = which::which(name) {
                 return Some(p);
             }
@@ -195,10 +200,7 @@ async fn launch_browser_ex(
 
     let mut cmd = tokio::process::Command::new(browser_path);
     cmd.arg(format!("--remote-debugging-port={port}"))
-        .arg(format!(
-            "--user-data-dir={}",
-            temp_dir.display()
-        ))
+        .arg(format!("--user-data-dir={}", temp_dir.display()))
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
         .arg("--disable-background-networking")
@@ -219,9 +221,12 @@ async fn launch_browser_ex(
 
     cmd.arg("about:blank"); // start with blank page
 
-    let child = cmd
-        .spawn()
-        .map_err(|e| EverEvoError::Internal(format!("launch browser ({mode}): {e}", mode = if headless { "headless" } else { "headful" })))?;
+    let child = cmd.spawn().map_err(|e| {
+        EverEvoError::Internal(format!(
+            "launch browser ({mode}): {e}",
+            mode = if headless { "headless" } else { "headful" }
+        ))
+    })?;
 
     Ok(child)
 }
@@ -273,8 +278,7 @@ impl BrowserBridge {
             );
 
             let process = launch_browser_ex(&browser_path, port, headless).await?;
-            let temp_dir =
-                std::env::temp_dir().join(format!("everevo-cdp-{}", std::process::id()));
+            let temp_dir = std::env::temp_dir().join(format!("everevo-cdp-{}", std::process::id()));
 
             // Wait for CDP to become available with exponential backoff
             // (250ms → 500ms → 1s → ... capped at 2s, total ~20s).
@@ -288,9 +292,8 @@ impl BrowserBridge {
                 match client.get(&version_url).send().await {
                     Ok(resp) => {
                         if let Ok(json) = resp.json::<Value>().await {
-                            if let Some(url) = json
-                                .get("webSocketDebuggerUrl")
-                                .and_then(|v| v.as_str())
+                            if let Some(url) =
+                                json.get("webSocketDebuggerUrl").and_then(|v| v.as_str())
                             {
                                 ws_url = Some(url.to_string());
                                 break;
@@ -378,15 +381,13 @@ impl BrowserBridge {
         let mut cdp = self.connect_page().await?;
 
         // Enable Page domain
-        cdp.send_command("Page.enable", serde_json::json!({})).await?;
+        cdp.send_command("Page.enable", serde_json::json!({}))
+            .await?;
 
         // Navigate to search URL
         tracing::debug!(url = %search_url, "CDP navigate");
-        cdp.send_command(
-            "Page.navigate",
-            serde_json::json!({"url": search_url}),
-        )
-        .await?;
+        cdp.send_command("Page.navigate", serde_json::json!({"url": search_url}))
+            .await?;
 
         // Wait for page load by reading CDP events until we get
         // Page.loadEventFired or timeout.
@@ -434,8 +435,7 @@ impl BrowserBridge {
             .and_then(|v| v.as_str())
             .unwrap_or("[]");
 
-        let results: Vec<BrowserSearchResult> = serde_json::from_str(json_str)
-            .unwrap_or_default();
+        let results: Vec<BrowserSearchResult> = serde_json::from_str(json_str).unwrap_or_default();
 
         tracing::info!(count = results.len(), "CDP search results extracted");
 

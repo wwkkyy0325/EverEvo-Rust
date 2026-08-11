@@ -24,6 +24,8 @@ pub async fn persist_and_send(
     thinking_open: bool,
     text_block_idx: Option<usize>,
     block_index: usize,
+    input_tokens: u64,
+    output_tokens: u64,
 ) -> Result<(), String> {
     // Persist assistant message
     if !full_response.is_empty() {
@@ -75,9 +77,9 @@ pub async fn persist_and_send(
         let _ = tx.send(super::stream::stop_event(tb)).await;
     }
 
-    // message_delta
+    // message_delta — real token counts from LLM API
     let _ = tx.send(Ok(Event::default().event("message_delta").data(
-        serde_json::json!({"delta": {"stop_reason": "end_turn", "stop_sequence": null}, "usage": {"input_tokens": 0, "output_tokens": 0}}).to_string(),
+        serde_json::json!({"delta": {"stop_reason": "end_turn", "stop_sequence": null}, "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}}).to_string(),
     ))).await;
 
     // message_stop
@@ -85,8 +87,8 @@ pub async fn persist_and_send(
         .send(Ok(Event::default().event("message_stop").data("{}")))
         .await;
 
-    // Legacy done event
-    let done = serde_json::json!({"session_id": session_id, "message_id": assistant_id});
+    // Done event — includes real token usage from LLM API
+    let done = serde_json::json!({"session_id": session_id, "message_id": assistant_id, "input_tokens": input_tokens, "output_tokens": output_tokens});
     let _ = tx
         .send(Ok(Event::default().event("done").data(done.to_string())))
         .await;
@@ -99,7 +101,13 @@ pub async fn persist_and_send(
 
     // ── Summarizer: fire-and-forget session summary on close ──
     // Only runs when there's substantive conversation to summarize.
-    if !full_response.is_empty() && full_response.len() > 50 {
+    // Benchmark mode (EVEREVO_BENCHMARK=1) skips it — the handoff summary is
+    // written to the GLOBAL tier and would leak one GAIA question's content
+    // into later questions' context.
+    if !full_response.is_empty()
+        && full_response.len() > 50
+        && std::env::var("EVEREVO_BENCHMARK").is_err()
+    {
         let llm = {
             let guard = state.llm.read().await;
             guard.values().find_map(|v| v.clone())

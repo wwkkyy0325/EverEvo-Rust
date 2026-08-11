@@ -391,10 +391,7 @@ pub enum StreamEvent {
         message: Option<String>,
     },
     #[serde(rename = "artifact-update")]
-    ArtifactUpdate {
-        task_id: String,
-        artifact: Artifact,
-    },
+    ArtifactUpdate { task_id: String, artifact: Artifact },
 }
 
 /// Request body for `tasks/get`.

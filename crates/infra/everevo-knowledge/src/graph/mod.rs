@@ -25,5 +25,8 @@ pub mod types;
 pub use extraction::build_extraction_prompt;
 pub use graph::KnowledgeGraph;
 pub use resolver::{EntityResolver, MatchResult, ResolveStats};
-pub use symbols::{SymbolRegistry, CAP_EXECUTE, CAP_READ, CAP_SEARCH, CAP_WRITE, CAP_DELEGATE, CAP_LEARN, CAP_FETCH};
+pub use symbols::{
+    SymbolRegistry, CAP_DELEGATE, CAP_EXECUTE, CAP_FETCH, CAP_LEARN, CAP_READ, CAP_SEARCH,
+    CAP_WRITE,
+};
 pub use types::{Entity, EntityType, Relation, RelationStatus, SymbolPredicate};

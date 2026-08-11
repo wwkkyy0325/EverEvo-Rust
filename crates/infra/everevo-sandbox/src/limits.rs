@@ -40,10 +40,10 @@ impl ResourceLimits {
     pub fn relaxed() -> Self {
         Self {
             timeout_secs: 300,
-            memory_mb: None,
-            max_processes: None,
+            memory_mb: Some(2048),
+            max_processes: Some(8),
             network_allowed: true,
-            max_file_size_mb: None,
+            max_file_size_mb: Some(512),
         }
     }
 }

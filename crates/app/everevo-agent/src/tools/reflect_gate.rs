@@ -75,11 +75,7 @@ impl Default for ReflectGateHook {
 
 #[async_trait]
 impl ToolHook for ReflectGateHook {
-    async fn pre_execute(
-        &self,
-        _tool_name: &str,
-        _params: &Value,
-    ) -> Result<(), EverEvoError> {
+    async fn pre_execute(&self, _tool_name: &str, _params: &Value) -> Result<(), EverEvoError> {
         Ok(()) // ReflectGate only does post-execute work
     }
 
@@ -249,8 +245,7 @@ mod tests {
     #[test]
     fn test_reflect_gate_records_digest() {
         let gate = ReflectGateHook::new();
-        let result: Result<ToolOutput, EverEvoError> =
-            Ok(ToolOutput::text("build successful"));
+        let result: Result<ToolOutput, EverEvoError> = Ok(ToolOutput::text("build successful"));
 
         rt().block_on(gate.post_execute(
             "shell",

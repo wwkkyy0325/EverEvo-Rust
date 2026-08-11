@@ -65,16 +65,26 @@ struct ToolRegistry {
 }
 
 impl ToolRegistry {
-    fn new() -> Self { Self { tools: HashMap::new() } }
-
-    fn register(&mut self, def: ToolDef, handler: ToolFn) {
-        self.tools.insert(def.name.clone(), ToolEntry { def, handler });
+    fn new() -> Self {
+        Self {
+            tools: HashMap::new(),
+        }
     }
 
-    fn list(&self) -> Vec<&ToolDef> { self.tools.values().map(|e| &e.def).collect() }
+    fn register(&mut self, def: ToolDef, handler: ToolFn) {
+        self.tools
+            .insert(def.name.clone(), ToolEntry { def, handler });
+    }
+
+    fn list(&self) -> Vec<&ToolDef> {
+        self.tools.values().map(|e| &e.def).collect()
+    }
 
     fn call(&self, name: &str, args: Value, state: &AppState) -> Result<String, String> {
-        let entry = self.tools.get(name).ok_or_else(|| format!("Tool not found: {name}"))?;
+        let entry = self
+            .tools
+            .get(name)
+            .ok_or_else(|| format!("Tool not found: {name}"))?;
         (entry.handler)(state, args)
     }
 }
@@ -96,7 +106,7 @@ pub struct Server {
 impl Server {
     pub fn new() -> Self {
         let state = Arc::new(AppState {
-            rate_limiter: RateLimiter::new(5.0, 0.5),  // 5 tokens, 0.5/sec refill
+            rate_limiter: RateLimiter::new(5.0, 0.5), // 5 tokens, 0.5/sec refill
             circuit_breaker: CircuitBreaker::new(5, 120), // trip after 5 failures, 2min cooldown
         });
 
@@ -370,27 +380,42 @@ impl Server {
         let mut stdout = std::io::stdout();
 
         for line in reader.lines() {
-            let line = match line { Ok(l) => l, Err(_) => break };
-            if line.trim().is_empty() { continue; }
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
 
             let req: Request = match serde_json::from_str(&line) {
                 Ok(r) => r,
                 Err(e) => {
-                    let resp = Response { jsonrpc: "2.0", id: Value::Null, result: None,
-                        error: Some(RpcError { code: -32700, message: format!("Parse error: {e}") }) };
-                    writeln!(stdout, "{}", serde_json::to_string(&resp).unwrap_or_default()).ok();
+                    let resp = Response {
+                        jsonrpc: "2.0",
+                        id: Value::Null,
+                        result: None,
+                        error: Some(RpcError {
+                            code: -32700,
+                            message: format!("Parse error: {e}"),
+                        }),
+                    };
+                    writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::to_string(&resp).unwrap_or_default()
+                    )
+                    .ok();
                     continue;
                 }
             };
 
             let result = match req.method.as_str() {
-                "initialize" => {
-                    Ok(serde_json::json!({
-                        "protocolVersion": "2025-03-26",
-                        "serverInfo": { "name": "everevo-webagent", "version": "0.1.0" },
-                        "capabilities": { "tools": {} }
-                    }))
-                }
+                "initialize" => Ok(serde_json::json!({
+                    "protocolVersion": "2025-03-26",
+                    "serverInfo": { "name": "everevo-webagent", "version": "0.1.0" },
+                    "capabilities": { "tools": {} }
+                })),
                 "tools/list" => {
                     let tools: Vec<&ToolDef> = self.registry.list();
                     Ok(serde_json::json!({ "tools": tools }))
@@ -410,14 +435,32 @@ impl Server {
                 }
                 "ping" => Ok(serde_json::json!({})),
                 "notifications/initialized" => continue,
-                _ => Err(RpcError { code: -32601, message: format!("Method not found: {}", req.method) }),
+                _ => Err(RpcError {
+                    code: -32601,
+                    message: format!("Method not found: {}", req.method),
+                }),
             };
 
             let resp = match result {
-                Ok(r) => Response { jsonrpc: "2.0", id: req.id, result: Some(r), error: None },
-                Err(e) => Response { jsonrpc: "2.0", id: req.id, result: None, error: Some(e) },
+                Ok(r) => Response {
+                    jsonrpc: "2.0",
+                    id: req.id,
+                    result: Some(r),
+                    error: None,
+                },
+                Err(e) => Response {
+                    jsonrpc: "2.0",
+                    id: req.id,
+                    result: None,
+                    error: Some(e),
+                },
             };
-            writeln!(stdout, "{}", serde_json::to_string(&resp).unwrap_or_default()).ok();
+            writeln!(
+                stdout,
+                "{}",
+                serde_json::to_string(&resp).unwrap_or_default()
+            )
+            .ok();
             stdout.flush().ok();
         }
     }

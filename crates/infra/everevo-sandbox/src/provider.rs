@@ -114,8 +114,25 @@ impl TieredSandbox {
             .current_dir(working_dir)
             .kill_on_drop(true)
             .stdin(std::process::Stdio::null());
-        // PATH: sandbox runtimes first (higher priority), host fallback last
+        // PATH: sandbox runtimes first (higher priority), host fallback last.
+        // Windows: filter out %LOCALAPPDATA%\Microsoft\WindowsApps — these are
+        // App Execution Aliases (stubs) that launch the Microsoft Store instead
+        // of the real executable (python3.exe, node.exe, etc.). Exit code 49 on
+        // Windows means "launched the Store stub, user declined", which breaks
+        // sandboxed tool execution.
         let host_path = std::env::var("PATH").unwrap_or_default();
+        let host_path_filtered = if cfg!(windows) {
+            host_path
+                .split(';')
+                .filter(|segment| {
+                    let lower = segment.to_lowercase();
+                    !lower.contains("windowsapps") && !segment.trim().is_empty()
+                })
+                .collect::<Vec<_>>()
+                .join(";")
+        } else {
+            host_path
+        };
         let mut path_parts: Vec<String> = self
             .config
             .injected_paths
@@ -125,7 +142,7 @@ impl TieredSandbox {
         // Also add sandbox-local bin for any per-session tools
         let sandbox_bin = self.config.sandbox_root.join(".local").join("bin");
         path_parts.push(sandbox_bin.display().to_string());
-        path_parts.push(host_path);
+        path_parts.push(host_path_filtered);
         cmd.env(
             "PATH",
             path_parts.join(if cfg!(windows) { ";" } else { ":" }),
@@ -154,7 +171,14 @@ impl TieredSandbox {
         // ── HTTP proxy passthrough ────────────────────────────────
         // Sandbox inherits host proxy settings so git/curl/wget work
         // behind firewalls/GFW without manual per-tool configuration.
-        for proxy_var in &["HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"] {
+        for proxy_var in &[
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "no_proxy",
+        ] {
             if let Ok(val) = std::env::var(proxy_var) {
                 if !val.is_empty() {
                     cmd.env(proxy_var, &val);
@@ -362,7 +386,11 @@ impl SandboxProvider for TieredSandbox {
             let mut buf = Vec::new();
             if let Some(mut reader) = stdout_handle {
                 let r = tokio::io::AsyncReadExt::take(&mut reader, MAX_OUTPUT_BYTES as u64);
-                let _ = tokio::io::AsyncReadExt::read_to_end(&mut tokio::io::BufReader::new(r), &mut buf).await;
+                let _ = tokio::io::AsyncReadExt::read_to_end(
+                    &mut tokio::io::BufReader::new(r),
+                    &mut buf,
+                )
+                .await;
                 // fallback to empty on pipe error
             }
             String::from_utf8_lossy(&buf).to_string()
@@ -371,7 +399,11 @@ impl SandboxProvider for TieredSandbox {
             let mut buf = Vec::new();
             if let Some(mut reader) = stderr_handle {
                 let r = tokio::io::AsyncReadExt::take(&mut reader, MAX_OUTPUT_BYTES as u64);
-                let _ = tokio::io::AsyncReadExt::read_to_end(&mut tokio::io::BufReader::new(r), &mut buf).await;
+                let _ = tokio::io::AsyncReadExt::read_to_end(
+                    &mut tokio::io::BufReader::new(r),
+                    &mut buf,
+                )
+                .await;
             }
             String::from_utf8_lossy(&buf).to_string()
         };
@@ -447,6 +479,19 @@ impl SandboxProvider for TieredSandbox {
         if let Ok(mut log) = self.audit_log.lock() {
             log.push(audit);
         }
+
+        // Augment stderr with exit code explanation for known Windows errors
+        let stderr = if let Some(explanation) =
+            crate::config::exit_code_explanation(exit_code, &ec.command)
+        {
+            if stderr.is_empty() {
+                explanation.to_string()
+            } else {
+                format!("{stderr}\n\n[{explanation}]")
+            }
+        } else {
+            stderr
+        };
 
         Ok(ExecutionResult {
             stdout,

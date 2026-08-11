@@ -64,11 +64,7 @@ pub(crate) fn kernel_protected_globs() -> Vec<&'static str> {
 /// directory component, it's blocked regardless of glob matching.
 /// This catches edge cases like unusual path separators or symlinks.
 pub(crate) fn kernel_protected_dirs() -> Vec<&'static str> {
-    vec![
-        "crates/kernel",
-        "src-tauri",
-        "migrations",
-    ]
+    vec!["crates/kernel", "src-tauri", "migrations"]
 }
 
 /// Protected file names (exact match on filename, any directory).
@@ -152,9 +148,15 @@ fn is_workspace_level(normalized_path: &str, filename: &str) -> bool {
 
     // Also protect files directly under target/release/ that match kernel binary names
     if normalized_path.contains("/target/release/") {
-        let kernel_names = ["everevo-server", "everevo-server.exe", "everevo.exe",
-                            "everevo-kernel", "everevo-kernel.exe",
-                            "everevo_core", "everevo_mcp"];
+        let kernel_names = [
+            "everevo-server",
+            "everevo-server.exe",
+            "everevo.exe",
+            "everevo-kernel",
+            "everevo-kernel.exe",
+            "everevo_core",
+            "everevo_mcp",
+        ];
         for kn in &kernel_names {
             if filename.eq_ignore_ascii_case(kn) {
                 return true;
@@ -271,9 +273,15 @@ mod tests {
 
     #[test]
     fn test_kernel_source_is_protected() {
-        assert!(is_kernel_protected("crates/kernel/everevo-kernel/src/lib.rs"));
-        assert!(is_kernel_protected("crates\\kernel\\everevo-core\\src\\lib.rs"));
-        assert!(is_kernel_protected("crates/kernel/everevo-mcp/src/client.rs"));
+        assert!(is_kernel_protected(
+            "crates/kernel/everevo-kernel/src/lib.rs"
+        ));
+        assert!(is_kernel_protected(
+            "crates\\kernel\\everevo-core\\src\\lib.rs"
+        ));
+        assert!(is_kernel_protected(
+            "crates/kernel/everevo-mcp/src/client.rs"
+        ));
     }
 
     #[test]
@@ -327,20 +335,28 @@ mod tests {
     #[test]
     fn test_plugin_source_is_not_protected() {
         assert!(!is_kernel_protected("plugins/tools/search/src/main.rs"));
-        assert!(!is_kernel_protected("plugins/stages/best_practices/src/main.rs"));
+        assert!(!is_kernel_protected(
+            "plugins/stages/best_practices/src/main.rs"
+        ));
         assert!(!is_kernel_protected("plugins/hooks/audit/src/main.rs"));
     }
 
     #[test]
     fn test_app_crates_are_not_protected() {
-        assert!(!is_kernel_protected("crates/app/everevo-server/src/main.rs"));
+        assert!(!is_kernel_protected(
+            "crates/app/everevo-server/src/main.rs"
+        ));
         assert!(!is_kernel_protected("crates/app/everevo-agent/src/lib.rs"));
     }
 
     #[test]
     fn test_infra_crates_are_not_protected() {
-        assert!(!is_kernel_protected("crates/infra/everevo-sandbox/src/provider.rs"));
-        assert!(!is_kernel_protected("crates/infra/everevo-db/src/models.rs"));
+        assert!(!is_kernel_protected(
+            "crates/infra/everevo-sandbox/src/provider.rs"
+        ));
+        assert!(!is_kernel_protected(
+            "crates/infra/everevo-db/src/models.rs"
+        ));
     }
 
     #[test]

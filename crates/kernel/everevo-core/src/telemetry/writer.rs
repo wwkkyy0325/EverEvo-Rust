@@ -133,13 +133,15 @@ async fn execute_cmd(pool: &sqlx::SqlitePool, cmd: WriteCmd) {
             latency_ms,
             tokens_input,
             tokens_output,
+            error_type,
+            error_message,
             experiment_id,
             variant,
         } => {
             sqlx::query(
                 "INSERT INTO telemetry_agent_turns \
-                 (id, trace_id, turn_number, tool_calls_total, tool_calls_success, task_completed, latency_ms, tokens_input, tokens_output, experiment_id, variant) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 (id, trace_id, turn_number, tool_calls_total, tool_calls_success, task_completed, latency_ms, tokens_input, tokens_output, error_type, error_message, experiment_id, variant) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&id)
             .bind(&trace_id)
@@ -150,6 +152,8 @@ async fn execute_cmd(pool: &sqlx::SqlitePool, cmd: WriteCmd) {
             .bind(latency_ms)
             .bind(tokens_input)
             .bind(tokens_output)
+            .bind(&error_type)
+            .bind(&error_message)
             .bind(&experiment_id)
             .bind(&variant)
             .execute(pool)
@@ -209,6 +213,8 @@ CREATE TABLE IF NOT EXISTS telemetry_agent_turns (
     latency_ms INTEGER NOT NULL,
     tokens_input INTEGER NOT NULL DEFAULT 0,
     tokens_output INTEGER NOT NULL DEFAULT 0,
+    error_type TEXT,
+    error_message TEXT,
     experiment_id TEXT,
     variant TEXT
 );

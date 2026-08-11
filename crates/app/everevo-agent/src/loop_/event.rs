@@ -29,6 +29,10 @@ pub enum AgentEvent {
     TurnComplete,
     /// Final response complete (no more tool calls).
     Done { final_text: String },
+    /// End-of-run retrospective: execution stats + failure classification.
+    /// Emitted just before `Done`; kept separate so scoring/parsers that read
+    /// `final_text` (e.g. benchmarks) are unaffected.
+    Retrospective { summary: String },
     /// A sub-agent was dispatched.
     SubAgentStarted { id: String, description: String },
     /// A sub-agent completed with a result.

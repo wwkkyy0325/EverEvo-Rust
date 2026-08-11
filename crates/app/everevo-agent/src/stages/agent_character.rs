@@ -394,19 +394,28 @@ fn merge_synthesized(current: &AgentCharacter, value: &serde_json::Value) -> Age
         }
     }
     if let Some(arr) = obj.get("traits").and_then(|v| v.as_array()) {
-        let parsed: Vec<String> = arr.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+        let parsed: Vec<String> = arr
+            .iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect();
         if !parsed.is_empty() {
             out.traits = parsed;
         }
     }
     if let Some(arr) = obj.get("style_guidelines").and_then(|v| v.as_array()) {
-        let parsed: Vec<String> = arr.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+        let parsed: Vec<String> = arr
+            .iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect();
         if !parsed.is_empty() {
             out.style_guidelines = parsed;
         }
     }
     if let Some(arr) = obj.get("values").and_then(|v| v.as_array()) {
-        let parsed: Vec<String> = arr.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+        let parsed: Vec<String> = arr
+            .iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect();
         if !parsed.is_empty() {
             out.values = parsed;
         }
@@ -580,13 +589,10 @@ mod tests {
 
         let pipeline = ContextPipeline::new()
             .with_stage(SystemPromptStage::new("CORE SYSTEM"))
-            .with_stage(AgentCharacterStage::new(PathBuf::from(
-                "ignored.json",
-            )));
+            .with_stage(AgentCharacterStage::new(PathBuf::from("ignored.json")));
 
         let ctx = ContextBuildContext::default();
-        let (messages, snapshot) =
-            pipeline.assemble_with_snapshot(&ctx, uuid::Uuid::nil(), 1);
+        let (messages, snapshot) = pipeline.assemble_with_snapshot(&ctx, uuid::Uuid::nil(), 1);
 
         // First message = system prompt, second = agent character.
         assert_eq!(messages.len(), 2);
@@ -631,7 +637,10 @@ mod tests {
         });
         let merged = merge_synthesized(&current, &v);
         assert_eq!(merged.tone, "dry and precise");
-        assert_eq!(merged.traits, vec!["witty".to_string(), "sharp".to_string()]);
+        assert_eq!(
+            merged.traits,
+            vec!["witty".to_string(), "sharp".to_string()]
+        );
         // Omitted fields preserved from current.
         assert_eq!(merged.name, current.name);
         assert_eq!(merged.identity, current.identity);

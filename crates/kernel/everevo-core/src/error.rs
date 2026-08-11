@@ -143,22 +143,46 @@ pub struct ApiError {
 
 impl ApiError {
     pub fn not_found(msg: impl Into<String>) -> Self {
-        Self { code: ErrorCode::NotFound, message: msg.into(), details: None }
+        Self {
+            code: ErrorCode::NotFound,
+            message: msg.into(),
+            details: None,
+        }
     }
     pub fn bad_request(msg: impl Into<String>) -> Self {
-        Self { code: ErrorCode::InvalidInput, message: msg.into(), details: None }
+        Self {
+            code: ErrorCode::InvalidInput,
+            message: msg.into(),
+            details: None,
+        }
     }
     pub fn conflict(msg: impl Into<String>) -> Self {
-        Self { code: ErrorCode::Conflict, message: msg.into(), details: None }
+        Self {
+            code: ErrorCode::Conflict,
+            message: msg.into(),
+            details: None,
+        }
     }
     pub fn forbidden(msg: impl Into<String>) -> Self {
-        Self { code: ErrorCode::Forbidden, message: msg.into(), details: None }
+        Self {
+            code: ErrorCode::Forbidden,
+            message: msg.into(),
+            details: None,
+        }
     }
     pub fn internal(msg: impl Into<String>) -> Self {
-        Self { code: ErrorCode::Internal, message: msg.into(), details: None }
+        Self {
+            code: ErrorCode::Internal,
+            message: msg.into(),
+            details: None,
+        }
     }
     pub fn timeout(msg: impl Into<String>) -> Self {
-        Self { code: ErrorCode::Timeout, message: msg.into(), details: None }
+        Self {
+            code: ErrorCode::Timeout,
+            message: msg.into(),
+            details: None,
+        }
     }
 
     #[allow(dead_code)]
@@ -193,7 +217,11 @@ impl From<EverEvoError> for ApiError {
             EverEvoError::Io(_) => ErrorCode::IoError,
             _ => ErrorCode::Internal,
         };
-        Self { code, message: e.to_string(), details: None }
+        Self {
+            code,
+            message: e.to_string(),
+            details: None,
+        }
     }
 }
 

@@ -49,10 +49,7 @@ pub fn detect_challenge(html: &str, title: &str) -> Option<ChallengeType> {
     }
 
     // reCAPTCHA v2 checkbox
-    if h.contains("recaptcha")
-        || h.contains("g-recaptcha")
-        || h.contains("recaptcha-checkbox")
-    {
+    if h.contains("recaptcha") || h.contains("g-recaptcha") || h.contains("recaptcha-checkbox") {
         return Some(ChallengeType::RecaptchaV2Checkbox);
     }
 

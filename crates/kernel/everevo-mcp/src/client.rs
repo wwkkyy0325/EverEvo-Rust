@@ -286,9 +286,7 @@ impl McpClient {
                     false
                 }
             },
-            Transport::Http { .. } => {
-                self.ping().await
-            }
+            Transport::Http { .. } => self.ping().await,
         }
     }
 
@@ -299,7 +297,9 @@ impl McpClient {
         // Send shutdown request (best-effort — server may already be dead)
         match self.send_recv("shutdown", None).await {
             Ok(_) => tracing::debug!("MCP shutdown acknowledged"),
-            Err(e) => tracing::debug!(error = %e, "MCP shutdown request failed (server may be dead)"),
+            Err(e) => {
+                tracing::debug!(error = %e, "MCP shutdown request failed (server may be dead)")
+            }
         }
         // Send exit notification (stdio only — tells server to close gracefully)
         if matches!(self.transport, Transport::Stdio { .. }) {

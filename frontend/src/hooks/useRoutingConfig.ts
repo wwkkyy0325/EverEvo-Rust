@@ -16,14 +16,18 @@ export interface TierConfig {
 export interface RoutingConfig {
   mainModelId: string;          // orchestrator — plans, decides, chats
   mainEffort: EffortLevel;      // orchestrator thinking depth
+  visionModelId: string;        // image description provider (describe_image) — '' = off
+  compactModelId: string;       // context compaction/rolling-summary provider — '' = main model
   tiers: [TierConfig, TierConfig, TierConfig]; // sub-agent execution cascade
 }
 
-const STORAGE_KEY = 'everevo_routing_v7';
+const STORAGE_KEY = 'everevo_routing_v8';
 
 const DEFAULT: RoutingConfig = {
   mainModelId: '',
   mainEffort: 'auto',
+  visionModelId: '',
+  compactModelId: '',
   tiers: [
     { modelId: '', effort: 'auto' },
     { modelId: '', effort: 'high' },
@@ -58,7 +62,13 @@ export function useRoutingConfig() {
           modelId: t.modelId || '', effort: t.effort || 'auto',
         }));
         if (tiers.length === 3) {
-          const remote = { mainModelId: data.mainModelId || '', mainEffort: data.mainEffort || 'auto', tiers: tiers as [TierConfig, TierConfig, TierConfig] };
+          const remote = {
+            mainModelId: data.mainModelId || '',
+            mainEffort: data.mainEffort || 'auto',
+            visionModelId: data.visionModelId || '',
+            compactModelId: data.compactModelId || '',
+            tiers: tiers as [TierConfig, TierConfig, TierConfig],
+          };
           setConfig(remote);
           localStorage.setItem(STORAGE_KEY, JSON.stringify(remote));
         }
@@ -84,5 +94,13 @@ export function useRoutingConfig() {
     });
   }, []);
 
-  return { config, synced, setMainModel, setMainEffort, setTier };
+  const setVisionModel = useCallback((modelId: string) => {
+    setConfig(prev => { const next = { ...prev, visionModelId: modelId }; persist(next); return next; });
+  }, []);
+
+  const setCompactModel = useCallback((modelId: string) => {
+    setConfig(prev => { const next = { ...prev, compactModelId: modelId }; persist(next); return next; });
+  }, []);
+
+  return { config, synced, setMainModel, setMainEffort, setTier, setVisionModel, setCompactModel };
 }

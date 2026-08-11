@@ -48,9 +48,9 @@ Match existing style — don't \"improve\" adjacent code. Remove only imports/va
 YOUR changes made unused. Write test → reproduce bug → fix. Prefer simple solutions.
 
 ### Shell & Permissions ({shell}, {perm})
-Shell is for build/test/git/packages, NOT for read/write/list/search/fetch. \
-Use relative paths (./file.txt). {tool_count} tools available. \
-Explain when elevated permissions are needed."
+Prefer dedicated tools for read/write/list/search/fetch; shell is best for \
+build/test/git/packages. You decide which fits. Use relative paths (./file.txt). \
+{tool_count} tools available. Explain when elevated permissions are needed."
         );
 
         Some(ContextFragment {

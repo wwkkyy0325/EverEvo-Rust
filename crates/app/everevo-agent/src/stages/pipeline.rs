@@ -9,6 +9,8 @@
 //!   0: AgentCharacter   — the agent's OWN voice / speaking style
 //!   1: Persona          — user communication style + thinking paradigm
 //!   2: BestPractices    — verification, planning, code quality rules
+//!   2: AnswerDiscipline — final-answer marker, verbatim fidelity, constraint & candidate checks
+//!   2: EvidenceChecklist — ECLoop-style pre-commit evidence checklist + deterministic verifier gate
 //!   2: Skill            — loaded SKILL.md instructions
 //!   3: TaskState        — current TodoWrite task list (from default_pipeline)
 //!   3: Memory           — relevant memory facts (RRF-ranked)
@@ -23,11 +25,11 @@ use std::sync::Arc;
 
 use everevo_core::context::{default_pipeline, ContextPipeline};
 
-use crate::skill::SkillRegistry;
 use super::{
-    AgentCharacterStage, BestPracticesStage, DomainKnowledgeStage,
-    MemoryStage, PersonaStage, SkillStage,
+    AgentCharacterStage, AnswerDisciplineStage, BestPracticesStage, DomainKnowledgeStage,
+    EvidenceChecklistStage, MemoryStage, PersonaStage, SkillStage,
 };
+use crate::skill::SkillRegistry;
 
 /// Build the complete production context pipeline with all 11 stages.
 ///
@@ -55,6 +57,16 @@ pub fn build_full_pipeline(
 
     // Priority 2 — verification, planning, code quality rules
     pipeline = pipeline.with_stage(BestPracticesStage);
+
+    // Priority 2 — answer-output discipline (final-answer marker, verbatim
+    // fidelity, constraint enumeration, candidate verification). Stable-sorts
+    // right after BestPractices, before skills.
+    pipeline = pipeline.with_stage(AnswerDisciplineStage);
+
+    // Priority 2 — verifier-gated commit (ECLoop-style evidence checklist:
+    // pre-declare the constraints, verify each deterministically, then commit).
+    // Stable-sorts right after AnswerDiscipline, before skills.
+    pipeline = pipeline.with_stage(EvidenceChecklistStage);
 
     // Priority 2 — loaded SKILL.md instructions
     pipeline = pipeline.with_stage(SkillStage::new(skill_registry));

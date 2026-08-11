@@ -80,12 +80,8 @@ impl ProcessPool {
 
         // Spawn a new process
         tracing::debug!(%key, path = %exe_path.display(), "Spawning plugin process");
-        let client = McpClient::connect_stdio(
-            &exe_path.to_string_lossy(),
-            &[],
-            &HashMap::new(),
-        )
-        .await?;
+        let client =
+            McpClient::connect_stdio(&exe_path.to_string_lossy(), &[], &HashMap::new()).await?;
         let client = Arc::new(Mutex::new(client));
 
         Ok(client)

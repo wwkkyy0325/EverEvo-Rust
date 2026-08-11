@@ -36,7 +36,8 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TodoItem {
     pub content: String, // imperative: "Run the tests"
-    pub status: String,  // "pending" | "in_progress" | "completed"
+    // "pending" | "in_progress" | "completed" | "failed" | "skipped" | "deferred"
+    pub status: String,
     #[serde(rename = "activeForm")]
     pub active_form: String, // present continuous: "Running the tests"
 }
@@ -129,12 +130,15 @@ impl Tool for TodoWriteTool {
     fn description(&self) -> &str {
         "Use this tool to create and manage a structured task list. Track progress, \
          organize complex tasks, and demonstrate thoroughness. Use proactively for \
-         multi-step tasks. Each todo needs: content (imperative form), status \
-         (pending/in_progress/completed), activeForm (present continuous form). \
-         Only ONE task in_progress at a time. Mark complete IMMEDIATELY after finishing. \
-         Use scope='global' for long-running project tasks that should persist across \
-         conversations (new sessions will see them); scope='session' (default) for the \
-         current conversation only."
+         multi-step tasks. Each todo needs: content (imperative form), status, \
+         activeForm (present continuous form). Status is one of: pending (待执行), \
+         in_progress (执行中), completed (已完成), failed (失败), skipped (跳过), \
+         deferred (暂缓). Only ONE task in_progress at a time. Mark complete \
+         IMMEDIATELY after finishing. On failure, mark the item 'failed' with the \
+         reason folded into its content or activeForm. Items can be appended to or \
+         edited by resending the full list. Use scope='global' for long-running \
+         project tasks that should persist across conversations (new sessions will \
+         see them); scope='session' (default) for the current conversation only."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -153,7 +157,7 @@ impl Tool for TodoWriteTool {
                             },
                             "status": {
                                 "type": "string",
-                                "enum": ["pending", "in_progress", "completed"],
+                                "enum": ["pending", "in_progress", "completed", "failed", "skipped", "deferred"],
                                 "description": "Current task status"
                             },
                             "activeForm": {
@@ -225,19 +229,141 @@ impl Tool for TodoWriteTool {
 
         let new_todos = store.get(&session_id).cloned().unwrap_or_default();
 
+        let count = |status: &str| new_todos.iter().filter(|t| t.status == status).count();
+        let total = new_todos.len();
+        let completed = count("completed");
+        let in_progress = count("in_progress");
+        let pending = count("pending");
+        let failed = count("failed");
+        let skipped = count("skipped");
+        let deferred = count("deferred");
+        // Keep the summary compact — list non-zero status buckets only.
+        let mut buckets = vec![];
+        if pending > 0 {
+            buckets.push(format!("{pending} pending"));
+        }
+        if in_progress > 0 {
+            buckets.push(format!("{in_progress} in_progress"));
+        }
+        if completed > 0 {
+            buckets.push(format!("{completed} completed"));
+        }
+        if failed > 0 {
+            buckets.push(format!("{failed} failed"));
+        }
+        if skipped > 0 {
+            buckets.push(format!("{skipped} skipped"));
+        }
+        if deferred > 0 {
+            buckets.push(format!("{deferred} deferred"));
+        }
+
         Ok(ToolOutput {
             content: format!(
-                "Todo list updated. {} items ({} completed, {} in progress, {} pending).",
-                new_todos.len(),
-                new_todos.iter().filter(|t| t.status == "completed").count(),
-                new_todos
-                    .iter()
-                    .filter(|t| t.status == "in_progress")
-                    .count(),
-                new_todos.iter().filter(|t| t.status == "pending").count(),
+                "Todo list updated. {} items ({}).",
+                total,
+                if buckets.is_empty() {
+                    "empty".to_string()
+                } else {
+                    buckets.join(", ")
+                },
             ),
             is_error: false,
             ..Default::default()
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ALL_STATUSES: &[&str] = &[
+        "pending",
+        "in_progress",
+        "completed",
+        "failed",
+        "skipped",
+        "deferred",
+    ];
+
+    #[test]
+    fn schema_enum_covers_all_six_statuses() {
+        let tool = TodoWriteTool::new(new_todo_store());
+        let schema = tool.parameters_schema();
+        let status_enum = schema["properties"]["todos"]["items"]["properties"]["status"]["enum"]
+            .as_array()
+            .expect("status must have an enum");
+        let enum_vals: Vec<&str> = status_enum.iter().map(|v| v.as_str().unwrap()).collect();
+        for s in ALL_STATUSES {
+            assert!(enum_vals.contains(s), "schema enum missing {s}");
+        }
+        assert_eq!(enum_vals.len(), ALL_STATUSES.len());
+    }
+
+    #[tokio::test]
+    async fn execute_counts_all_status_buckets() {
+        let store = new_todo_store();
+        let tool = TodoWriteTool::new(store.clone()).with_session_id(Uuid::nil());
+        let list: Vec<serde_json::Value> = ALL_STATUSES
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                serde_json::json!({
+                    "content": format!("task {i}"),
+                    "status": s,
+                    "activeForm": format!("working {i}"),
+                })
+            })
+            .collect();
+        let params = serde_json::json!({ "todos": list, "scope": "session" });
+
+        let out = tool.execute(params, None).await.expect("execute ok");
+        assert!(!out.is_error);
+        for s in ALL_STATUSES {
+            assert!(
+                out.content.contains(&format!("1 {s}")),
+                "summary should mention '1 {s}', got: {}",
+                out.content
+            );
+        }
+        // Store should hold the full list (session-scoped, keyed by nil = default).
+        let stored = store.read().await;
+        let items = stored.get(&Uuid::nil()).expect("todos stored");
+        assert_eq!(items.len(), ALL_STATUSES.len());
+    }
+
+    #[tokio::test]
+    async fn dynamic_append_replaces_previous_list() {
+        let store = new_todo_store();
+        let tool = TodoWriteTool::new(store.clone()).with_session_id(Uuid::nil());
+
+        // First write: 2 items
+        let first = serde_json::json!({
+            "todos": [
+                {"content": "a", "status": "in_progress", "activeForm": "doing a"},
+                {"content": "b", "status": "pending", "activeForm": "doing b"}
+            ],
+            "scope": "session"
+        });
+        tool.execute(first, None).await.expect("first write ok");
+
+        // Append a third item + flip b → deferred (dynamic modify).
+        let second = serde_json::json!({
+            "todos": [
+                {"content": "a", "status": "completed", "activeForm": "doing a"},
+                {"content": "b", "status": "deferred", "activeForm": "doing b"},
+                {"content": "c", "status": "pending", "activeForm": "doing c"}
+            ],
+            "scope": "session"
+        });
+        let out = tool.execute(second, None).await.expect("second write ok");
+        assert!(out.content.contains("1 deferred"), "got: {}", out.content);
+
+        let stored = store.read().await;
+        let items = stored.get(&Uuid::nil()).expect("todos stored");
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[1].status, "deferred");
+        assert_eq!(items[0].status, "completed");
     }
 }

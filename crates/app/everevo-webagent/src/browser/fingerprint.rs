@@ -23,7 +23,7 @@ pub struct Fingerprint {
     pub avail_height: u32,
     pub color_depth: u32,
     pub pixel_depth: u32,
-    pub device_memory: u32,     // GB
+    pub device_memory: u32, // GB
     pub hardware_concurrency: u32,
     pub timezone: &'static str,
     pub language: &'static str,
@@ -131,13 +131,22 @@ pub fn fingerprint_injection_js(fp: &Fingerprint) -> String {
     }};
   }} catch(e) {{}}
 }})()"#,
-        fp.platform, fp.vendor,
+        fp.platform,
+        fp.vendor,
         fp.language,
-        fp.languages.iter().map(|l| format!("\"{l}\"")).collect::<Vec<_>>().join(","),
-        fp.hardware_concurrency, fp.device_memory,
-        fp.screen_width, fp.screen_height,
-        fp.avail_width, fp.avail_height,
-        fp.color_depth, fp.pixel_depth,
+        fp.languages
+            .iter()
+            .map(|l| format!("\"{l}\""))
+            .collect::<Vec<_>>()
+            .join(","),
+        fp.hardware_concurrency,
+        fp.device_memory,
+        fp.screen_width,
+        fp.screen_height,
+        fp.avail_width,
+        fp.avail_height,
+        fp.color_depth,
+        fp.pixel_depth,
         fp.timezone,
     )
 }
@@ -150,7 +159,10 @@ mod tests {
     fn test_profiles_consistent() {
         for (i, fp) in PROFILES.iter().enumerate() {
             assert!(!fp.user_agent.is_empty(), "profile {i}: empty UA");
-            assert!(fp.screen_width >= fp.avail_width, "profile {i}: invalid screen/avail");
+            assert!(
+                fp.screen_width >= fp.avail_width,
+                "profile {i}: invalid screen/avail"
+            );
             assert!(fp.languages.len() >= 1, "profile {i}: no languages");
         }
     }

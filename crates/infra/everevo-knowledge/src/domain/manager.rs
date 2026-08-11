@@ -265,6 +265,93 @@ pub struct InboxResult {
     pub new_domains: Vec<String>,
 }
 
+// ── Tests ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use everevo_vector::{DummyEmbedder, EmbeddingModel};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn setup_domain_root() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("inbox")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_process_empty_inbox() {
+        let dir = setup_domain_root();
+        // Empty inbox — scan should return nothing
+        let inbox = dir.path().join("inbox");
+        let reg_path = dir.path().join("domains.json");
+        let mut watcher = DomainWatcher::new(&inbox, &reg_path).unwrap();
+        let files = watcher.scan().unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_list_documents_empty_domain() {
+        let dir = setup_domain_root();
+        let mgr = DomainManager::load(dir.path()).unwrap();
+        let docs = mgr.list_documents("nonexistent").unwrap();
+        assert!(docs.is_empty());
+    }
+
+    #[test]
+    fn test_coverage_stats() {
+        let dir = setup_domain_root();
+        let mut mgr = DomainManager::load(dir.path()).unwrap();
+        // Manually create a domain for coverage testing
+        mgr.registry.create(
+            "test-cov".into(),
+            "Test Coverage".into(),
+            "Coverage test".into(),
+        );
+        mgr.save().unwrap();
+
+        let coverage = mgr.coverage();
+        assert!(coverage.iter().any(|c| c.domain_id == "test-cov"));
+        let cov = coverage.iter().find(|c| c.domain_id == "test-cov").unwrap();
+        assert_eq!(cov.document_count, 0);
+        assert!(cov.is_new); // < 3 docs
+    }
+
+    #[test]
+    fn test_domain_manager_load_and_save() {
+        let dir = setup_domain_root();
+        {
+            let mut mgr = DomainManager::load(dir.path()).unwrap();
+            mgr.registry.create(
+                "load-test".into(),
+                "Load Test".into(),
+                "Testing load".into(),
+            );
+            mgr.save().unwrap();
+        }
+        {
+            let mgr = DomainManager::load(dir.path()).unwrap();
+            assert!(mgr.registry.domains.contains_key("load-test"));
+        }
+    }
+
+    #[test]
+    fn test_domain_manager_with_dummy_embedder() {
+        let dir = setup_domain_root();
+        let embedder: Arc<dyn EmbeddingModel> = Arc::new(DummyEmbedder::new(384));
+        let mgr = DomainManager::load_with_embedder(dir.path(), Some(embedder)).unwrap();
+        assert!(mgr.embedder().is_some());
+    }
+
+    #[test]
+    fn test_domain_manager_without_embedder() {
+        let dir = setup_domain_root();
+        let mgr = DomainManager::load(dir.path()).unwrap();
+        assert!(mgr.embedder().is_none());
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DomainCoverage {
     pub domain_id: String,

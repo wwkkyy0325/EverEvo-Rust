@@ -2,10 +2,10 @@
 
 use std::convert::Infallible;
 
+use super::helpers::resolve_permission;
 use axum::response::sse::Event;
 use tokio::sync::mpsc;
 use uuid::Uuid;
-use super::helpers::resolve_permission;
 
 use crate::app_state::AppState;
 
@@ -15,7 +15,11 @@ pub(super) async fn handle_character_command(
     args: &str,
 ) -> String {
     let path = state
-        .config.data_dir.join("memory").join("agent").join("character.json");
+        .config
+        .data_dir
+        .join("memory")
+        .join("agent")
+        .join("character.json");
     if args.trim() == "sync" {
         let llm_opt = {
             let guard = state.llm.read().await;
@@ -70,12 +74,18 @@ pub(super) async fn handle_plan_command(
         "Plan mode cancelled. Normal operations resumed.".to_string()
     } else {
         state
-            .plan_mode_sessions.write().await
+            .plan_mode_sessions
+            .write()
+            .await
             .insert(session_id, "semi_auto".to_string());
-        let _ = tx.send(Ok(Event::default()
-            .event("plan_mode_entered")
-            .json_data(serde_json::json!({"session_id": session_id.to_string(), "task": plan_task}))
-            .unwrap_or_else(|_| Event::default().event("error")))).await;
+        let _ = tx
+            .send(Ok(Event::default()
+                .event("plan_mode_entered")
+                .json_data(
+                    serde_json::json!({"session_id": session_id.to_string(), "task": plan_task}),
+                )
+                .unwrap_or_else(|_| Event::default().event("error"))))
+            .await;
         tracing::info!(%session_id, task = plan_task, "Plan mode entered via /plan command");
         if plan_task.is_empty() {
             "Plan mode entered via /plan. Explore the codebase, design an approach, \

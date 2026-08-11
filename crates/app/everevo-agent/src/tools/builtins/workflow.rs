@@ -90,10 +90,7 @@ impl WorkflowTool {
 
     /// Wire the result sender so sub-agent results flow back to the main loop
     /// via subagent_rx (same channel TaskTool uses).
-    pub fn with_result_tx(
-        mut self,
-        tx: tokio::sync::mpsc::UnboundedSender<String>,
-    ) -> Self {
+    pub fn with_result_tx(mut self, tx: tokio::sync::mpsc::UnboundedSender<String>) -> Self {
         self.result_tx = Some(tx);
         self
     }
@@ -306,9 +303,11 @@ impl Tool for WorkflowTool {
                     .push(summary.clone());
                 // Push into shared backlog so auto-continue can see it
                 if let Some(ref bl) = shared_backlog {
-                    bl.lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push((task_id_str.clone(), desc.clone(), summary));
+                    bl.lock().unwrap_or_else(|e| e.into_inner()).push((
+                        task_id_str.clone(),
+                        desc.clone(),
+                        summary,
+                    ));
                 }
                 pending_c.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 if let Some(ref sp) = shared_pending {

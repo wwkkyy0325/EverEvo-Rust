@@ -11,11 +11,11 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
-use everevo_core::ApiError;
-use everevo_knowledge::domain::{DocumentParser, Domain, DomainManager};
 use everevo_core::llm::LlmProvider;
 use everevo_core::retrieval::Retriever;
+use everevo_core::ApiError;
 use everevo_core::EverEvoError;
+use everevo_knowledge::domain::{DocumentParser, Domain, DomainManager};
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -30,7 +30,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/rag/ingest", post(rag_ingest))
         // Memory fact management (full CRUD — list/create/get/update/delete)
         .route("/api/memory/facts", get(list_facts).post(create_fact))
-        .route("/api/memory/facts/{name}", get(get_fact).put(update_fact).delete(delete_fact))
+        .route(
+            "/api/memory/facts/{name}",
+            get(get_fact).put(update_fact).delete(delete_fact),
+        )
 }
 
 // ── Request / Response types ──────────────────────────────────────────
@@ -420,6 +423,8 @@ async fn create_fact(
         updated_at: now,
         projection: everevo_core::memory::ProjectionMetadata::new("1.0", "api", vec![], 1.0),
         links: vec![],
+        // Domain docs are cross-session knowledge — global tier.
+        session: Some("global".into()),
     };
     state
         .fact_manager
@@ -476,6 +481,7 @@ async fn update_fact(
         updated_at: chrono::Utc::now(),
         projection: existing.projection,
         links: existing.links,
+        session: existing.session,
     };
     state
         .fact_manager
@@ -484,7 +490,9 @@ async fn update_fact(
     Ok(Json(serde_json::json!({ "updated": name })))
 }
 
-async fn list_facts(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>, ApiError> {
+async fn list_facts(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let facts = state
         .fact_manager
         .load_all()
@@ -500,7 +508,9 @@ async fn list_facts(State(state): State<Arc<AppState>>) -> Result<Json<serde_jso
             })
         })
         .collect();
-    Ok(Json(serde_json::json!({ "data": { "facts": items, "total": items.len() } })))
+    Ok(Json(
+        serde_json::json!({ "data": { "facts": items, "total": items.len() } }),
+    ))
 }
 
 async fn delete_fact(
@@ -511,7 +521,9 @@ async fn delete_fact(
         .fact_manager
         .delete(&name)
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(Json(serde_json::json!({ "data": { "deleted": true, "name": name } })))
+    Ok(Json(
+        serde_json::json!({ "data": { "deleted": true, "name": name } }),
+    ))
 }
 
 /// Build an LLM prompt for generating a domain description.
@@ -523,4 +535,3 @@ fn build_domain_description_prompt(name: &str, doc_count: usize) -> String {
          no prefixes, no quotes."
     )
 }
-

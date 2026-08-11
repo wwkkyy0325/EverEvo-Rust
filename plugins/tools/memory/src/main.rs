@@ -9,7 +9,21 @@ use std::path::PathBuf;
 static FACTS_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 fn facts_dir() -> &'static PathBuf {
-    FACTS_DIR.get().expect("facts_dir not initialized — MCP initialize must be called first")
+    FACTS_DIR.get_or_init(|| {
+        // Priority: 1) MCP initialize factsDir param, 2) EVEREVO_FACTS_DIR env,
+        // 3) fallback to ./data/memory-facts relative to cwd.
+        if let Ok(dir) = std::env::var("EVEREVO_FACTS_DIR") {
+            let p = PathBuf::from(&dir);
+            let _ = std::fs::create_dir_all(&p);
+            return p;
+        }
+        let default = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("data")
+            .join("memory-facts");
+        let _ = std::fs::create_dir_all(&default);
+        default
+    })
 }
 
 fn main() {
@@ -118,4 +132,103 @@ fn list_facts() -> Result<String, String> {
     }
     facts.sort();
     Ok(format!("{} facts: {}", facts.len(), facts.join(", ")))
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::LazyLock;
+    use tempfile::TempDir;
+
+    /// A single shared temp directory for all memory plugin tests.
+    /// `FACTS_DIR` is a process-level `OnceLock` — once set, it never changes.
+    /// We use a `LazyLock` to create one shared directory for all tests.
+    static TEST_DIR: LazyLock<TempDir> = LazyLock::new(|| TempDir::new().unwrap());
+
+    fn init_test_env() {
+        std::env::set_var(
+            "EVEREVO_FACTS_DIR",
+            TEST_DIR.path().to_string_lossy().as_ref(),
+        );
+        // Clear previous test artifacts
+        let dir = TEST_DIR.path();
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn test_list_empty() {
+        init_test_env();
+        let result = list_facts().unwrap();
+        // When dir exists but is empty, list returns "N facts: " with N=0
+        assert!(result.contains("0 facts"), "Expected '0 facts' in: {result}");
+    }
+
+    #[test]
+    fn test_save_and_list() {
+        init_test_env();
+        save_fact("test-fact", "A test description", "Some content here").unwrap();
+        let result = list_facts().unwrap();
+        assert!(result.contains("test-fact"), "Expected 'test-fact' in: {result}");
+    }
+
+    #[test]
+    fn test_search_finds_match() {
+        init_test_env();
+        save_fact("unique-search", "Search test", "The quick brown fox jumps over the lazy dog").unwrap();
+        let result = search_facts("brown fox").unwrap();
+        assert!(result.contains("unique-search"), "Expected 'unique-search' in: {result}");
+    }
+
+    #[test]
+    fn test_search_no_match() {
+        init_test_env();
+        save_fact("only-fact", "Only fact", "hello world").unwrap();
+        let result = search_facts("nonexistent-xyz").unwrap();
+        assert!(result.contains("No facts matching"), "Expected 'No facts matching' in: {result}");
+    }
+
+    #[test]
+    fn test_duplicate_save_overwrites() {
+        init_test_env();
+        save_fact("dup", "First save", "content v1").unwrap();
+        save_fact("dup", "Second save", "content v2").unwrap();
+
+        let result = list_facts().unwrap();
+        // Should only appear once in list
+        let count = result.matches("dup").count();
+        assert_eq!(count, 1, "Duplicate fact should only appear once, found {count}");
+
+        // The file content should contain the second save's data
+        let path = TEST_DIR.path().join("dup.md");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("content v2"), "File should contain second save's content");
+    }
+
+    #[test]
+    fn test_save_creates_markdown_frontmatter() {
+        init_test_env();
+        save_fact("fmt-test", "Format test desc", "Body content here").unwrap();
+
+        let path = TEST_DIR.path().join("fmt-test.md");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("---"));
+        assert!(content.contains("name: fmt-test"));
+        assert!(content.contains("description: Format test desc"));
+        assert!(content.contains("Body content here"));
+    }
+
+    #[test]
+    fn test_search_case_insensitive() {
+        init_test_env();
+        save_fact("case-test", "Case test", "UPPERCASE CONTENT lower").unwrap();
+        let r1 = search_facts("uppercase").unwrap();
+        let r2 = search_facts("UPPERCASE").unwrap();
+        let r3 = search_facts("UpPeRcAsE").unwrap();
+        assert!(r1.contains("case-test"));
+        assert!(r2.contains("case-test"));
+        assert!(r3.contains("case-test"));
+    }
 }

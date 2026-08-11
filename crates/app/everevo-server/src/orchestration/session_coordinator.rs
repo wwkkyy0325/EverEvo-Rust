@@ -39,10 +39,8 @@ use everevo_agent::tools::builtins::{SubAgentHandle, SubAgentStatus};
 
 /// Receivers extracted from `SessionCoordinator::new()` — consumed by chat.rs.
 pub struct SessionReceivers {
-    pub sse_rx:
-        mpsc::Receiver<Result<axum::response::sse::Event, std::convert::Infallible>>,
-    pub confirm_rx:
-        mpsc::UnboundedReceiver<crate::app_state::ConfirmationNotification>,
+    pub sse_rx: mpsc::Receiver<Result<axum::response::sse::Event, std::convert::Infallible>>,
+    pub confirm_rx: mpsc::UnboundedReceiver<crate::app_state::ConfirmationNotification>,
 }
 
 #[derive(Clone)]
@@ -78,9 +76,7 @@ impl SessionCoordinator {
     /// Returns (coordinator, sse_rx, confirm_rx).
     /// The receivers are consumed by chat.rs; the coordinator is passed through
     /// AssembledTools and back to chat.rs for the AgentLoop.
-    pub fn new(
-        session_id: Uuid,
-    ) -> (Self, SessionReceivers) {
+    pub fn new(session_id: Uuid) -> (Self, SessionReceivers) {
         let (tx_sse, sse_rx) = mpsc::channel(256);
         let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
 

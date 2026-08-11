@@ -14,6 +14,7 @@
 //! | `subagent_context` | Sub-agent context assembly |
 
 pub mod code_search;
+pub mod context;
 pub mod llm;
 pub mod llmwiki;
 pub mod loop_;
@@ -52,9 +53,9 @@ pub use tools::build_registry;
 // ── Server integration surface ────────────────────────────────────────────
 // These types are consumed by everevo-server. Breaking changes here may
 // require coordinated server updates.
-pub use memory::facts::FactManager;
 pub use memory::diary::DiaryManager;
 pub use memory::engine::DreamingEngine;
+pub use memory::facts::FactManager;
 pub use memory::scheduler::DreamingScheduler;
 pub use skill::SkillRegistry;
 pub use subagent_context::SubAgentContext;

@@ -16,7 +16,9 @@ pub fn sanitize_url(url: &str) -> Result<String, String> {
 
     // Extract host manually (avoid url crate dependency).
     // Format: http(s)://host[:port][/path]
-    let after_scheme = url.strip_prefix("https://").unwrap_or_else(|| url.strip_prefix("http://").unwrap_or(url));
+    let after_scheme = url
+        .strip_prefix("https://")
+        .unwrap_or_else(|| url.strip_prefix("http://").unwrap_or(url));
     let host = match after_scheme.find('/') {
         Some(pos) => &after_scheme[..pos],
         None => after_scheme,
@@ -174,10 +176,7 @@ mod tests {
 
     #[test]
     fn test_html_to_text_strips_tags() {
-        assert_eq!(
-            html_to_text("<h1>Hello</h1><p>World</p>"),
-            "Hello World"
-        );
+        assert_eq!(html_to_text("<h1>Hello</h1><p>World</p>"), "Hello World");
     }
 
     #[test]

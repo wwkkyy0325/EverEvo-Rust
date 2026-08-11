@@ -367,9 +367,12 @@ async fn workspace_get_returns_path() {
 async fn workspace_put_invalid_rejects() {
     let (app, _) = setup().await;
     let (status, _body) = send(
-        &app, Method::PUT, "/api/workspace",
+        &app,
+        Method::PUT,
+        "/api/workspace",
         Some(json!({"path": "/nonexistent/path/xyz123"})),
-    ).await;
+    )
+    .await;
     assert!(status.is_client_error() || status == 200);
 }
 
@@ -405,9 +408,12 @@ async fn character_get_returns_profile() {
 async fn character_put_empty_name_rejects() {
     let (app, _) = setup().await;
     let (status, _body) = send(
-        &app, Method::PUT, "/api/character",
+        &app,
+        Method::PUT,
+        "/api/character",
         Some(json!({"name": "", "style": "test"})),
-    ).await;
+    )
+    .await;
     assert!(status.is_client_error());
 }
 
@@ -425,9 +431,12 @@ async fn models_list_returns_array() {
 async fn models_activate_unknown_handled_gracefully() {
     let (app, _) = setup().await;
     let (status, _body) = send(
-        &app, Method::POST, "/api/models/activate",
+        &app,
+        Method::POST,
+        "/api/models/activate",
         Some(json!({"model": "nonexistent-model-xyz"})),
-    ).await;
+    )
+    .await;
     // With empty model registry, this may return 200 with error or 500
     // The key is that the server doesn't crash
     assert!(status.as_u16() > 0);
@@ -495,7 +504,8 @@ async fn config_verify_without_llm_reports_not_ok() {
 async fn not_found_returns_api_error_envelope() {
     let (app, _) = setup().await;
     let (status, body) = ok!(
-        &app, GET,
+        &app,
+        GET,
         "/api/sessions/00000000-0000-0000-0000-000000000000"
     );
     // Now returns proper ApiError envelope

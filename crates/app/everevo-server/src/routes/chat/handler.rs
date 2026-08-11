@@ -29,9 +29,7 @@ use uuid::Uuid;
 use crate::app_state::AppState;
 use crate::orchestration::{self, ContentBlockStreamer};
 
-use super::helpers::{
-    detect_git, discover_workspace_context, truncate_for_title,
-};
+use super::helpers::{detect_git, discover_workspace_context, truncate_for_title};
 use super::post_turn::spawn_post_turn_tasks;
 use super::reconnect::handle_reconnect;
 use super::slash_commands::{
@@ -55,9 +53,7 @@ async fn handler(
         {
             Ok(Ok(())) => {} // normal completion
             Ok(Err(e)) => {
-                let _ = tx
-                    .send(Ok(Event::default().event("error").data(e)))
-                    .await;
+                let _ = tx.send(Ok(Event::default().event("error").data(e))).await;
             }
             Err(panic) => {
                 let msg = panic_message(&panic);
@@ -89,6 +85,15 @@ async fn handle_chat(
         orchestration::resolve_session(&state, req.session_id, &req.message)
             .await
             .map_err(|e| e.message)?;
+
+    // Durable rolling summary (spec D3) — injected before the history window.
+    // Best-effort: a DB error just means no summary this turn.
+    let rolling_summary = state
+        .db
+        .get_session_context(session_id)
+        .await
+        .ok()
+        .and_then(|(s, _wm)| s);
 
     // ── 1.5. Slash command dispatch ──────────────────────────────────
     let effective_message = if let Some((cmd, args)) = state.commands.parse(&req.message) {
@@ -177,12 +182,8 @@ async fn handle_chat(
                     .await;
                 format!("## Current Configuration\n\n{status}")
             }
-            "character" => {
-                handle_character_command(&state, tx, args).await
-            }
-            "plan" => {
-                handle_plan_command(&state, session_id, tx, args).await
-            }
+            "character" => handle_character_command(&state, tx, args).await,
+            "plan" => handle_plan_command(&state, session_id, tx, args).await,
             "tasks" => {
                 let todos = state.todo_store.read().await;
                 let items = todos.get(&session_id);
@@ -251,9 +252,7 @@ async fn handle_chat(
                     .await;
                 status
             }
-            "workspace" => {
-                handle_workspace_command(&state, session_id, tx, args).await
-            }
+            "workspace" => handle_workspace_command(&state, session_id, tx, args).await,
             _ => req.message.clone(),
         }
     } else {
@@ -261,7 +260,7 @@ async fn handle_chat(
     };
 
     // ── 1.5 Start telemetry trace for this session ──────────────────
-    let trace = state.telemetry.start_trace(session_id);
+    let trace = state.telemetry_pipeline.start_trace(session_id);
     let trace_id = trace.as_ref().map(|t| t.trace_id);
 
     // ── 3. Build context via pipeline ─────────────────────────────────
@@ -278,8 +277,10 @@ async fn handle_chat(
             })
             .unwrap_or_default()
     };
-    // Tool count: MCP tools (known at build time) + per-session assembled tools.
-    // The exact total is determined during assemble() — this is a lower-bound estimate.
+    // Tool count: MCP tools (known at build time) + base estimate of
+    // bootstrap (6) + in-process (~17) = 23. The exact total is determined
+    // during assemble() — the system prompt shows this estimate, while the
+    // actual tool schemas sent to the LLM reflect the real count.
     let mcp_tool_count: usize = state
         .mcp_clients
         .read()
@@ -287,7 +288,8 @@ async fn handle_chat(
         .values()
         .filter_map(|c| c.try_lock().ok().map(|g| g.tools.len()))
         .sum();
-    let tool_count = mcp_tool_count;
+    let base_tool_count: usize = 23; // 6 bootstrap + ~17 in-process (always registered)
+    let tool_count = base_tool_count + mcp_tool_count;
     // Use per-session sandbox work_dir (may be workspace or sandbox default)
     let workspace_path = {
         let sandboxes = state.sandboxes.read().await;
@@ -386,6 +388,7 @@ async fn handle_chat(
             report.as_ref().map(|r| r.fail == 0).unwrap_or(false)
         },
         hook_feedback: None,
+        summary: rolling_summary,
     };
     let persona_profile_path = state
         .config
@@ -399,7 +402,7 @@ async fn handle_chat(
         .join("memory")
         .join("agent")
         .join("character.json");
-    let memory_stage = state.build_memory_stage(trace_id);
+    let memory_stage = state.build_memory_stage(session_id, trace_id);
     let domain_root = state.config.data_dir.join("domain");
     let domain_stage = everevo_agent::DomainKnowledgeStage::new(&domain_root).with_max_docs(3);
 
@@ -443,10 +446,16 @@ async fn handle_chat(
     // Inherit parent session's permission level for sub-agents.
     sub_ctx.permission_level = Some(permission_level.clone());
 
-    // Inject T1 memory context for sub-agents (≤400 chars)
+    // Inject T1 memory context for sub-agents (≤400 chars).
+    // Session-filtered: sub-agents of this session must not see other sessions'
+    // working memory (分层记忆 strict isolation).
     if let Ok(t1) = state.fact_manager.load_tier1() {
-        if !t1.is_empty() {
-            let lines: Vec<String> = t1
+        let t1_visible: Vec<_> = t1
+            .into_iter()
+            .filter(|f| everevo_agent::memory::facts::fact_visible_to(f, Some(&session_id)))
+            .collect();
+        if !t1_visible.is_empty() {
+            let lines: Vec<String> = t1_visible
                 .iter()
                 .take(5)
                 .map(|f| format!("- {} — {}", f.name, f.description))
@@ -521,10 +530,10 @@ async fn handle_chat(
     drop(guard);
 
     let client = client.ok_or_else(|| "未配置 LLM".to_string())?;
+    let client_for_tokens = Arc::clone(&client); // Clone before agent.run() moves it
 
     // ── 6. Build per-session data flow + tool registry ──────────────
-    let (mut coord, mut receivers) =
-        crate::orchestration::SessionCoordinator::new(session_id);
+    let (mut coord, mut receivers) = crate::orchestration::SessionCoordinator::new(session_id);
 
     state
         .session_actors
@@ -567,13 +576,37 @@ async fn handle_chat(
     let client_for_autocontinue = Arc::clone(&client);
     let tools_for_autocontinue = Arc::clone(&tools);
     let proactivity = Arc::new(std::sync::Mutex::new(everevo_agent::ProactivityState::new()));
+
+    // Compaction model routing (decision 1): the configured compact model
+    // (`compactModelId`) when present, else the main model — "有哪个用哪个".
+    let (compact_arc, compact_window) = {
+        let c = state.compact_llm.read().await;
+        match c.as_ref() {
+            Some(r) => (
+                Some(Arc::clone(&r.client) as Arc<dyn everevo_core::llm::LlmProvider>),
+                r.context_window,
+            ),
+            None => (
+                Some(Arc::clone(&client) as Arc<dyn everevo_core::llm::LlmProvider>),
+                None,
+            ),
+        }
+    };
+    // Meta-agent background work reuses the compaction model when configured,
+    // else the main model (existing pipeline, unchanged behavior otherwise).
+    let meta_llm = {
+        let c = state.compact_llm.read().await;
+        c.as_ref()
+            .map(|r| Arc::clone(&r.client))
+            .unwrap_or_else(|| Arc::clone(&client))
+    };
     let meta_agent = Arc::new(std::sync::Mutex::new(
         everevo_agent::memory::MetaAgentState::new(
-            Some(Arc::clone(&client)),
+            Some(meta_llm),
             Some(state.fact_manager.clone()),
         ),
     ));
-    let agent = everevo_agent::AgentLoop::main_session(
+    let mut agent = everevo_agent::AgentLoop::main_session(
         subagent_rx,
         coord.pending.clone(),
         coord.cancel.clone(),
@@ -581,7 +614,41 @@ async fn handle_chat(
         Arc::clone(&proactivity),
     )
     .with_meta_agent(Arc::clone(&meta_agent))
-    .with_hook_feedback(assembled.hook_feedback.clone());
+    .with_hook_feedback(assembled.hook_feedback.clone())
+    .with_compact_llm(compact_arc.clone());
+    // Layer-1 background rolling-summary maintenance (spec D3): runs at soft
+    // threshold turn boundaries without blocking the main loop.
+    agent = agent.with_background_maintenance(compact_arc.as_ref().map(|llm| {
+        Arc::new(everevo_agent::context::BackgroundMaintenance {
+            db: state.db.clone(),
+            session_id,
+            llm: Arc::clone(llm),
+            ctx_window: compact_window,
+            in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+    }));
+    // Phase 8 (spec deliverable 6): page large tool outputs to
+    // data/sessions/<id>/tool_cache/ so the context keeps only a 2KB preview.
+    // The full text stays reachable via the `tool_cache_read` tool.
+    agent = agent.with_tool_cache_dir(Some(
+        state
+            .config
+            .data_dir
+            .join("sessions")
+            .join(session_id.to_string())
+            .join("tool_cache"),
+    ));
+    if let Some(tid) = trace_id {
+        agent = agent.with_telemetry(state.telemetry_pipeline.clone(), tid);
+    }
+    // Benchmark mode: cap the ReAct loop so a question that cannot be verified
+    // (blocked web / junk search results from the host network) is still forced
+    // to commit to a final answer instead of churning tools until the
+    // wall-clock cap. The loop injects a "provide your final answer now"
+    // reminder two turns before the limit.
+    if std::env::var("EVEREVO_BENCHMARK").is_ok() {
+        agent = agent.with_max_turns(20);
+    }
     let mut agent_rx = agent.run(client, tools, messages, None).await;
 
     let assistant_id = Uuid::new_v4();
@@ -740,13 +807,19 @@ async fn handle_chat(
             }
 
             // ── Restart AgentLoop with updated messages ──
-            let agent2 = everevo_agent::AgentLoop::new()
+            let mut agent2 = everevo_agent::AgentLoop::new()
                 .with_pending_subagents(Arc::clone(&pending_for_autocontinue))
                 .with_cancel_token(coord.cancel.clone())
                 .with_compact_focus(coord.compact_focus.clone())
                 .with_proactivity(Arc::clone(&proactivity))
                 .with_meta_agent(Arc::clone(&meta_agent))
                 .with_hook_feedback(assembled.hook_feedback.clone());
+            if let Some(tid) = trace_id {
+                agent2 = agent2.with_telemetry(state.telemetry_pipeline.clone(), tid);
+            }
+            if std::env::var("EVEREVO_BENCHMARK").is_ok() {
+                agent2 = agent2.with_max_turns(20);
+            }
             let resumed_msgs = messages_for_autocontinue.clone();
             let mut agent_rx2 = agent2
                 .run(
@@ -807,6 +880,7 @@ async fn handle_chat(
     }
 
     // ── 8-11. Persist + close blocks + cleanup ───────────────────────
+    let (total_in, total_out) = client_for_tokens.token_usage();
     let _ = orchestration::finalize_response(
         tx,
         &state,
@@ -818,17 +892,18 @@ async fn handle_chat(
         s.thinking_open,
         s.text_block_idx,
         s.block_index,
+        total_in,
+        total_out,
     )
     .await;
 
     // ── Post-turn memory extraction + reflection (async, fire-and-forget) ──
     if !s.full_response.is_empty() {
-        spawn_post_turn_tasks(&state, &req.message, &s.full_response).await;
+        spawn_post_turn_tasks(&state, session_id, &req.message, &s.full_response).await;
     }
 
     Ok(())
 }
-
 
 // ── Post-turn background tasks ──────────────────────────────────────────────
 // (extracted to post_turn.rs)

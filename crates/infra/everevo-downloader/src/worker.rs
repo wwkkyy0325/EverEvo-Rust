@@ -24,9 +24,20 @@ use crate::task::DownloadTask;
 /// A shared HTTP client — created once per engine, cloned cheaply.
 pub(crate) type HttpClient = reqwest::Client;
 
+/// Proxied ureq Agent for the sync probe + simple-download fallback. The proxy
+/// wiring lives in `everevo-net` — the single HTTP egress for the whole project.
+fn ureq_proxied_agent() -> ureq::Agent {
+    everevo_net::ureq_agent(
+        std::time::Duration::from_secs(10),
+        std::time::Duration::from_secs(300),
+        5,
+        None,
+    )
+}
+
 /// Build a reqwest Client from config.
 pub(crate) fn build_client(config: &DownloaderConfig) -> Result<HttpClient, DownloadError> {
-    reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .user_agent(&config.user_agent)
         .connect_timeout(std::time::Duration::from_secs(30))
         .timeout(std::time::Duration::from_secs(300))
@@ -34,9 +45,12 @@ pub(crate) fn build_client(config: &DownloaderConfig) -> Result<HttpClient, Down
             config.pool_idle_timeout_secs,
         ))
         .tcp_nodelay(true)
-        .tcp_keepalive(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(DownloadError::Http)
+        .tcp_keepalive(std::time::Duration::from_secs(60));
+    // Route through a proxy when one is configured (env-driven, single egress
+    // in everevo-net) — without it GFW-blocked downloads fail with connect
+    // errors and burn the question wall-clock.
+    let builder = everevo_net::reqwest_apply_proxy(builder);
+    builder.build().map_err(DownloadError::Http)
 }
 
 // ── Entry Point ─────────────────────────────────────────────────────────
@@ -716,7 +730,8 @@ fn format_reqwest_error(e: &DownloadError) -> String {
 async fn probe_url_ureq(url: &str) -> Result<(u64, bool), DownloadError> {
     let url = url.to_string();
     tokio::task::spawn_blocking(move || {
-        let resp = ureq::head(&url)
+        let resp = ureq_proxied_agent()
+            .head(&url)
             .call()
             .map_err(|e| DownloadError::Other(format!("ureq probe: {e}")))?;
         let len: u64 = resp
@@ -787,13 +802,16 @@ fn download_ureq_fallback(
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
     }
 
+    let agent = ureq_proxied_agent();
     let resp = if downloaded > 0 && downloaded < total_size {
-        ureq::get(url)
+        agent
+            .get(url)
             .header("Range", &format!("bytes={downloaded}-"))
             .call()
             .map_err(|e| format!("ureq range: {e}"))?
     } else {
-        ureq::get(url)
+        agent
+            .get(url)
             .call()
             .map_err(|e| format!("ureq get: {e}"))?
     };

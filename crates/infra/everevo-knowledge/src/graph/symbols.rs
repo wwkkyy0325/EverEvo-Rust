@@ -36,7 +36,13 @@ pub const CAP_FETCH: &str = "can-fetch";
 
 /// All known capabilities (for seeding purposes).
 pub const ALL_CAPABILITIES: &[&str] = &[
-    CAP_READ, CAP_WRITE, CAP_EXECUTE, CAP_SEARCH, CAP_DELEGATE, CAP_LEARN, CAP_FETCH,
+    CAP_READ,
+    CAP_WRITE,
+    CAP_EXECUTE,
+    CAP_SEARCH,
+    CAP_DELEGATE,
+    CAP_LEARN,
+    CAP_FETCH,
 ];
 
 // ── Symbol Registry ─────────────────────────────────────────────────────────
@@ -101,12 +107,7 @@ impl SymbolRegistry {
 
             let desc = tool.description();
             // Take first sentence for short label
-            let label = desc
-                .split('.')
-                .next()
-                .unwrap_or(name)
-                .trim()
-                .to_string();
+            let label = desc.split('.').next().unwrap_or(name).trim().to_string();
             props.insert("description".into(), desc.to_string());
 
             let risk = format!("{:?}", tool.risk_level());
@@ -173,16 +174,15 @@ impl SymbolRegistry {
             merged_into: None,
         });
 
-        tracing::info!(count, "Symbol registry: registered tool entities in knowledge graph");
+        tracing::info!(
+            count,
+            "Symbol registry: registered tool entities in knowledge graph"
+        );
         Ok(count)
     }
 
     /// Register the main agent entity with its tool set.
-    pub fn register_agent(
-        &self,
-        agent_id: &str,
-        tool_names: &[&str],
-    ) -> Result<(), EverEvoError> {
+    pub fn register_agent(&self, agent_id: &str, tool_names: &[&str]) -> Result<(), EverEvoError> {
         let kg = match &self.kg {
             Some(kg) => kg,
             None => return Ok(()),
@@ -243,10 +243,7 @@ impl SymbolRegistry {
             .map(|r| r.from.clone())
             .collect();
 
-        from_ids
-            .iter()
-            .filter_map(|id| kg.get_entity(id))
-            .collect()
+        from_ids.iter().filter_map(|id| kg.get_entity(id)).collect()
     }
 
     /// Return all constraint entities that apply to a given entity.
@@ -297,10 +294,8 @@ impl SymbolRegistry {
         }
 
         // Greedy set cover: repeatedly pick the tool covering the most uncovered caps
-        let mut uncovered: std::collections::HashSet<String> = required
-            .iter()
-            .map(|c| c.to_string())
-            .collect();
+        let mut uncovered: std::collections::HashSet<String> =
+            required.iter().map(|c| c.to_string()).collect();
         let mut selected: Vec<String> = Vec::new();
         let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -612,7 +607,10 @@ mod tests {
 
         // Request capabilities: read + execute
         let compositions = sr.suggest_composition(&[CAP_READ, CAP_EXECUTE]);
-        assert!(!compositions.is_empty(), "Should find a composition covering read+execute");
+        assert!(
+            !compositions.is_empty(),
+            "Should find a composition covering read+execute"
+        );
         let tool_ids = &compositions[0];
         // Collect covered capabilities from selected tools
         let mut covered = std::collections::HashSet::new();
@@ -624,8 +622,14 @@ mod tests {
                 covered.insert(rel.to.clone());
             }
         }
-        assert!(covered.contains(CAP_READ), "selected tools should cover can-read");
-        assert!(covered.contains(CAP_EXECUTE), "selected tools should cover can-execute");
+        assert!(
+            covered.contains(CAP_READ),
+            "selected tools should cover can-read"
+        );
+        assert!(
+            covered.contains(CAP_EXECUTE),
+            "selected tools should cover can-execute"
+        );
     }
 
     #[test]

@@ -237,6 +237,7 @@ mod tests {
             updated_at: chrono::Utc::now(),
             projection: ProjectionMetadata::new("test", "none", vec![], 0.8),
             links: vec![],
+            session: None,
         }
     }
 

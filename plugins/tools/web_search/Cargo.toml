@@ -10,4 +10,5 @@ name = "plugin-web-search"
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+everevo-net = { path = "../../../crates/infra/everevo-net", default-features = false }
 ureq = "3"

@@ -44,7 +44,10 @@ pub use self::facts::FactManager as FactStore;
 pub use self::frontmatter::{parse_fact_file, parse_frontmatter, serialize_fact_file};
 pub use self::index::{load_all_facts, parse_index, regenerate_index};
 pub use self::meta_agent::{meta_diagnose, MetaAgentState};
-pub use self::paradigm::{extract_paradigm_from_trajectory, load_paradigms, search_paradigms, TrajectoryBuffer, TurnDigest};
+pub use self::paradigm::{
+    extract_paradigm_from_trajectory, load_paradigms, search_paradigms, TrajectoryBuffer,
+    TurnDigest,
+};
 pub use self::pipeline::{
     ApplyStats, ChunkExtractor, ExtractedEntity, ExtractedRelation, ExtractionResult,
 };

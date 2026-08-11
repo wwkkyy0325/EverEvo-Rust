@@ -23,9 +23,9 @@ pub mod skills_routes;
 pub mod tools_routes;
 pub mod workspace_routes;
 
-use std::sync::Arc;
-use axum::Router;
 use crate::app_state::AppState;
+use axum::Router;
+use std::sync::Arc;
 
 /// Assemble all API routes in one place.
 ///

@@ -14,10 +14,7 @@ mod server;
 fn main() {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(
-            std::env::var("EVEREVO_LOG")
-                .unwrap_or_else(|_| "info".into()),
-        )
+        .with_env_filter(std::env::var("EVEREVO_LOG").unwrap_or_else(|_| "info".into()))
         .init();
 
     tracing::info!("everevo-webagent starting (MCP stdio)");

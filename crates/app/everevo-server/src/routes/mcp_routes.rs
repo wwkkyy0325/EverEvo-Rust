@@ -93,7 +93,9 @@ async fn reconnect_server(
         }
         Err(e) => {
             tracing::warn!(%name, error = %e, "MCP server reconnect failed");
-            Err(ApiError::internal(format!("MCP server '{name}' reconnect failed: {e}")))
+            Err(ApiError::internal(format!(
+                "MCP server '{name}' reconnect failed: {e}"
+            )))
         }
     }
 }

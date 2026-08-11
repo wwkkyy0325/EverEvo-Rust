@@ -23,7 +23,9 @@ impl PluginRollback {
 
 #[async_trait]
 impl Tool for PluginRollback {
-    fn name(&self) -> &str { "plugin_rollback" }
+    fn name(&self) -> &str {
+        "plugin_rollback"
+    }
     fn description(&self) -> &str {
         "Emergency rollback any plugin to its last stable version. \
          Kills canary processes and resets canary traffic to 0. \
@@ -43,7 +45,9 @@ impl Tool for PluginRollback {
             "required": ["plugin_id"]
         })
     }
-    fn risk_level(&self) -> RiskLevel { RiskLevel::Medium }
+    fn risk_level(&self) -> RiskLevel {
+        RiskLevel::Medium
+    }
 
     async fn execute(
         &self,

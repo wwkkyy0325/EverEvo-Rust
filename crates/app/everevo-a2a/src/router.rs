@@ -10,8 +10,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::response::{IntoResponse, Json, Sse};
 use axum::response::sse::Event;
+use axum::response::{IntoResponse, Json, Sse};
 use axum::routing::{get, post};
 use axum::Extension;
 use tokio::sync::{mpsc, Mutex};
@@ -21,8 +21,8 @@ use tokio_util::sync::CancellationToken;
 use crate::error::A2aError;
 use crate::executor::A2aAgentExecutor;
 use crate::types::{
-    A2aTask, AgentCard, JsonRpcRequest, JsonRpcResponse, Part, TaskQueryParams,
-    TaskSendParams, TaskState, TaskStatus,
+    A2aTask, AgentCard, JsonRpcRequest, JsonRpcResponse, Part, TaskQueryParams, TaskSendParams,
+    TaskState, TaskStatus,
 };
 
 // ── Shared State ──────────────────────────────────────────────────────────
@@ -103,7 +103,10 @@ async fn jsonrpc_handler(
     Json(request): Json<JsonRpcRequest>,
 ) -> impl IntoResponse {
     // SSE streaming — returned as Response<Body> to match the JSON fallback type
-    if matches!(request.method.as_str(), "tasks/sendSubscribe" | "message/stream") {
+    if matches!(
+        request.method.as_str(),
+        "tasks/sendSubscribe" | "message/stream"
+    ) {
         return handle_tasks_send_subscribe(Arc::clone(&state), &request)
             .await
             .into_response();
@@ -113,15 +116,9 @@ async fn jsonrpc_handler(
         result.map(|task| serde_json::to_value(task).unwrap_or_default())
     };
     let response: Result<serde_json::Value, A2aError> = match request.method.as_str() {
-        "message/send" => task_to_json(
-            handle_message_send(Arc::clone(&state), &request).await
-        ),
-        "tasks/get" => task_to_json(
-            handle_tasks_get(&state, &request).await
-        ),
-        "tasks/cancel" => task_to_json(
-            handle_tasks_cancel(&state, &request).await
-        ),
+        "message/send" => task_to_json(handle_message_send(Arc::clone(&state), &request).await),
+        "tasks/get" => task_to_json(handle_tasks_get(&state, &request).await),
+        "tasks/cancel" => task_to_json(handle_tasks_cancel(&state, &request).await),
         "tasks/list" => handle_tasks_list(&state, &request).await,
         other => Err(A2aError::method_not_found(other)),
     };
@@ -231,10 +228,7 @@ async fn handle_message_send(
     }
 }
 
-async fn handle_tasks_get(
-    state: &A2aState,
-    req: &JsonRpcRequest,
-) -> Result<A2aTask, A2aError> {
+async fn handle_tasks_get(state: &A2aState, req: &JsonRpcRequest) -> Result<A2aTask, A2aError> {
     let params: TaskQueryParams = serde_json::from_value(req.params.clone())
         .map_err(|e| A2aError::invalid_params(&e.to_string()))?;
 
@@ -245,10 +239,7 @@ async fn handle_tasks_get(
         .ok_or_else(|| A2aError::task_not_found(&params.id))
 }
 
-async fn handle_tasks_cancel(
-    state: &A2aState,
-    req: &JsonRpcRequest,
-) -> Result<A2aTask, A2aError> {
+async fn handle_tasks_cancel(state: &A2aState, req: &JsonRpcRequest) -> Result<A2aTask, A2aError> {
     let params: TaskQueryParams = serde_json::from_value(req.params.clone())
         .map_err(|e| A2aError::invalid_params(&e.to_string()))?;
 
@@ -326,7 +317,10 @@ async fn handle_tasks_send_subscribe(
     };
 
     let task_id = uuid::Uuid::new_v4().to_string();
-    let context_id = params.context_id.clone().unwrap_or_else(|| format!("ctx-{}", &task_id[..8]));
+    let context_id = params
+        .context_id
+        .clone()
+        .unwrap_or_else(|| format!("ctx-{}", &task_id[..8]));
     let (tx, rx) = mpsc::channel::<Result<Event, std::convert::Infallible>>(32);
 
     let executor = Arc::clone(&state.executor);
@@ -384,7 +378,12 @@ async fn handle_tasks_send_subscribe(
                     "user" => everevo_core::llm::LlmMessage::user(text),
                     _ => everevo_core::llm::LlmMessage::assistant(text),
                 },
-                Part::File { name, mime_type, uri, bytes: _ } => {
+                Part::File {
+                    name,
+                    mime_type,
+                    uri,
+                    bytes: _,
+                } => {
                     let desc = format!(
                         "[File: {} ({}) at {}]",
                         name.as_deref().unwrap_or("unnamed"),
@@ -409,9 +408,9 @@ async fn handle_tasks_send_subscribe(
         let final_state = match &result {
             Ok(task) => {
                 let _ = tx
-                    .send(Ok(Event::default().event("task").data(
-                        serde_json::to_string(&task).unwrap_or_default(),
-                    )))
+                    .send(Ok(Event::default()
+                        .event("task")
+                        .data(serde_json::to_string(&task).unwrap_or_default())))
                     .await;
                 task.status.state
             }
@@ -436,12 +435,13 @@ async fn handle_tasks_send_subscribe(
     });
 
     let stream = ReceiverStream::new(rx);
-    Sse::new(stream).keep_alive(
-        axum::response::sse::KeepAlive::new()
-            .interval(std::time::Duration::from_secs(15))
-            .text("keep-alive"),
-    )
-    .into_response()
+    Sse::new(stream)
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -453,11 +453,7 @@ mod tests {
 
     fn test_state() -> Arc<A2aState> {
         let card = AgentCardBuilder::new("http://localhost:3000").build();
-        Arc::new(A2aState::new(
-            Arc::new(EchoExecutor),
-            card,
-            5,
-        ))
+        Arc::new(A2aState::new(Arc::new(EchoExecutor), card, 5))
     }
 
     #[tokio::test]

@@ -21,6 +21,7 @@ pub mod types;
 pub use config::{AppConfig, McpServerConfig};
 pub use context::{
     default_pipeline, ContextBuildContext, ContextFragment, ContextPipeline, ContextStage,
+    RollingSummaryStage,
 };
 pub use error::{ApiError, ErrorCode, EverEvoError};
 pub use llm::{
@@ -30,7 +31,9 @@ pub use memory::{FactType, MemoryFact, MemoryIndexEntry, ProjectionMetadata, Sou
 pub use provider::{BootstrapProvider, BootstrapStatus};
 pub use sandbox::{ExecutionConfig, ExecutionResult, SandboxProvider};
 pub use telemetry::{
-    AgentTurnRecord, RetrievalRecord, SpanGuard, Telemetry, TelemetryConfig, Trace,
+    default_telemetry_pipeline, AgentTurnRecord, RetrievalRecord, SpanGuard, Telemetry,
+    TelemetryConfig, TelemetryEmitContext, TelemetryPipeline, TelemetryRecord, TelemetrySnapshot,
+    TelemetryStage, Trace,
 };
 pub use tool::{Tool, ToolHook, ToolOutput, ToolRegistry};
 pub use types::*;

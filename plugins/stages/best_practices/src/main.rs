@@ -11,7 +11,7 @@ const RULES: &str = "\
 - Commits: conventional commits (`feat:`, `fix:`, `chore:`)\n\
 - Imports: remove imports YOUR changes made unused.\n\n\
 ## Critical Rules\n\n\
-- 2-failure limit: same command fails twice → STOP, diagnose root cause\n\
+- Anti-fixation: if the same command fails repeatedly, pause, diagnose root cause, and switch approach\n\
 - Verify before claiming done\n\
 - Admit when stuck: 'I tried X,Y,Z. Here's what failed and what I need'";
 fn main() {

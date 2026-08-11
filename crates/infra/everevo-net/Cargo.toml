@@ -1,0 +1,18 @@
+[package]
+name = "everevo-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared HTTP egress — single source of truth for proxy-aware client construction (ureq/reqwest)"
+
+[dependencies]
+ureq = "3"
+reqwest = { workspace = true, optional = true }
+
+[features]
+default = ["reqwest"]
+reqwest = ["dep:reqwest"]
+
+[lints]
+workspace = true

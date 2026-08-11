@@ -8,8 +8,8 @@ use std::sync::Arc;
 use axum::{extract::State, routing::get, Json, Router};
 
 use crate::app_state::AppState;
-use everevo_core::ApiError;
 use everevo_agent::AgentCharacter;
+use everevo_core::ApiError;
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new().route("/api/character", get(get_character).put(put_character))
@@ -41,11 +41,13 @@ async fn put_character(
     }
     let path = character_path(&state);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| ApiError::internal(format!("failed to create dir: {e}")))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| ApiError::internal(format!("failed to create dir: {e}")))?;
     }
     let json = serde_json::to_string_pretty(&profile)
         .map_err(|e| ApiError::internal(format!("failed to serialize character: {e}")))?;
-    std::fs::write(&path, json).map_err(|e| ApiError::internal(format!("failed to write character: {e}")))?;
+    std::fs::write(&path, json)
+        .map_err(|e| ApiError::internal(format!("failed to write character: {e}")))?;
     tracing::info!(path = %path.display(), "Agent character profile updated via API");
     Ok(Json(profile))
 }

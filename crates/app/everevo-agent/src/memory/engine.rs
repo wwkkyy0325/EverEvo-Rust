@@ -704,6 +704,8 @@ fn theme_to_memory_fact(theme: &Theme) -> MemoryFact {
         updated_at: chrono::Utc::now(),
         projection: ProjectionMetadata::new("dreaming-pipeline", "llm", vec![], theme.confidence),
         links: vec![],
+        // DEEP-phase promoted themes are cross-session long-term memory.
+        session: Some("global".into()),
     }
 }
 

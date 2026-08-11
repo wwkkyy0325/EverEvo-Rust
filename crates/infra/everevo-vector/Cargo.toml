@@ -45,3 +45,4 @@ workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
 tempfile = "3"
+rand = "0.8"

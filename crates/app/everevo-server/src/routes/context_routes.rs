@@ -24,8 +24,11 @@ async fn get_latest_snapshot(
     let latest = snapshots.get(&id).and_then(|v| v.last()).cloned();
 
     match latest {
-        Some(snapshot) => Ok(Json(serde_json::to_value(&snapshot)
-            .map_err(|e| ApiError::internal(format!("serialization failed: {e}")))?)),
+        Some(snapshot) => {
+            Ok(Json(serde_json::to_value(&snapshot).map_err(|e| {
+                ApiError::internal(format!("serialization failed: {e}"))
+            })?))
+        }
         None => Err(ApiError::not_found(
             "No context snapshot available for this session",
         )),

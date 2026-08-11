@@ -10,6 +10,7 @@ interface Provider {
   api_key: string;
   base_url: string;
   model: string;
+  context_window?: number | null;
 }
 
 type SettingsTab = 'llm' | 'routing' | 'character';
@@ -115,6 +116,7 @@ function LlmConfig() {
           api_key: p.api_key || '',
           base_url: p.base_url || '',
           model: p.model || '',
+          context_window: p.context_window ?? null,
         })));
       }
       setLoading(false);
@@ -127,7 +129,7 @@ function LlmConfig() {
     const id = crypto.randomUUID();
     const first = presetKeys[0];
     const p = getPreset(first);
-    setDraft({ id, api_format: 'openai', api_key: '', base_url: p?.baseUrl || '', model: '' });
+    setDraft({ id, api_format: 'openai', api_key: '', base_url: p?.baseUrl || '', model: '', context_window: null });
     setDraftPreset(first || '自定义');
     setEditingId(null);
     setTestState('idle'); setTestMsg('');
@@ -148,7 +150,10 @@ function LlmConfig() {
   const closeDraft = () => { setDraft(null); setEditingId(null); setTestState('idle'); setTestMsg(''); setShowDraftKey(false); };
 
   const updateDraft = (field: string, value: string) => {
-    setDraft(prev => prev ? { ...prev, [field]: value } : null);
+    setDraft(prev => prev ? {
+      ...prev,
+      [field]: field === 'context_window' ? (value === '' ? null : Number(value)) : value,
+    } : null);
   };
 
   // Switch API format — also adjust base URL if the preset has a format-specific URL
@@ -171,8 +176,8 @@ function LlmConfig() {
 
   const testDraft = async () => {
     if (!draft) return;
-    if (!draft.api_key) {
-      setTestState('error'); setTestMsg('请先输入 API Key'); return;
+    if (!draft.api_key && !draft.base_url) {
+      setTestState('error'); setTestMsg('请先输入 API Key 或 Base URL'); return;
     }
     setTestState('testing'); setTestMsg('测试中...');
 
@@ -206,6 +211,10 @@ function LlmConfig() {
   };
 
   // ── Delete (auto-saves to backend) ────────────────────────────────
+
+  // Allow saving a local URL-only provider (e.g. llama-server vision, no API key)
+  // without a successful test — the server may be offline at config time.
+  const canCommit = !!draft?.model && (testState === 'ok' || (!draft.api_key && !!draft.base_url));
 
   const deleteProvider = async (id: string) => {
     const remaining = providers.filter(p => p.id !== id);
@@ -299,6 +308,17 @@ function LlmConfig() {
                            text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-primary" />
             </div>
 
+            {/* Context window (tokens, optional) */}
+            <div>
+              <label className="text-xs text-muted-foreground">Context Window (tokens, 可选)</label>
+              <input type="number" min={0} step={1024}
+                value={draft.context_window ?? ''}
+                onChange={e => updateDraft('context_window', e.target.value)}
+                placeholder="如 32768（视觉必须 ≤ 32K，防显存溢出）"
+                className="w-full bg-background border border-border rounded px-2.5 py-1.5 text-xs font-mono mt-0.5
+                           text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-primary" />
+            </div>
+
             {/* Test + Commit buttons */}
             <div className="flex gap-2 pt-1">
               <button onClick={testDraft} disabled={testState === 'testing'}
@@ -311,9 +331,9 @@ function LlmConfig() {
                 {testState === 'testing' ? '⏳ 测试中...' : testState === 'ok' ? '✓ 已连接' : testState === 'error' ? `✗ ${testMsg}` : '🔍 测试连接'}
               </button>
               <button onClick={commitDraft}
-                disabled={!draft.model || testState !== 'ok'}
+                disabled={!canCommit}
                 className={`py-2 px-4 rounded-lg text-xs font-medium transition-colors ${
-                  !draft.model || testState !== 'ok'
+                  !canCommit
                     ? 'bg-muted text-muted-foreground cursor-not-allowed'
                     : 'bg-primary hover:bg-primary/90 text-primary-foreground'
                 }`}>
@@ -418,7 +438,7 @@ const CASCADE_LABELS = [
 ];
 
 function RoutingConfig() {
-  const { config, setMainModel, setMainEffort, setTier } = useRoutingConfig();
+  const { config, setMainModel, setMainEffort, setTier, setVisionModel, setCompactModel } = useRoutingConfig();
   const [providers, setProviders] = useState<Provider[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -428,6 +448,7 @@ function RoutingConfig() {
         id: p.id || crypto.randomUUID(),
         api_format: p.api_format || 'openai', api_key: '',
         base_url: p.base_url || '', model: p.model || '',
+        context_window: p.context_window ?? null,
       }));
       setProviders(list);
       if (list.length > 0) {
@@ -519,10 +540,52 @@ function RoutingConfig() {
           </div>
         </div>
 
+        {/* Vision provider */}
+        <div>
+          <p className="text-xs text-muted-foreground font-medium mb-2">视觉模型（图片处理）</p>
+          <p className="text-xs text-muted-foreground mb-2">
+            用于 describe_image 工具识别图片。留空则离线脚本候补（棋谱 / 分数识别）。
+            <span className="text-warning"> 注意：上下文必须 ≤ 32K（llama-server -c 32768），防止 6GB 显存溢出。</span>
+          </p>
+          <div className="bg-secondary/50 border border-border rounded-xl p-3 flex gap-2 items-center">
+            <span className="text-xs text-foreground shrink-0 w-12">视觉</span>
+            <select value={config.visionModelId}
+              onChange={e => setVisionModel(e.target.value)}
+              className="flex-1 bg-background border border-border rounded px-2.5 py-1.5 text-xs text-foreground
+                         focus:outline-none focus:border-primary appearance-none cursor-pointer">
+              <option value="">不使用视觉模型</option>
+              {providers.map((p) => (
+                <option key={p.id} value={p.id}>{p.model || '(未命名)'}</option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        {/* Compaction provider */}
+        <div>
+          <p className="text-xs text-muted-foreground font-medium mb-2">压缩模型（上下文维护）</p>
+          <p className="text-xs text-muted-foreground mb-2">
+            用于滚动摘要 / 上下文压缩。留空则复用主 Agent 模型（有哪个用哪个）。
+          </p>
+          <div className="bg-secondary/50 border border-border rounded-xl p-3 flex gap-2 items-center">
+            <span className="text-xs text-foreground shrink-0 w-12">压缩</span>
+            <select value={config.compactModelId}
+              onChange={e => setCompactModel(e.target.value)}
+              className="flex-1 bg-background border border-border rounded px-2.5 py-1.5 text-xs text-foreground
+                         focus:outline-none focus:border-primary appearance-none cursor-pointer">
+              <option value="">复用主 Agent</option>
+              {providers.map((p) => (
+                <option key={p.id} value={p.id}>{p.model || '(未命名)'}</option>
+              ))}
+            </select>
+          </div>
+        </div>
+
         <div className="bg-secondary/30 border border-border rounded-xl p-3">
           <p className="text-xs text-muted-foreground leading-relaxed">
             主 Agent（编排者）始终用当前对话模型，保证编排质量。
             子 Agent（执行者）按此链路升级——先试便宜，失败升级。
+            视觉与压缩模型独立指定，但录入逻辑与普通模型一致（配置页面统一编辑）。
             参考：Cursor Swarm（planner 用最强，worker 级联）、
             Claude Code（主对话 Sonnet/Opus，子 Agent Haiku/Sonnet）。
           </p>

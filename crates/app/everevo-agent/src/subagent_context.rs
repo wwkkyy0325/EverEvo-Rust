@@ -283,6 +283,7 @@ pub async fn assemble_subagent_context(
         sandbox_root: None,
         startup_verified: false,
         hook_feedback: None,
+        summary: None,
     };
 
     let mut sub_ctx = SubAgentContext::default();

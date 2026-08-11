@@ -13,8 +13,8 @@
 //! | `edit` | Write/modify a plugin's source file |
 //! | `build` | Run `cargo build --release` for a specific plugin |
 #![allow(clippy::disallowed_methods)] // kernel privilege: cargo build plugin binaries
-use std::path::PathBuf;
 use std::path::Path;
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 use everevo_core::tool::{Tool, ToolOutput};
@@ -38,15 +38,25 @@ impl PluginDev {
         let mut plugins = Vec::new();
         for category in &["tools", "stages", "hooks"] {
             let dir = self.plugins_dir.join(category);
-            if !dir.exists() { continue; }
+            if !dir.exists() {
+                continue;
+            }
             if let Ok(entries) = std::fs::read_dir(&dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if !path.is_dir() { continue; }
-                    let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                    if !path.is_dir() {
+                        continue;
+                    }
+                    let name = path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned();
                     let main_rs = path.join("src").join("main.rs");
                     let cargo_toml = path.join("Cargo.toml");
-                    if !main_rs.exists() || !cargo_toml.exists() { continue; }
+                    if !main_rs.exists() || !cargo_toml.exists() {
+                        continue;
+                    }
                     // Try to parse tool names from the source
                     let tools = Self::extract_tool_names(&main_rs);
                     let main_size = std::fs::metadata(&main_rs).map(|m| m.len()).unwrap_or(0);
@@ -75,9 +85,13 @@ impl PluginDev {
                     if let Some(quoted) = rest.trim().strip_prefix('"') {
                         if let Some(end) = quoted.find('"') {
                             let name = &quoted[..end];
-                            if name != "initialize" && name != "notifications/initialized"
-                                && name != "tools/list" && name != "tools/call"
-                                && name != "ping" && name != "prompts/list" && name != "prompts/get"
+                            if name != "initialize"
+                                && name != "notifications/initialized"
+                                && name != "tools/list"
+                                && name != "tools/call"
+                                && name != "ping"
+                                && name != "prompts/list"
+                                && name != "prompts/get"
                             {
                                 names.push(name.to_string());
                             }
@@ -99,7 +113,11 @@ impl PluginDev {
 
     fn source_file(&self, category: &str, name: &str, file: &str) -> Option<PathBuf> {
         let path = self.plugins_dir.join(category).join(name).join(file);
-        if path.exists() { Some(path) } else { None }
+        if path.exists() {
+            Some(path)
+        } else {
+            None
+        }
     }
 
     /// Read a plugin's source. Returns (main_rs, cargo_toml).
@@ -111,8 +129,8 @@ impl PluginDev {
             .source_file(category, name, "Cargo.toml")
             .ok_or_else(|| format!("Plugin '{name}' Cargo.toml not found"))?;
 
-        let main_rs = std::fs::read_to_string(&main_rs_path)
-            .map_err(|e| format!("Read main.rs: {e}"))?;
+        let main_rs =
+            std::fs::read_to_string(&main_rs_path).map_err(|e| format!("Read main.rs: {e}"))?;
         let cargo_toml = std::fs::read_to_string(&cargo_toml_path)
             .map_err(|e| format!("Read Cargo.toml: {e}"))?;
         Ok((main_rs, cargo_toml))
@@ -143,7 +161,11 @@ impl PluginDev {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(file);
-        if file_name.is_empty() || file_name.contains("..") || file_name.contains('/') || file_name.contains('\\') {
+        if file_name.is_empty()
+            || file_name.contains("..")
+            || file_name.contains('/')
+            || file_name.contains('\\')
+        {
             return Err(format!("Invalid file name: '{file}'"));
         }
 
@@ -169,7 +191,10 @@ impl PluginDev {
         }
 
         // ── Verify the resolved path stays within plugins/ dir ────────
-        let canonical_plugins_dir = self.plugins_dir.canonicalize().unwrap_or_else(|_| self.plugins_dir.clone());
+        let canonical_plugins_dir = self
+            .plugins_dir
+            .canonicalize()
+            .unwrap_or_else(|_| self.plugins_dir.clone());
         // If we can't canonicalize (file doesn't exist yet), check the parent
         if let Ok(canonical) = path.canonicalize() {
             if !canonical.starts_with(&canonical_plugins_dir) {
@@ -243,9 +268,7 @@ impl PluginDev {
         if let Some(reader) = stdout_handle {
             std::thread::spawn(move || {
                 let mut buf = Vec::new();
-                let _ = reader
-                    .take(MAX_OUTPUT_BYTES as u64)
-                    .read_to_end(&mut buf);
+                let _ = reader.take(MAX_OUTPUT_BYTES as u64).read_to_end(&mut buf);
                 let _ = tx_out.send(String::from_utf8_lossy(&buf).to_string());
             });
         } else {
@@ -255,9 +278,7 @@ impl PluginDev {
         if let Some(reader) = stderr_handle {
             std::thread::spawn(move || {
                 let mut buf = Vec::new();
-                let _ = reader
-                    .take(MAX_OUTPUT_BYTES as u64)
-                    .read_to_end(&mut buf);
+                let _ = reader.take(MAX_OUTPUT_BYTES as u64).read_to_end(&mut buf);
                 let _ = tx_err.send(String::from_utf8_lossy(&buf).to_string());
             });
         } else {
@@ -271,7 +292,8 @@ impl PluginDev {
             let _ = tx_wait.send(result);
         });
 
-        let status = match rx_wait.recv_timeout(std::time::Duration::from_secs(BUILD_TIMEOUT_SECS)) {
+        let status = match rx_wait.recv_timeout(std::time::Duration::from_secs(BUILD_TIMEOUT_SECS))
+        {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => return Err(format!("Build process error: {e}")),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -301,10 +323,20 @@ impl PluginDev {
                     "Build succeeded.\n  Binary: {}\n  Size: {} bytes\n\n{}",
                     binary.display(),
                     size,
-                    combined.lines().rev().take(10).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")
+                    combined
+                        .lines()
+                        .rev()
+                        .take(10)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join("\n")
                 ))
             } else {
-                Ok(format!("Build succeeded but binary not found at expected path.\n\n{combined}"))
+                Ok(format!(
+                    "Build succeeded but binary not found at expected path.\n\n{combined}"
+                ))
             }
         } else {
             Err(format!(
@@ -353,7 +385,10 @@ fn validate_plugin_name(name: &str) -> Result<(), String> {
         ));
     }
     // Only allow alphanumeric, dash, underscore
-    if !name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
         return Err(format!(
             "Invalid plugin name '{name}': only alphanumeric, dash, and underscore allowed."
         ));
@@ -363,7 +398,9 @@ fn validate_plugin_name(name: &str) -> Result<(), String> {
 
 #[async_trait]
 impl Tool for PluginDev {
-    fn name(&self) -> &str { "plugin_dev" }
+    fn name(&self) -> &str {
+        "plugin_dev"
+    }
     fn description(&self) -> &str {
         "Inspect and modify MCP plugin source code (non-kernel, safe to edit). \
          Actions: 'list' all plugins with metadata, 'source' to read a plugin's code, \
@@ -401,7 +438,9 @@ impl Tool for PluginDev {
             "required": ["action"]
         })
     }
-    fn risk_level(&self) -> RiskLevel { RiskLevel::Medium }
+    fn risk_level(&self) -> RiskLevel {
+        RiskLevel::Medium
+    }
 
     async fn execute(
         &self,
@@ -418,10 +457,7 @@ impl Tool for PluginDev {
                         "No plugins found. Ensure plugins/ directory exists with tools/, stages/, hooks/ subdirectories."
                     ));
                 }
-                let mut lines = vec![format!(
-                    "{} plugins across 3 categories:\n",
-                    plugins.len()
-                )];
+                let mut lines = vec![format!("{} plugins across 3 categories:\n", plugins.len())];
                 let mut current_cat = String::new();
                 for p in &plugins {
                     if p.category != current_cat {
@@ -450,12 +486,17 @@ impl Tool for PluginDev {
                 let name = params["name"].as_str().unwrap_or("");
                 let file = params["file"].as_str().unwrap_or("main.rs");
                 if name.is_empty() {
-                    return Ok(ToolOutput { content: "Provide 'name' and 'category' for action='source'.".into(), is_error: true, ..Default::default() });
+                    return Ok(ToolOutput {
+                        content: "Provide 'name' and 'category' for action='source'.".into(),
+                        is_error: true,
+                        ..Default::default()
+                    });
                 }
                 if file == "Cargo.toml" {
                     // Return only Cargo.toml
-                    let path = self.source_file(category, name, file)
-                        .ok_or_else(|| EverEvoError::Internal(format!("Plugin '{name}' not found")))?;
+                    let path = self.source_file(category, name, file).ok_or_else(|| {
+                        EverEvoError::Internal(format!("Plugin '{name}' not found"))
+                    })?;
                     let content = std::fs::read_to_string(&path)
                         .map_err(|e| EverEvoError::Internal(format!("Read: {e}")))?;
                     Ok(ToolOutput::text(format!(
@@ -463,7 +504,8 @@ impl Tool for PluginDev {
                         name
                     )))
                 } else {
-                    let (main_rs, cargo_toml) = self.read_source(category, name)
+                    let (main_rs, cargo_toml) = self
+                        .read_source(category, name)
                         .map_err(EverEvoError::Internal)?;
                     let lines_main = main_rs.lines().count();
                     Ok(ToolOutput::text(format!(
@@ -478,7 +520,12 @@ impl Tool for PluginDev {
                 let file = params["file"].as_str().unwrap_or("main.rs");
                 let content = params["content"].as_str().unwrap_or("");
                 if name.is_empty() || content.is_empty() {
-                    return Ok(ToolOutput { content: "Provide 'name', 'category', and 'content' for action='edit'.".into(), is_error: true, ..Default::default() });
+                    return Ok(ToolOutput {
+                        content: "Provide 'name', 'category', and 'content' for action='edit'."
+                            .into(),
+                        is_error: true,
+                        ..Default::default()
+                    });
                 }
                 self.write_source(category, name, file, content)
                     .map_err(EverEvoError::Internal)?;
@@ -493,11 +540,19 @@ impl Tool for PluginDev {
                 let category = params["category"].as_str().unwrap_or("tools");
                 let name = params["name"].as_str().unwrap_or("");
                 if name.is_empty() {
-                    return Ok(ToolOutput { content: "Provide 'name' and 'category' for action='build'.".into(), is_error: true, ..Default::default() });
+                    return Ok(ToolOutput {
+                        content: "Provide 'name' and 'category' for action='build'.".into(),
+                        is_error: true,
+                        ..Default::default()
+                    });
                 }
                 match self.build_plugin(category, name) {
                     Ok(log) => Ok(ToolOutput::text(log)),
-                    Err(e) => Ok(ToolOutput { content: e, is_error: true, ..Default::default() }),
+                    Err(e) => Ok(ToolOutput {
+                        content: e,
+                        is_error: true,
+                        ..Default::default()
+                    }),
                 }
             }
 

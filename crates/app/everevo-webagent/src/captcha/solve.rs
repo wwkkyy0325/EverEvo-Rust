@@ -99,8 +99,7 @@ impl VisionCaptchaSolver {
         } else {
             (
                 std::env::var("OPENAI_API_KEY").ok()?,
-                std::env::var("OPENAI_MODEL")
-                    .unwrap_or_else(|_| "gpt-4o".into()),
+                std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".into()),
                 std::env::var("OPENAI_BASE_URL")
                     .unwrap_or_else(|_| "https://api.openai.com".into()),
             )
@@ -128,7 +127,8 @@ impl VisionCaptchaSolver {
         instruction: &str,
     ) -> Result<CaptchaSolution, String> {
         // Simple base64 encode (no external dep needed)
-        const BASE64_TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const BASE64_TABLE: &[u8] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut base64_img = String::with_capacity(screenshot.len() * 4 / 3 + 4);
         for chunk in screenshot.chunks(3) {
             let b0 = chunk[0] as u32;
@@ -137,8 +137,16 @@ impl VisionCaptchaSolver {
             let triple = (b0 << 16) | (b1 << 8) | b2;
             base64_img.push(BASE64_TABLE[((triple >> 18) & 0x3F) as usize] as char);
             base64_img.push(BASE64_TABLE[((triple >> 12) & 0x3F) as usize] as char);
-            base64_img.push(if chunk.len() > 1 { BASE64_TABLE[((triple >> 6) & 0x3F) as usize] as char } else { '=' });
-            base64_img.push(if chunk.len() > 2 { BASE64_TABLE[(triple & 0x3F) as usize] as char } else { '=' });
+            base64_img.push(if chunk.len() > 1 {
+                BASE64_TABLE[((triple >> 6) & 0x3F) as usize] as char
+            } else {
+                '='
+            });
+            base64_img.push(if chunk.len() > 2 {
+                BASE64_TABLE[(triple & 0x3F) as usize] as char
+            } else {
+                '='
+            });
         }
         let prompt = format!(
             "You are solving a CAPTCHA. The instruction is: \"{instruction}\"\n\n\
@@ -231,8 +239,8 @@ impl VisionCaptchaSolver {
             .trim_start_matches("```")
             .trim_end_matches("```")
             .trim();
-        let json: serde_json::Value =
-            serde_json::from_str(clean).map_err(|e| format!("Parse vision response: {e} — raw: {text}"))?;
+        let json: serde_json::Value = serde_json::from_str(clean)
+            .map_err(|e| format!("Parse vision response: {e} — raw: {text}"))?;
 
         if let Some(reason) = json.get("unsolvable").and_then(|v| v.as_str()) {
             return Ok(CaptchaSolution::Unsolvable(reason.into()));
@@ -356,34 +364,26 @@ impl CaptchaSolver for SimpleCaptchaSolver {
                     )
                 }
             }
-            ChallengeType::RecaptchaV2Grid => {
-                CaptchaSolution::Unsolvable(
-                    "reCAPTCHA v2 image grid requires a vision AI model \
+            ChallengeType::RecaptchaV2Grid => CaptchaSolution::Unsolvable(
+                "reCAPTCHA v2 image grid requires a vision AI model \
                      (GPT-4V, Claude Vision, or Qwen-VL). \
                      Implement VisionCaptchaSolver to handle this."
-                        .into(),
-                )
-            }
-            ChallengeType::HCaptcha => {
-                CaptchaSolution::Unsolvable(
-                    "hCaptcha image selection requires a vision AI model. \
+                    .into(),
+            ),
+            ChallengeType::HCaptcha => CaptchaSolution::Unsolvable(
+                "hCaptcha image selection requires a vision AI model. \
                      Implement VisionCaptchaSolver to handle this."
-                        .into(),
-                )
-            }
-            ChallengeType::Slider => {
-                CaptchaSolution::Unsolvable(
-                    "Slider CAPTCHA requires a vision AI model to compute \
+                    .into(),
+            ),
+            ChallengeType::Slider => CaptchaSolution::Unsolvable(
+                "Slider CAPTCHA requires a vision AI model to compute \
                      the slide offset. Implement VisionCaptchaSolver."
-                        .into(),
-                )
-            }
-            ChallengeType::Unknown(desc) => {
-                CaptchaSolution::Unsolvable(format!(
-                    "Unknown challenge type: {desc}. Screenshot may be needed \
+                    .into(),
+            ),
+            ChallengeType::Unknown(desc) => CaptchaSolution::Unsolvable(format!(
+                "Unknown challenge type: {desc}. Screenshot may be needed \
                      for manual review or vision model analysis."
-                ))
-            }
+            )),
         }
     }
 }
@@ -416,7 +416,10 @@ fn extract_captcha_text_from_dom(html: &str) -> Option<String> {
         let nearby = &html[pos..];
         // Look for a short alphanumeric string nearby
         for word in nearby.split(|c: char| !c.is_alphanumeric()) {
-            if word.len() >= 3 && word.len() <= 10 && word.chars().all(|c| c.is_ascii_alphanumeric()) {
+            if word.len() >= 3
+                && word.len() <= 10
+                && word.chars().all(|c| c.is_ascii_alphanumeric())
+            {
                 return Some(word.to_string());
             }
         }
@@ -433,9 +436,7 @@ mod tests {
     #[tokio::test]
     async fn test_simple_solver_turnstile() {
         let solver = SimpleCaptchaSolver;
-        let result = solver
-            .solve(None, &ChallengeType::Turnstile, "", "")
-            .await;
+        let result = solver.solve(None, &ChallengeType::Turnstile, "", "").await;
         assert!(matches!(result, CaptchaSolution::WaitAndRetry));
     }
 
@@ -452,7 +453,12 @@ mod tests {
     async fn test_simple_solver_grid_is_unsolvable() {
         let solver = SimpleCaptchaSolver;
         let result = solver
-            .solve(None, &ChallengeType::RecaptchaV2Grid, "Select all crosswalks", "")
+            .solve(
+                None,
+                &ChallengeType::RecaptchaV2Grid,
+                "Select all crosswalks",
+                "",
+            )
             .await;
         assert!(matches!(result, CaptchaSolution::Unsolvable(_)));
     }

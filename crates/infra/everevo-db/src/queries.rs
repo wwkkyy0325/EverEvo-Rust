@@ -15,9 +15,10 @@ impl Database {
         let metadata = "{}".to_string();
 
         sqlx::query_as::<_, SessionRow>(
-            "INSERT INTO sessions (id, title, created_at, updated_at, metadata, workspace_dir) \
-             VALUES (?, ?, ?, ?, ?, NULL) \
-             RETURNING id, title, created_at, updated_at, metadata, workspace_dir",
+            "INSERT INTO sessions \
+               (id, title, created_at, updated_at, metadata, workspace_dir, context_summary, summary_watermark) \
+             VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL) \
+             RETURNING id, title, created_at, updated_at, metadata, workspace_dir, context_summary, summary_watermark",
         )
         .bind(id)
         .bind(title)
@@ -31,7 +32,7 @@ impl Database {
 
     pub async fn list_sessions(&self) -> Result<Vec<SessionRow>, EverEvoError> {
         sqlx::query_as::<_, SessionRow>(
-            "SELECT id, title, created_at, updated_at, metadata, workspace_dir \
+            "SELECT id, title, created_at, updated_at, metadata, workspace_dir, context_summary, summary_watermark \
              FROM sessions ORDER BY updated_at DESC",
         )
         .fetch_all(&self.pool)
@@ -41,7 +42,7 @@ impl Database {
 
     pub async fn get_session(&self, id: Uuid) -> Result<Option<SessionRow>, EverEvoError> {
         sqlx::query_as::<_, SessionRow>(
-            "SELECT id, title, created_at, updated_at, metadata, workspace_dir \
+            "SELECT id, title, created_at, updated_at, metadata, workspace_dir, context_summary, summary_watermark \
              FROM sessions WHERE id = ?",
         )
         .bind(id)
@@ -123,6 +124,43 @@ impl Database {
 
         Ok(())
     }
+
+    /// Read the durable rolling context summary + watermark for a session.
+    /// Returns (summary, watermark); both None when nothing summarized yet.
+    pub async fn get_session_context(
+        &self,
+        id: Uuid,
+    ) -> Result<(Option<String>, Option<String>), EverEvoError> {
+        let row: Option<(Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT context_summary, summary_watermark FROM sessions WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| EverEvoError::Database(format!("Get session context failed: {e}")))?;
+        Ok(row.unwrap_or((None, None)))
+    }
+
+    /// Persist the rolling context summary and advance its watermark.
+    /// Both None clears the summary (e.g. after /clear).
+    pub async fn update_session_context(
+        &self,
+        id: Uuid,
+        summary: Option<&str>,
+        watermark: Option<&str>,
+    ) -> Result<(), EverEvoError> {
+        sqlx::query(
+            "UPDATE sessions SET context_summary = ?, summary_watermark = ?, updated_at = ? \
+             WHERE id = ?",
+        )
+        .bind(summary)
+        .bind(watermark)
+        .bind(Utc::now())
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| EverEvoError::Database(format!("Update session context failed: {e}")))?;
+        Ok(())
+    }
 }
 
 // ── Messages ───────────────────────────────────────────────────────────
@@ -174,6 +212,48 @@ impl Database {
         Ok(rows)
     }
 
+    /// Fetch messages strictly newer than `after_created_at` (the rolling-summary
+    /// watermark time), oldest→newest. Used by incremental context maintenance
+    /// to summarize only the new tail since the last pass (spec rule 1).
+    pub async fn get_messages_after(
+        &self,
+        session_id: Uuid,
+        after_created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<MessageRow>, EverEvoError> {
+        sqlx::query_as::<_, MessageRow>(
+            "SELECT id, session_id, role, content, content_hash, tool_calls, tool_call_id, thinking, blocks_json, created_at
+             FROM messages WHERE session_id = ? AND created_at > ?
+             ORDER BY created_at ASC",
+        )
+        .bind(session_id)
+        .bind(after_created_at)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| EverEvoError::Database(format!("Get messages after failed: {e}")))
+    }
+
+    /// Resolve a message id (the summary watermark) to its created_at timestamp.
+    /// Returns None if the message no longer exists (session cleared) or the
+    /// watermark is not a valid UUID. The id column is a 16-byte BLOB, so the
+    /// string watermark must be parsed back to `Uuid` before binding.
+    pub async fn get_message_created_at(
+        &self,
+        session_id: Uuid,
+        message_id: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, EverEvoError> {
+        let Ok(id) = Uuid::parse_str(message_id) else {
+            return Ok(None);
+        };
+        sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+            "SELECT created_at FROM messages WHERE session_id = ? AND id = ?",
+        )
+        .bind(session_id)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| EverEvoError::Database(format!("Get message created_at failed: {e}")))
+    }
+
     pub async fn search_sessions(&self, query: &str) -> Result<Vec<SessionRow>, EverEvoError> {
         // Escape LIKE wildcards to prevent DoS via % and _ injection
         let escaped = query
@@ -183,7 +263,8 @@ impl Database {
         let pattern = format!("%{escaped}%");
         // SQLite uses \ as default escape char
         sqlx::query_as::<_, SessionRow>(
-            "SELECT DISTINCT s.id, s.title, s.created_at, s.updated_at, s.metadata, s.workspace_dir
+            "SELECT DISTINCT s.id, s.title, s.created_at, s.updated_at, s.metadata, s.workspace_dir, \
+                    s.context_summary, s.summary_watermark
              FROM sessions s
              LEFT JOIN messages m ON s.id = m.session_id
              WHERE s.title LIKE ? OR m.content LIKE ?

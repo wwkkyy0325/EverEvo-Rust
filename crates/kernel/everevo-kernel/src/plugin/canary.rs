@@ -45,7 +45,10 @@ impl CanaryRouter {
     }
 
     /// Evaluate whether a canary should be promoted, rolled back, or kept observing.
-    pub fn evaluate(&self, plugin_id: &str) -> Result<PromoteDecision, super::version::VersionError> {
+    pub fn evaluate(
+        &self,
+        plugin_id: &str,
+    ) -> Result<PromoteDecision, super::version::VersionError> {
         let config = self.store.load_config(plugin_id)?;
         let canary_ver = match &config.canary {
             Some(v) => v.clone(),
@@ -102,7 +105,10 @@ impl CanaryRouter {
     /// Evaluate and automatically apply the decision.
     ///
     /// Returns the decision that was made (or NoCanary if not applicable).
-    pub async fn evaluate_and_apply(&self, plugin_id: &str) -> Result<PromoteDecision, super::version::VersionError> {
+    pub async fn evaluate_and_apply(
+        &self,
+        plugin_id: &str,
+    ) -> Result<PromoteDecision, super::version::VersionError> {
         let decision = self.evaluate(plugin_id)?;
 
         match &decision {
@@ -258,7 +264,10 @@ mod tests {
         store.save_config("test", &config).unwrap();
 
         let router = CanaryRouter::new(store);
-        assert_eq!(router.evaluate("test").unwrap(), PromoteDecision::InsufficientData);
+        assert_eq!(
+            router.evaluate("test").unwrap(),
+            PromoteDecision::InsufficientData
+        );
     }
 
     #[test]

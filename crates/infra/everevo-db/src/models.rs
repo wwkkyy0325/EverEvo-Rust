@@ -15,6 +15,11 @@ pub struct SessionRow {
     pub metadata: String, // JSON string
     /// Per-session workspace directory (NULL = use sandbox default).
     pub workspace_dir: Option<String>,
+    /// Durable rolling conversation summary (NULL = none yet).
+    pub context_summary: Option<String>,
+    /// messages.id of the newest message already folded into context_summary.
+    /// NULL = nothing summarized yet.
+    pub summary_watermark: Option<String>,
 }
 
 /// A message row in the `messages` table.

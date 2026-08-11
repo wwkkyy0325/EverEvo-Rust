@@ -22,12 +22,12 @@ use std::time::Instant;
 use everevo_core::context::{ContextBuildContext, ContextFragment, ContextStage};
 use everevo_core::llm::LlmMessage;
 use everevo_core::memory::MemoryIndexEntry;
-use everevo_core::{RetrievalRecord, Telemetry};
+use everevo_core::{TelemetryEmitContext, TelemetryPipeline};
 use uuid::Uuid;
 
-use everevo_knowledge::graph::KnowledgeGraph;
-use crate::memory::facts::FactManager;
+use crate::memory::facts::{fact_visible_to, FactManager};
 use crate::rag::RagPipeline;
+use everevo_knowledge::graph::KnowledgeGraph;
 
 /// Injects relevant memory facts + knowledge graph context into the LLM context pipeline.
 ///
@@ -38,8 +38,11 @@ use crate::rag::RagPipeline;
 pub struct MemoryStage {
     fact_manager: Arc<FactManager>,
     max_facts: usize,
-    telemetry: Option<Arc<Telemetry>>,
+    telemetry: Option<Arc<TelemetryPipeline>>,
     trace_id: Option<Uuid>,
+    /// Originating session (分层记忆). Recall is filtered to this session's
+    /// working memory + the global tier — other sessions' facts stay hidden.
+    session_id: Option<Uuid>,
     /// Optional knowledge graph for entity/relation context injection.
     knowledge_graph: Option<Arc<std::sync::RwLock<KnowledgeGraph>>>,
     /// Optional RAG pipeline for vector similarity search.
@@ -56,10 +59,18 @@ impl MemoryStage {
             max_facts: 5,
             telemetry: None,
             trace_id: None,
+            session_id: None,
             knowledge_graph: None,
             rag_pipeline: None,
             workflows_dir: None,
         }
+    }
+
+    /// Bind the originating session so recall only sees this session's working
+    /// memory plus the global long-term tier (strict cross-session isolation).
+    pub fn with_session_id(mut self, session_id: Option<Uuid>) -> Self {
+        self.session_id = session_id;
+        self
     }
 
     /// Point at the workflow library so reusable workflows matching the query
@@ -69,7 +80,7 @@ impl MemoryStage {
         self
     }
 
-    pub fn with_telemetry(mut self, telemetry: Arc<Telemetry>, trace_id: Uuid) -> Self {
+    pub fn with_telemetry(mut self, telemetry: Arc<TelemetryPipeline>, trace_id: Uuid) -> Self {
         self.telemetry = Some(telemetry);
         self.trace_id = Some(trace_id);
         self
@@ -107,6 +118,12 @@ impl MemoryStage {
         let Ok(all_facts) = self.fact_manager.load_all() else {
             return vec![];
         };
+        // 分层记忆: recall sees only this session's working memory + the global
+        // long-term tier. Other sessions' facts are strictly isolated.
+        let all_facts: Vec<_> = all_facts
+            .into_iter()
+            .filter(|f| fact_visible_to(f, self.session_id.as_ref()))
+            .collect();
         if all_facts.is_empty() || user_message.trim().is_empty() {
             return vec![];
         }
@@ -241,18 +258,14 @@ impl MemoryStage {
             })
             .collect();
 
-        if let (Some(telemetry), Some(trace_id)) = (&self.telemetry, self.trace_id) {
-            let latency_ms = start.elapsed().as_millis() as i64;
-            telemetry.record_retrieval(RetrievalRecord {
-                trace_id,
-                query: user_message.to_string(),
-                source: "memory-rrf".into(),
-                recall_k: results.len() as i32,
-                precision_at_5: None,
-                mrr: None,
-                latency_ms,
-                experiment_id: None,
-                variant: None,
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.emit(&TelemetryEmitContext {
+                trace_id: self.trace_id,
+                retrieval_query: Some(user_message.to_string()),
+                retrieval_source: Some("memory-rrf".into()),
+                retrieval_recall_k: Some(results.len() as i32),
+                retrieval_latency_ms: Some(start.elapsed().as_millis() as i64),
+                ..Default::default()
             });
         }
 
@@ -275,10 +288,15 @@ impl ContextStage for MemoryStage {
 
         if relevant.is_empty() {
             // ── T1 bootstrap: session-start memory overview ──
+            // Session-filtered: only global tier + this session's facts.
             if is_first_turn {
                 if let Ok(t1_facts) = self.fact_manager.load_tier1() {
-                    if !t1_facts.is_empty() {
-                        let t1_lines: Vec<String> = t1_facts
+                    let t1_visible: Vec<_> = t1_facts
+                        .into_iter()
+                        .filter(|f| fact_visible_to(f, self.session_id.as_ref()))
+                        .collect();
+                    if !t1_visible.is_empty() {
+                        let t1_lines: Vec<String> = t1_visible
                             .iter()
                             .take(5)
                             .map(|f| format!("- {} — {}", f.name, f.description))
@@ -295,7 +313,22 @@ impl ContextStage for MemoryStage {
                 }
             }
 
-            let index = self.fact_manager.read_index_lean(50).ok()?;
+            // Build the persistent-memory index from session-visible facts
+            // (global tier + own session) instead of reading the raw MEMORY.md,
+            // which lists every session's facts.
+            let Ok(all_facts) = self.fact_manager.load_all() else {
+                return None;
+            };
+            let visible: Vec<_> = all_facts
+                .into_iter()
+                .filter(|f| fact_visible_to(f, self.session_id.as_ref()))
+                .collect();
+            let index = visible
+                .iter()
+                .take(50)
+                .map(|f| format!("- [{}](facts/{}.md) — {}", f.name, f.name, f.description))
+                .collect::<Vec<_>>()
+                .join("\n");
             if index.is_empty() {
                 return None;
             }
@@ -401,10 +434,8 @@ impl ContextStage for MemoryStage {
         }
 
         // ── Action Paradigms (SAMULE pattern: reuse learned strategies) ──
-        let paradigms = crate::memory::paradigm::search_paradigms(
-            &self.fact_manager,
-            &ctx.user_message,
-        );
+        let paradigms =
+            crate::memory::paradigm::search_paradigms(&self.fact_manager, &ctx.user_message);
         if !paradigms.is_empty() {
             content.push_str("\n\n## Action Paradigms (learned strategies)\n\n");
             for p in paradigms.iter().take(3) {

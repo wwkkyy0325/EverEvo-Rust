@@ -165,21 +165,19 @@ pub async fn extract_paradigm_from_trajectory(
 
             for (name, description, content) in &facts {
                 // Parse paradigm metadata from the content JSON block
-                let meta = parse_paradigm_meta(content, level)
-                    .unwrap_or_else(|| ParadigmMeta {
-                        problem_class: name.clone(),
-                        preconditions: Vec::new(),
-                        approach: description.clone(),
-                        parameters: Vec::new(),
-                        success_signals: Vec::new(),
-                        failure_modes: Vec::new(),
-                        divergence_point: None,
-                        anti_pattern: None,
-                        extraction_level: level,
-                    });
+                let meta = parse_paradigm_meta(content, level).unwrap_or_else(|| ParadigmMeta {
+                    problem_class: name.clone(),
+                    preconditions: Vec::new(),
+                    approach: description.clone(),
+                    parameters: Vec::new(),
+                    success_signals: Vec::new(),
+                    failure_modes: Vec::new(),
+                    divergence_point: None,
+                    anti_pattern: None,
+                    extraction_level: level,
+                });
 
-                let meta_json =
-                    serde_json::to_string(&meta).unwrap_or_else(|_| "{}".into());
+                let meta_json = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".into());
                 let full_content = format!(
                     "# Paradigm: {}\n\n**Approach**: {}\n\n**Problem Class**: {}\n\n{}\n\n---\n```json\n{}\n```",
                     name, meta.approach, meta.problem_class, content, meta_json
@@ -192,13 +190,10 @@ pub async fn extract_paradigm_from_trajectory(
                     fact_type: FactType::Paradigm,
                     created_at: chrono::Utc::now(),
                     updated_at: chrono::Utc::now(),
-                    projection: ProjectionMetadata::new(
-                        "paradigm-extractor",
-                        "llm",
-                        vec![],
-                        0.7,
-                    ),
+                    projection: ProjectionMetadata::new("paradigm-extractor", "llm", vec![], 0.7),
                     links: vec![],
+                    // Reusable action paradigm — deliberately cross-session.
+                    session: Some("global".into()),
                 };
                 match fact_manager.save_async(fact.clone()).await {
                     Ok(()) => saved += 1,
@@ -219,10 +214,7 @@ pub async fn extract_paradigm_from_trajectory(
 
 // ── Prompt Builder ─────────────────────────────────────────────────────────
 
-fn build_paradigm_extraction_prompt(
-    trajectory: &[TurnDigest],
-    has_failure: bool,
-) -> String {
+fn build_paradigm_extraction_prompt(trajectory: &[TurnDigest], has_failure: bool) -> String {
     let mut turns = String::new();
     for (i, t) in trajectory.iter().enumerate() {
         let status = if t.success { "✓" } else { "✗" };
@@ -337,7 +329,13 @@ mod tests {
 
     #[test]
     fn test_turn_digest_new() {
-        let d = TurnDigest::new("shell", false, Some("command not found"), "install pnpm", "Trying npm...");
+        let d = TurnDigest::new(
+            "shell",
+            false,
+            Some("command not found"),
+            "install pnpm",
+            "Trying npm...",
+        );
         assert_eq!(d.tool_name, "shell");
         assert!(!d.success);
         assert_eq!(d.error_type, Some("command not found".into()));
@@ -348,7 +346,13 @@ mod tests {
     fn test_trajectory_buffer_evicts_oldest() {
         let buf = TrajectoryBuffer::new(3);
         for i in 0..5 {
-            buf.push(TurnDigest::new(&format!("tool-{i}"), true, None, "test", "ok"));
+            buf.push(TurnDigest::new(
+                &format!("tool-{i}"),
+                true,
+                None,
+                "test",
+                "ok",
+            ));
         }
         let snapshot = buf.snapshot();
         assert_eq!(snapshot.len(), 3);

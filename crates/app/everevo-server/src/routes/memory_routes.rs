@@ -165,7 +165,9 @@ async fn trigger_dream(
     }))
 }
 
-async fn trigger_consolidate(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>, ApiError> {
+async fn trigger_consolidate(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     // Run DEEP consolidator pass on existing facts without REM themes
     match state
         .scheduler

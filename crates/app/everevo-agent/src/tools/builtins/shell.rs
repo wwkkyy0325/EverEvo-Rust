@@ -68,7 +68,7 @@ impl Tool for ShellTool {
             .as_str()
             .ok_or_else(|| EverEvoError::InvalidInput("command is required".into()))?;
 
-        let timeout_secs = params["timeout_secs"].as_u64().unwrap_or(30).min(300);
+        let mut timeout_secs = params["timeout_secs"].as_u64().unwrap_or(30).min(300);
         let working_dir = params["working_dir"].as_str().map(std::path::PathBuf::from);
 
         let mut config = ExecutionConfig::new(command).with_timeout(timeout_secs);
@@ -91,7 +91,25 @@ impl Tool for ShellTool {
         }
 
         // Permission gate — check before execution
-        let result = self.sandbox.execute(&config).await?;
+        let mut result = self.sandbox.execute(&config).await?;
+
+        // ── Compute-timeout rescue (one-shot auto-retry) ─────────────
+        // A compute cell (python/node/perl/awk…) that hit the default budget is
+        // retried ONCE with a larger budget — the GAIA exact-DP pattern dies at
+        // 30s and is recoverable. Gated to compute commands so interactive,
+        // network, or side-effecting commands are never silently re-run.
+        if result.killed_by_timeout && timeout_secs < 300 && is_compute_command(command) {
+            let retry = (timeout_secs * 3).min(300);
+            tracing::info!(
+                command,
+                timeout_secs,
+                retry,
+                "Compute cell timed out — one-shot retry"
+            );
+            let retry_config = config.clone().with_timeout(retry);
+            result = self.sandbox.execute(&retry_config).await?;
+            timeout_secs = retry;
+        }
 
         // ── Confirmation gate ──────────────────────────────────────
         if result.needs_confirmation {
@@ -125,7 +143,12 @@ impl Tool for ShellTool {
         // ── Exit code classification ──────────────────────────────
         if result.killed_by_timeout {
             return Ok(ToolOutput {
-                content: format!("Timeout after {timeout_secs}s\n\n{content}"),
+                content: format!(
+                    "Timeout after {timeout_secs}s\n\n{content}\n\n\
+                     If this is a long computation, re-run with `timeout_secs=300` \
+                     and checkpoint partial state to `work/` between steps so \
+                     progress survives the limit."
+                ),
                 is_error: true,
                 ..Default::default()
             });
@@ -158,6 +181,31 @@ impl Tool for ShellTool {
 }
 
 // ── Git Commit Guard ──────────────────────────────────────────────────────
+
+/// Heuristic: is this command a pure compute cell (safe to auto-retry on
+/// timeout)? Interpreter + an inline/script argument only — a bare interpreter
+/// (REPL) or `-m <module>` (pip/venv, network/mutating) is excluded, as are
+/// interactive, network, and file-mutating commands.
+fn is_compute_command(command: &str) -> bool {
+    let mut it = command.split_whitespace();
+    let first = it.next().unwrap_or("");
+    if !matches!(
+        first,
+        "python" | "python3" | "py" | "node" | "nodejs" | "perl" | "ruby" | "awk" | "bc" | "R"
+    ) {
+        return false;
+    }
+    // Bare interpreter with no args = interactive REPL — never auto-retry.
+    let second = match it.next() {
+        Some(s) => s,
+        None => return false,
+    };
+    // `-m <module>` runs a module: pip/venv/etc. are network/mutating.
+    if second == "-m" {
+        return false;
+    }
+    true
+}
 
 /// Check if a command is a destructive git operation that should require
 /// explicit user confirmation. Based on Claude Code community best practice:
@@ -215,5 +263,27 @@ mod tests {
     fn test_non_git_not_flagged() {
         assert!(!is_git_destructive("cargo build"));
         assert!(!is_git_destructive("npm test"));
+    }
+
+    #[test]
+    fn test_compute_commands_flagged() {
+        assert!(is_compute_command("python -c 'print(1)'"));
+        assert!(is_compute_command("python3 script.py"));
+        assert!(is_compute_command("node solve.js"));
+        assert!(is_compute_command(
+            "awk '{sum+=$1} END{print sum}' data.txt"
+        ));
+        assert!(is_compute_command("perl -e 'print 1'"));
+        assert!(is_compute_command("  python3 -c 'x=1'  ")); // leading/trailing ws
+    }
+
+    #[test]
+    fn test_non_compute_commands_not_flagged() {
+        assert!(!is_compute_command("git commit -m 'test'"));
+        assert!(!is_compute_command("curl https://example.com"));
+        assert!(!is_compute_command("ls -la"));
+        assert!(!is_compute_command("python"));
+        assert!(!is_compute_command(""));
+        assert!(!is_compute_command("python3 -m pip install x 2>&1 | head"));
     }
 }

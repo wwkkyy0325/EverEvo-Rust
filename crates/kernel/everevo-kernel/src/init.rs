@@ -66,6 +66,7 @@ pub async fn init(data_dir: impl Into<PathBuf>) -> Result<KernelState, String> {
         &mut tool_registry,
         Some(Arc::clone(&plugin_registry)),
         Some(plugins_source_dir.clone()),
+        None, // no per-session work_dir at global init
     );
 
     tracing::info!(
@@ -150,7 +151,7 @@ fn find_plugins_source_dir() -> Result<PathBuf, String> {
     // Try relative to the workspace root (development).
     // everevo-kernel is at crates/kernel/everevo-kernel → need 3 parents to reach root.
     let dev_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()              // crates/kernel
+        .parent() // crates/kernel
         .and_then(|p| p.parent()) // crates
         .and_then(|p| p.parent()) // project root
         .map(|p| p.join("plugins"));

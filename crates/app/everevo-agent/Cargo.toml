@@ -8,6 +8,7 @@ description = "EverEvo agent core — ReAct loop, tool registry, sandbox, knowle
 
 [dependencies]
 everevo-core = { path = "../../kernel/everevo-core" }
+everevo-net = { path = "../../infra/everevo-net" }
 everevo-db = { path = "../../infra/everevo-db" }
 everevo-downloader = { path = "../../infra/everevo-downloader" }
 everevo-bootstrap = { path = "../../infra/everevo-bootstrap" }
@@ -39,6 +40,7 @@ thiserror.workspace = true
 futures.workspace = true
 tokio-util.workspace = true
 async-trait = "0.1"
+base64 = "0.22"
 tracing.workspace = true
 reqwest.workspace = true
 which = "6"

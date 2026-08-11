@@ -64,6 +64,8 @@ pub async fn reflect_on_turn(
                         0.8,
                     ),
                     links: vec![],
+                    // Reflection lessons are cross-session reusable — global tier.
+                    session: Some("global".into()),
                 };
                 match fact_manager.save_async(fact.clone()).await {
                     Ok(()) => saved += 1,

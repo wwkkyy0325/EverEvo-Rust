@@ -46,14 +46,17 @@ pub fn build_registry(
         std::path::PathBuf::from("data"),
     )));
     registry.register(Arc::new(builtins::CompactTool::new()));
+    registry.register(Arc::new(builtins::ToolCacheReadTool::new()));
     registry.register(Arc::new(builtins::TeamTool::new()));
     registry.register(Arc::new(builtins::WorkflowRunnerTool::new()));
     let workspace = std::env::current_dir().unwrap_or_default();
     registry.register(Arc::new(builtins::CodeSearchTool::new(workspace.clone())));
     registry.register(Arc::new(builtins::CodeMapTool::new(workspace)));
     let skills_dir = std::path::PathBuf::from("data/skills");
-    let skill_reg = Arc::new(crate::skill::SkillRegistry::load(&skills_dir)
-        .unwrap_or_else(|_| crate::skill::SkillRegistry::empty()));
+    let skill_reg = Arc::new(
+        crate::skill::SkillRegistry::load(&skills_dir)
+            .unwrap_or_else(|_| crate::skill::SkillRegistry::empty()),
+    );
     registry.register(Arc::new(builtins::SkillTool::new(skill_reg)));
     registry
 }

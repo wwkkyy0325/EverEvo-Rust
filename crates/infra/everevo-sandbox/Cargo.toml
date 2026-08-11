@@ -25,5 +25,8 @@ tokio = { workspace = true, features = ["rt", "macros"] }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_JobObjects", "Win32_Security", "Win32_System_Threading", "Win32_Foundation"] }
 
+[target.'cfg(not(windows))'.dependencies]
+libc = "0.2"
+
 [lints]
 workspace = true

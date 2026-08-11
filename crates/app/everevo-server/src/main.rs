@@ -230,14 +230,29 @@ async fn cmd_serve(config: everevo_core::AppConfig, host: &str, port: u16) {
     }
 
     // ── Dreaming Scheduler ─────────────────────────────────────
-    let persona_profile = state.config.data_dir.join("memory").join("persona").join("profile.json");
-    let scheduler_handle = state.scheduler.start_background(
-        Arc::clone(&state.dreaming_engine),
-        Arc::clone(&state.fact_manager),
-        Arc::clone(&state.wiki_generator),
-        Some(persona_profile),
-    );
-    tracing::info!("Dreaming scheduler started");
+    let persona_profile = state
+        .config
+        .data_dir
+        .join("memory")
+        .join("persona")
+        .join("profile.json");
+    // Benchmark mode (EVEREVO_BENCHMARK=1) skips the dreaming scheduler —
+    // its DEEP phase promotes ALL sessions' content into shared global facts
+    // + KG, leaking answers across GAIA questions. Mirrors the gate in
+    // AppState::new (app_state.rs). (Note: start_background has no
+    // double-start guard, so this is the second of two call sites.)
+    let scheduler_handle = if std::env::var("EVEREVO_BENCHMARK").is_err() {
+        let handle = state.scheduler.start_background(
+            Arc::clone(&state.dreaming_engine),
+            Arc::clone(&state.fact_manager),
+            Arc::clone(&state.wiki_generator),
+            Some(persona_profile),
+        );
+        tracing::info!("Dreaming scheduler started");
+        Some(handle)
+    } else {
+        None
+    };
 
     // ── Domain Global Inbox Watcher ───────────────────────────────
     // Monitors data/domain/inbox/ for new files every 2 minutes.
@@ -397,7 +412,9 @@ async fn cmd_serve(config: everevo_core::AppConfig, host: &str, port: u16) {
     state.destroy_all_sandboxes().await;
     state.scheduler.stop();
     tracing::info!("Dreaming scheduler stopped, waiting for background task...");
-    let _ = scheduler_handle.await;
+    if let Some(handle) = scheduler_handle {
+        let _ = handle.await;
+    }
     tracing::info!("Shutdown complete.");
 }
 

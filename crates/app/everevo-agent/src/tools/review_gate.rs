@@ -66,11 +66,7 @@ impl ToolHook for ReviewGateHook {
         *last = None;
     }
 
-    async fn pre_execute(
-        &self,
-        tool_name: &str,
-        params: &Value,
-    ) -> Result<(), EverEvoError> {
+    async fn pre_execute(&self, tool_name: &str, params: &Value) -> Result<(), EverEvoError> {
         // ── Check 1: Empty / broken parameters ──────────────────────
         if let Some(obj) = params.as_object() {
             for (key, val) in obj {
@@ -123,7 +119,10 @@ impl ToolHook for ReviewGateHook {
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn is_required_param(key: &str) -> bool {
-    matches!(key, "command" | "file_path" | "query" | "url" | "content" | "message")
+    matches!(
+        key,
+        "command" | "file_path" | "query" | "url" | "content" | "message"
+    )
 }
 
 fn hash_json(v: &Value) -> u64 {
@@ -185,7 +184,9 @@ mod tests {
         // Second identical shell is blocked
         assert!(rt().block_on(gate.pre_execute("shell", &params)).is_err());
         // Different tool resets the tracked call
-        assert!(rt().block_on(gate.pre_execute("web_search", &params)).is_ok());
+        assert!(rt()
+            .block_on(gate.pre_execute("web_search", &params))
+            .is_ok());
         // Shell again after different tool — not redundant (intentional retry)
         assert!(rt().block_on(gate.pre_execute("shell", &params)).is_ok());
     }
@@ -194,11 +195,11 @@ mod tests {
     fn test_different_args_allowed() {
         let gate = ReviewGateHook::new(RiskLevel::High);
 
-        assert!(rt().block_on(
-            gate.pre_execute("shell", &serde_json::json!({"cmd": "ls"}))
-        ).is_ok());
-        assert!(rt().block_on(
-            gate.pre_execute("shell", &serde_json::json!({"cmd": "pwd"}))
-        ).is_ok());
+        assert!(rt()
+            .block_on(gate.pre_execute("shell", &serde_json::json!({"cmd": "ls"})))
+            .is_ok());
+        assert!(rt()
+            .block_on(gate.pre_execute("shell", &serde_json::json!({"cmd": "pwd"})))
+            .is_ok());
     }
 }

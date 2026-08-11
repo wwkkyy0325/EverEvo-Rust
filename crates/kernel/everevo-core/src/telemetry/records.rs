@@ -27,6 +27,12 @@ pub struct AgentTurnRecord {
     pub latency_ms: i64,
     pub tokens_input: i64,
     pub tokens_output: i64,
+    /// Classified error for this turn, e.g. "tool_error" when some tool calls
+    /// failed. `None` when the turn was clean. Lets telemetry diagnose a
+    /// failing question without scraping the message DB.
+    pub error_type: Option<String>,
+    /// Human-readable error detail (best effort), e.g. "2 of 5 tool calls failed".
+    pub error_message: Option<String>,
     pub experiment_id: Option<String>,
     pub variant: Option<String>,
 }

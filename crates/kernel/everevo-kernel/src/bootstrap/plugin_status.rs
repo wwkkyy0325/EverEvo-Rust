@@ -25,7 +25,9 @@ impl PluginStatus {
 
 #[async_trait]
 impl Tool for PluginStatus {
-    fn name(&self) -> &str { "plugin_status" }
+    fn name(&self) -> &str {
+        "plugin_status"
+    }
     fn description(&self) -> &str {
         "Check plugin health, manage canary deployments, promote/rollback versions. \
          Actions: 'status' (default, shows metrics and versions), \
@@ -61,7 +63,9 @@ impl Tool for PluginStatus {
             "required": []
         })
     }
-    fn risk_level(&self) -> RiskLevel { RiskLevel::Low }
+    fn risk_level(&self) -> RiskLevel {
+        RiskLevel::Low
+    }
 
     async fn execute(
         &self,
@@ -70,9 +74,11 @@ impl Tool for PluginStatus {
     ) -> Result<ToolOutput, EverEvoError> {
         let registry = match &self.registry {
             Some(r) => r,
-            None => return Ok(ToolOutput::text(
-                "Plugin registry not initialized — plugin_status unavailable."
-            )),
+            None => {
+                return Ok(ToolOutput::text(
+                    "Plugin registry not initialized — plugin_status unavailable.",
+                ))
+            }
         };
 
         let action = params["action"].as_str().unwrap_or("status");
@@ -83,7 +89,8 @@ impl Tool for PluginStatus {
             "promote" => self.handle_promote(registry, &params),
             "evaluate" => self.handle_evaluate(registry, &params),
             _ => Ok(ToolOutput {
-                content: "Unknown action. Use 'status', 'set_canary', 'promote', or 'evaluate'.".into(),
+                content: "Unknown action. Use 'status', 'set_canary', 'promote', or 'evaluate'."
+                    .into(),
                 is_error: true,
                 ..Default::default()
             }),
@@ -100,9 +107,15 @@ impl PluginStatus {
         if let Some(plugin_id) = params["plugin_id"].as_str() {
             match registry.store().load_config(plugin_id) {
                 Ok(config) => {
-                    let versions = registry.store().list_versions(plugin_id).unwrap_or_default();
+                    let versions = registry
+                        .store()
+                        .list_versions(plugin_id)
+                        .unwrap_or_default();
                     let canary_info = match &config.canary {
-                        Some(v) => format!("canary: {v} ({}% traffic)", (config.canary_pct * 100.0) as u32),
+                        Some(v) => format!(
+                            "canary: {v} ({}% traffic)",
+                            (config.canary_pct * 100.0) as u32
+                        ),
                         None => "no active canary".into(),
                     };
                     let mut result = format!(
@@ -137,10 +150,18 @@ impl PluginStatus {
                         match registry.store().load_config(&id) {
                             Ok(config) => {
                                 let m = config.metrics.get(&config.stable);
-                                let success = m.map(|m| format!("{:.1}%", m.success_rate() * 100.0))
+                                let success = m
+                                    .map(|m| format!("{:.1}%", m.success_rate() * 100.0))
                                     .unwrap_or_else(|| "N/A".into());
-                                let canary_note = config.canary.as_ref()
-                                    .map(|v| format!(" [canary:{v} @{}%]", (config.canary_pct*100.0) as u32))
+                                let canary_note = config
+                                    .canary
+                                    .as_ref()
+                                    .map(|v| {
+                                        format!(
+                                            " [canary:{v} @{}%]",
+                                            (config.canary_pct * 100.0) as u32
+                                        )
+                                    })
                                     .unwrap_or_default();
                                 result.push_str(&format!(
                                     "  {id}: stable={}, success={success}{canary_note}\n",
@@ -168,7 +189,8 @@ impl PluginStatus {
         let pct = params["pct"].as_f64().unwrap_or(0.1);
         if plugin_id.is_empty() || version.is_empty() {
             return Ok(ToolOutput {
-                content: "Provide 'plugin_id', 'version', and optionally 'pct' for set_canary.".into(),
+                content: "Provide 'plugin_id', 'version', and optionally 'pct' for set_canary."
+                    .into(),
                 is_error: true,
                 ..Default::default()
             });
@@ -194,16 +216,23 @@ impl PluginStatus {
         let version = params["version"].as_str().unwrap_or("");
         if plugin_id.is_empty() {
             return Ok(ToolOutput {
-                content: "Provide 'plugin_id' for promote (version optional — promotes current canary).".into(),
+                content:
+                    "Provide 'plugin_id' for promote (version optional — promotes current canary)."
+                        .into(),
                 is_error: true,
                 ..Default::default()
             });
         }
         // Verify there IS an active canary before promoting
-        let config = registry.store().load_config(plugin_id)
+        let config = registry
+            .store()
+            .load_config(plugin_id)
             .map_err(|e| EverEvoError::Internal(format!("load_config: {e}")))?;
-        let canary_ver = config.canary
-            .ok_or_else(|| EverEvoError::Internal(format!("No active canary for '{plugin_id}'. Use set_canary first.")))?;
+        let canary_ver = config.canary.ok_or_else(|| {
+            EverEvoError::Internal(format!(
+                "No active canary for '{plugin_id}'. Use set_canary first."
+            ))
+        })?;
         // If a specific version was requested, verify it matches the active canary
         if !version.is_empty() && version != canary_ver {
             return Ok(ToolOutput {
@@ -240,30 +269,32 @@ impl PluginStatus {
             .map_err(|e| EverEvoError::Internal(format!("evaluate: {e}")))?;
 
         // Also gather metrics for the report
-        let config = registry.store().load_config(plugin_id)
+        let config = registry
+            .store()
+            .load_config(plugin_id)
             .map_err(|e| EverEvoError::Internal(format!("load_config: {e}")))?;
         let stable_m = config.metrics.get(&config.stable);
         let canary_m = config.canary.as_ref().and_then(|v| config.metrics.get(v));
 
         let mut report = match &decision {
-            PromoteDecision::Promote => format!(
-                "✓ PROMOTE: {plugin_id} canary is ready for promotion.\n"
-            ),
-            PromoteDecision::Rollback => format!(
-                "✗ ROLLBACK: {plugin_id} canary should be rolled back.\n"
-            ),
-            PromoteDecision::KeepObserving => format!(
-                "⟳ KEEP OBSERVING: {plugin_id} canary metrics are within tolerance.\n"
-            ),
-            PromoteDecision::InsufficientData => format!(
-                "? INSUFFICIENT DATA: {plugin_id} needs ≥100 samples for evaluation.\n"
-            ),
-            PromoteDecision::Observing => format!(
-                "⏳ OBSERVING: {plugin_id} has enough samples but needs more time.\n"
-            ),
-            PromoteDecision::NoCanary => format!(
-                "○ NO CANARY: {plugin_id} has no active canary.\n"
-            ),
+            PromoteDecision::Promote => {
+                format!("✓ PROMOTE: {plugin_id} canary is ready for promotion.\n")
+            }
+            PromoteDecision::Rollback => {
+                format!("✗ ROLLBACK: {plugin_id} canary should be rolled back.\n")
+            }
+            PromoteDecision::KeepObserving => {
+                format!("⟳ KEEP OBSERVING: {plugin_id} canary metrics are within tolerance.\n")
+            }
+            PromoteDecision::InsufficientData => {
+                format!("? INSUFFICIENT DATA: {plugin_id} needs ≥100 samples for evaluation.\n")
+            }
+            PromoteDecision::Observing => {
+                format!("⏳ OBSERVING: {plugin_id} has enough samples but needs more time.\n")
+            }
+            PromoteDecision::NoCanary => {
+                format!("○ NO CANARY: {plugin_id} has no active canary.\n")
+            }
         };
 
         if let (Some(sm), Some(cm)) = (stable_m, canary_m) {
@@ -285,8 +316,7 @@ impl PluginStatus {
                     "Run plugin_rollback(plugin_id='{plugin_id}') to revert.",
                 PromoteDecision::KeepObserving | PromoteDecision::Observing =>
                     "Wait and re-evaluate later.",
-                PromoteDecision::InsufficientData =>
-                    "Wait for more traffic before evaluating.",
+                PromoteDecision::InsufficientData => "Wait for more traffic before evaluating.",
                 PromoteDecision::NoCanary =>
                     "Run plugin_status(action='set_canary', ...) to start a canary deployment.",
             }

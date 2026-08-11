@@ -182,6 +182,11 @@ pub struct ContextBuildContext {
     /// Feedback from ReflectGate sync quick-check (hook_feedback).
     /// Set after each tool execution; read by AgentLoop for next-turn injection.
     pub hook_feedback: Option<String>,
+    /// Durable rolling conversation summary (spec D3). Maintained incrementally
+    /// in the background (Layer-1) and persisted to the sessions table; injected
+    /// before the sliding-window history so the model sees what happened before
+    /// the window. Never re-summarized (rule 1).
+    pub summary: Option<String>,
 }
 
 // ── Context Stage Trait ─────────────────────────────────────────────────
@@ -397,6 +402,32 @@ impl ContextStage for SystemPromptStage {
     }
 }
 
+/// Injects the durable rolling conversation summary before the history window
+/// (spec D3). The summary is maintained incrementally and kept verbatim — it is
+/// never re-summarized (rule 1).
+pub struct RollingSummaryStage;
+
+impl ContextStage for RollingSummaryStage {
+    fn priority(&self) -> i32 {
+        75 // between domain knowledge (4+) and conversation history (80)
+    }
+    fn name(&self) -> &str {
+        "rolling_summary"
+    }
+    fn build(&self, ctx: &ContextBuildContext) -> Option<ContextFragment> {
+        let summary = ctx.summary.as_deref()?;
+        if summary.trim().is_empty() {
+            return None;
+        }
+        Some(ContextFragment {
+            label: "Rolling Summary".into(),
+            messages: vec![LlmMessage::user(format!(
+                "<conversation_summary>\n{summary}\n</conversation_summary>"
+            ))],
+        })
+    }
+}
+
 /// Injects current-session conversation history with a sliding-window cap.
 pub struct ConversationHistoryStage {
     /// Maximum number of past messages to include (oldest are dropped first).
@@ -505,10 +536,7 @@ impl ContextStage for SessionMetadataStage {
                 // Truncate very long context files to avoid blowing context budget
                 let truncated = if content.chars().count() > 4000 {
                     let safe: String = content.chars().take(4000).collect();
-                    format!(
-                        "{safe}...\n[truncated — full file at {}]",
-                        path
-                    )
+                    format!("{safe}...\n[truncated — full file at {}]", path)
                 } else {
                     content.clone()
                 };
@@ -548,7 +576,17 @@ impl ContextStage for SessionMetadataStage {
              - Dangerous operations require confirmation regardless of path.\n\
              - If something is denied: explain why and suggest an alternative.\n\
              - If a tool or runtime is missing: use `which <name>` to check, \
-             then tell the user what's needed.\n",
+             then tell the user what's needed.\n\n\
+             ## Self-Evolution (Plugin & Skill Modification)\n\n\
+             You can evolve your own capabilities by modifying plugins, skills, \
+             and workflows:\n\
+             - `plugin_dev` — list all plugins, read/edit source, compile new versions\n\
+             - `plugin_status` — check plugin versions, manage canary deployments\n\
+             - `plugin_rollback` — emergency rollback any plugin to its stable version\n\
+             - `skill_compose` / `skill_search` — create and discover reusable skills\n\
+             - `workflow_run` / `save_workflow` — execute and sediment repeatable procedures\n\
+             Kernel code (crates/kernel/) is IMMUTABLE and protected — you can only \
+             modify code under plugins/ and workflows under data/workflows/.\n",
             shell = shell,
             perm = perm,
             tools = ctx.tool_count,
@@ -690,6 +728,7 @@ pub fn default_pipeline() -> ContextPipeline {
         .with_stage(SystemPromptStage::new(SYSTEM_PROMPT))
         .with_stage(TaskStateStage)
         .with_stage(SessionMetadataStage)
+        .with_stage(RollingSummaryStage)
         .with_stage(ConversationHistoryStage::default())
         .with_stage(LatestMessageStage)
 }
@@ -699,11 +738,14 @@ pub fn default_pipeline() -> ContextPipeline {
 pub const SYSTEM_PROMPT: &str = "\
 You are EverEvo, a desktop AI agent. Use tools to DO things — never just describe.\n\
 \n\
-## Tool Rules (MUST FOLLOW)\n\
+## Tool Preferences\n\
 \n\
-Shell is LAST RESORT. Use specialized tools first:\n\
+You have specialized tools for common operations. Prefer them — they are safer,\n\
+more reliable, and cheaper than shell. This is guidance, not a hard rule: use\n\
+your judgment, and fall back to shell when a specialized tool fails or doesn't\n\
+fit the task.\n\
 \n\
-| Operation | ✅ | ❌ |\n\
+| Operation | Prefer | Shell fallback |\n\
 |-----------|---|---|\n\
 | Read file | `read_file` | `shell cat` |\n\
 | Write file | `write_file` | `shell echo` |\n\
@@ -712,8 +754,8 @@ Shell is LAST RESORT. Use specialized tools first:\n\
 | Search web | `web_search` | `shell curl` |\n\
 | Fetch URL | `web_fetch` | `shell curl` |\n\
 | Download | `download` | `shell wget` |\n\
-| Build/test/run | `shell` | — (OK) |\n\
-| Git/packages | `shell` | — (OK) |\n\
+| Build/test/run | `shell` | — |\n\
+| Git/packages | `shell` | — |\n\
 \n\
 Other tools: `TodoWrite` (tasks, scope=session/global), `Task` (sub-agents) + \
 `cancel_task` (stop one by id), `team`/`cluster`/`parallel_agents` (multi-agent), \
@@ -748,9 +790,10 @@ spans conversations.\n\
 \n\
 ## Critical Rules\n\
 \n\
-- **2-failure limit**: If a command fails twice, STOP. Diagnose root cause \
-(`which`, `echo $VAR`, read error), web_search the error, switch approach \
-(SSH→HTTPS, different library). Never retry with minor tweaks.\n\
+- **Anti-fixation**: If the same command fails repeatedly, pause and diagnose the \
+root cause (`which`, `echo $VAR`, read the error), web_search the error, and \
+switch approach (SSH→HTTPS, different library). Retrying with minor tweaks \
+rarely helps — when a loop forms, stop and reconsider instead.\n\
 - **\"我做了X\" = report, not request**: User stating completion → VERIFY, don't redo.\n\
 - **\"继续\" = resume oldest PENDING TodoWrite task**, not most recent topic.\n\
 - **SSH→HTTPS**: Use `git clone https://...` and `gh` CLI. Never `git@github.com:`.\n\
@@ -760,6 +803,9 @@ spans conversations.\n\
 - **Type `/help`** to see slash commands. `/clear` resets context. `/compact` saves space.\n\
 - **Admit when stuck**: \"I tried X, Y, Z. Here's what failed and what I need.\" \
 Better than looping.\n\
+- **Authoritative verification**: Time-sensitive or factual claims (dates, versions, \
+APIs, current events, commands) — verify against authoritative web sources \
+(`web_search`/`web_fetch`) before claiming done. Don't rely on memory or assumptions.\n\
 - Verify before claiming done. Fix code, never weaken tests. Match existing style.";
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -798,6 +844,29 @@ mod tests {
     }
 
     // ── truncate_content ──────────────────────────────────────────────
+
+    // ── RollingSummaryStage (spec D3) ──────────────────────────────────
+
+    #[test]
+    fn rolling_summary_emits_when_summary_present() {
+        let mut ctx = ContextBuildContext::default();
+        ctx.summary = Some("Atlas migration planned for 2026-09-15.".into());
+        let frag = RollingSummaryStage.build(&ctx).expect("stage contributes");
+        assert_eq!(frag.messages.len(), 1);
+        assert!(frag.messages[0].content.contains("Atlas migration planned"));
+        assert!(frag.messages[0].content.contains("<conversation_summary>"));
+    }
+
+    #[test]
+    fn rolling_summary_none_when_unset() {
+        let ctx = ContextBuildContext::default(); // summary = None
+        assert!(RollingSummaryStage.build(&ctx).is_none());
+    }
+
+    #[test]
+    fn rolling_summary_priority_before_history() {
+        assert!(RollingSummaryStage.priority() < ConversationHistoryStage::default().priority());
+    }
 
     #[test]
     fn test_truncate_content_under_limit() {

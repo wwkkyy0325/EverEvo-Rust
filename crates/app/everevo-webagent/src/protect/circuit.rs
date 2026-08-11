@@ -29,8 +29,8 @@ struct Entry {
 
 pub struct CircuitBreaker {
     entries: Mutex<HashMap<String, Entry>>,
-    threshold: u32,        // consecutive failures to trip
-    cooldown: Duration,    // time in Open before HalfOpen
+    threshold: u32,     // consecutive failures to trip
+    cooldown: Duration, // time in Open before HalfOpen
 }
 
 impl CircuitBreaker {

@@ -120,7 +120,10 @@ pub(crate) fn dangerous_patterns() -> Vec<String> {
         // ── Persistence ───────────────────────────────────────────────
         "crontab".into(),
         "schtasks".into(),
-        "at ".into(),
+        // Anchored to command start: the `at` scheduler runs `at 09:00 cmd`,
+        // but a bare `"at "` substring also flags `cat `, `format `, `data `, …
+        // (verified false positive at SemiAuto).
+        "^at ".into(),
         "rc.local".into(),
         "init.d".into(),
         ".bashrc".into(),

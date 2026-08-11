@@ -43,7 +43,8 @@ pub fn extract_meta_tags(html: &str) -> Vec<(String, String)> {
                 if let Some(quote) = html[val_start..].find('"') {
                     let value = html[val_start..val_start + quote].to_string();
                     // Extract the property name
-                    let prop = html[abs_start..].chars()
+                    let prop = html[abs_start..]
+                        .chars()
                         .take_while(|&c| c != '"')
                         .collect::<String>();
                     results.push((prop, value));
@@ -63,7 +64,8 @@ mod tests {
 
     #[test]
     fn test_extract_json_ld() {
-        let html = r#"<script type="application/ld+json">{"@type":"Article","name":"Test"}</script>"#;
+        let html =
+            r#"<script type="application/ld+json">{"@type":"Article","name":"Test"}</script>"#;
         let items = extract_json_ld(html);
         assert_eq!(items.len(), 1);
         assert!(items[0].contains("Article"));

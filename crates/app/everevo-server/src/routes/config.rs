@@ -17,6 +17,11 @@ pub struct LlmProviderConfig {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
+    /// Provider context window in tokens (optional). Used by context
+    /// compaction to budget chunk summarization (D1). Vision providers must
+    /// stay ≤ 32K to protect VRAM on the 6GB local GPU.
+    #[serde(default)]
+    pub context_window: Option<u32>,
 }
 
 fn default_id() -> String {
@@ -31,6 +36,16 @@ pub struct RoutingSettings {
     #[serde(default)]
     #[serde(rename = "mainEffort")]
     pub main_effort: Option<String>,
+    /// Provider id used for image description (`describe_image` tool).
+    /// Falls back to a `[[llm]]` entry with id "vision" if unset.
+    #[serde(default)]
+    #[serde(rename = "visionModelId")]
+    pub vision_model_id: Option<String>,
+    /// Provider id used for context compaction / rolling summary.
+    /// Unset → falls back to the main execution model ("有哪个用哪个").
+    #[serde(default)]
+    #[serde(rename = "compactModelId")]
+    pub compact_model_id: Option<String>,
     #[serde(default)]
     pub tiers: Vec<CascadeTier>,
 }
@@ -74,6 +89,7 @@ async fn get_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
             serde_json::json!({
                 "id": p.id, "api_format": p.api_format,
                 "api_key": p.api_key, "base_url": p.base_url, "model": p.model,
+                "context_window": p.context_window,
             })
         })
         .collect();
@@ -100,7 +116,9 @@ async fn put_config(
             let mut new_map: HashMap<String, Option<Arc<everevo_agent::llm::HttpClient>>> =
                 HashMap::new();
             for p in &providers {
-                if !p.api_key.is_empty() {
+                // Local providers (e.g. llama-server vision) have no api_key —
+                // a base_url alone is enough to build a client.
+                if !p.api_key.is_empty() || !p.base_url.is_empty() {
                     let client = everevo_agent::llm::HttpClient::new(
                         &p.api_format,
                         &p.api_key,
@@ -116,6 +134,7 @@ async fn put_config(
             }
             guard.retain(|id, _| new_map.contains_key(id));
             drop(guard);
+            state.resolve_special_providers().await;
 
             if !new_map.is_empty() {
                 state.llm_notify.notify_one();
@@ -165,6 +184,7 @@ async fn reload_llm(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
     // Remove providers that no longer exist
     guard.retain(|id, _| new_map.contains_key(id));
     drop(guard);
+    state.resolve_special_providers().await;
 
     // Wake the init pipeline if it's waiting for LLM config
     if !providers.is_empty() {
@@ -208,6 +228,8 @@ async fn get_routing(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
     Json(serde_json::json!({
         "mainModelId": routing.main_model_id.unwrap_or_default(),
         "mainEffort": routing.main_effort.unwrap_or_else(|| "auto".to_string()),
+        "visionModelId": routing.vision_model_id.unwrap_or_default(),
+        "compactModelId": routing.compact_model_id.unwrap_or_default(),
         "tiers": tiers,
     }))
 }
@@ -245,15 +267,77 @@ async fn put_routing(
         .get("mainEffort")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let vision_model_id = body
+        .get("visionModelId")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let compact_model_id = body
+        .get("compactModelId")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     settings.routing = Some(RoutingSettings {
         tiers,
         main_model_id,
         main_effort,
+        vision_model_id,
+        compact_model_id,
     });
     match save_settings(&state, &settings).await {
-        Ok(_) => Ok(Json(serde_json::json!({ "ok": true }))),
+        Ok(_) => {
+            state.resolve_special_providers().await;
+            Ok(Json(serde_json::json!({ "ok": true })))
+        }
         Err(e) => Err(ApiError::internal(e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn routing_settings_roundtrip_new_fields() {
+        let settings = RoutingSettings {
+            main_model_id: Some("deepseek".into()),
+            main_effort: Some("high".into()),
+            vision_model_id: Some("vision".into()),
+            compact_model_id: Some("compact".into()),
+            tiers: vec![],
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        let parsed: RoutingSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.vision_model_id.as_deref(), Some("vision"));
+        assert_eq!(parsed.compact_model_id.as_deref(), Some("compact"));
+        assert_eq!(parsed.main_model_id.as_deref(), Some("deepseek"));
+        // Exact JSON keys (camelCase) that the frontend PUT/GET round-trips.
+        assert!(json.contains("\"visionModelId\":\"vision\""));
+        assert!(json.contains("\"compactModelId\":\"compact\""));
+
+        // Absent fields default to None (non-breaking for old clients).
+        let parsed: RoutingSettings = serde_json::from_str("{\"mainModelId\":\"x\"}").unwrap();
+        assert_eq!(parsed.vision_model_id, None);
+        assert_eq!(parsed.compact_model_id, None);
+    }
+
+    #[test]
+    fn provider_config_context_window_roundtrip() {
+        let p = LlmProviderConfig {
+            id: "vision".into(),
+            api_format: "openai".into(),
+            api_key: String::new(),
+            base_url: "http://127.0.0.1:8080/v1".into(),
+            model: "qwen3-vl-2b-instruct".into(),
+            context_window: Some(32_768),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let parsed: LlmProviderConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.context_window, Some(32_768));
+        // Old client without the field → None (non-breaking).
+        let parsed: LlmProviderConfig =
+            serde_json::from_str("{\"id\":\"x\",\"api_format\":\"openai\",\"api_key\":\"\",\"base_url\":\"\",\"model\":\"m\"}")
+                .unwrap();
+        assert_eq!(parsed.context_window, None);
     }
 }
 

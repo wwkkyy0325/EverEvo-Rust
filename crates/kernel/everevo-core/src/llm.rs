@@ -30,6 +30,14 @@ pub trait LlmProvider: Send + Sync {
         let resp = self.chat(messages, tools).await?;
         Ok(vec![StreamEvent::Text(resp.content.unwrap_or_default())])
     }
+
+    /// Server-side (provider-executed) tool the API supports natively, e.g.
+    /// `web_search_20250305`. Returns `Some(schema)` to declare the tool to
+    /// the model; the provider executes it within the turn (the loop must NOT
+    /// dispatch it as a client tool). Default: no native tool.
+    fn native_web_search_tool(&self) -> Option<ToolSchema> {
+        None
+    }
 }
 
 // ── Message Types ───────────────────────────────────────────────────────
@@ -78,6 +86,11 @@ pub struct ToolSchema {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
+    /// Server-side (provider-executed) tool type, e.g. `web_search_20250305`.
+    /// When set, the schema is emitted WITHOUT an `input_schema` so the API
+    /// executes the tool server-side (model issues `server_tool_use`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_type: Option<String>,
 }
 
 // ── Response Types ──────────────────────────────────────────────────────
@@ -115,7 +128,24 @@ pub enum StreamEvent {
         id: String,
         arg_delta: String,
     },
-    Done,
+    /// A server-side (provider-executed) tool call, e.g. native web search.
+    /// The provider runs the tool and injects the result within the same turn;
+    /// the loop must NOT dispatch it as a client tool.
+    ServerToolUse {
+        name: String,
+    },
+    /// Stream completed. Carries real token counts from the LLM API.
+    Done {
+        input_tokens: u32,
+        output_tokens: u32,
+        /// Provider `stop_reason` (`end_turn` | `max_tokens` | `tool_use` | ...).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_reason: Option<String>,
+    },
+    /// Terminal error from the LLM provider (auth, bad request, quota).
+    /// The agent loop surfaces this as a real error (SSE `error` event), so
+    /// it is never scored as the model's answer by the GAIA harness.
+    Error(String),
 }
 
 // ── Constructors ────────────────────────────────────────────────────────

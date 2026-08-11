@@ -21,9 +21,9 @@
 
 use std::path::PathBuf;
 
-use everevo_knowledge::domain::DomainManager;
 use everevo_core::context::{ContextBuildContext, ContextFragment, ContextStage};
 use everevo_core::llm::LlmMessage;
+use everevo_knowledge::domain::DomainManager;
 
 /// Injects relevant domain knowledge chunks into the agent's context.
 ///

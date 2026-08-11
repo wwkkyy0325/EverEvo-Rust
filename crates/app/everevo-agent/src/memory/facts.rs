@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use everevo_core::memory::MemoryFact;
 use everevo_core::EverEvoError;
+use uuid::Uuid;
 
 use super::frontmatter::{parse_fact_file, serialize_fact_file};
 use super::index::{load_all_facts, regenerate_index};
@@ -34,6 +35,18 @@ pub struct FactWriteTask {
 
 /// Sender for the serialized fact-writer actor.
 pub type FactWriteTx = tokio::sync::mpsc::UnboundedSender<FactWriteTask>;
+
+/// Whether a fact is visible to the given session's recall (分层记忆 scoping).
+///
+/// Untagged (`None`, legacy) and `"global"` facts are cross-session long-term
+/// memory — visible to every session. A `Some(uuid)` fact is session-scoped
+/// working memory — strictly isolated, visible only to its own session.
+pub fn fact_visible_to(fact: &MemoryFact, session_id: Option<&Uuid>) -> bool {
+    match fact.session.as_deref() {
+        None | Some("global") => true,
+        Some(owner) => session_id.is_some_and(|sid| sid.to_string() == owner),
+    }
+}
 
 /// Manages the facts directory (data/memory/facts/).
 ///
@@ -177,12 +190,7 @@ impl FactManager {
                 let db = Arc::clone(db);
                 tokio::spawn(async move {
                     if let Err(e) = db
-                        .upsert_fact(
-                            &task.id,
-                            &task.description,
-                            &task.content,
-                            &task.fact_type,
-                        )
+                        .upsert_fact(&task.id, &task.description, &task.content, &task.fact_type)
                         .await
                     {
                         tracing::warn!(error = %e, "Fact SQLite indexing failed");
@@ -317,20 +325,6 @@ impl FactManager {
             .collect())
     }
 
-    /// Read the MEMORY.md index (first 300 lines for context injection).
-    pub fn read_index_lean(&self, max_lines: usize) -> Result<String, EverEvoError> {
-        if !self.index_path.exists() {
-            return Ok(String::new());
-        }
-        let content = std::fs::read_to_string(&self.index_path)
-            .map_err(|e| EverEvoError::Internal(format!("Read index: {e}")))?;
-        Ok(content
-            .lines()
-            .take(max_lines)
-            .collect::<Vec<_>>()
-            .join("\n"))
-    }
-
     /// Path to a specific fact file.
     pub fn fact_path(&self, name: &str) -> PathBuf {
         self.facts_dir.join(format!("{name}.md"))
@@ -386,6 +380,7 @@ mod tests {
             updated_at: chrono::Utc::now(),
             projection: ProjectionMetadata::new("test", "none", vec![], 1.0),
             links: vec![],
+            session: None,
         };
 
         mgr.save(&fact).unwrap();
@@ -394,6 +389,71 @@ mod tests {
 
         let count = mgr.count().unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_session_tag_roundtrips_through_frontmatter() {
+        let dir = TempDir::new().unwrap();
+        let mgr = FactManager::new(dir.path()).unwrap();
+
+        let sid = uuid::Uuid::new_v4().to_string();
+        let fact = MemoryFact {
+            name: "session-fact".into(),
+            description: "Session working memory".into(),
+            content: "Only this session should see this".into(),
+            fact_type: FactType::Project,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            projection: ProjectionMetadata::new("test", "none", vec![], 1.0),
+            links: vec![],
+            session: Some(sid.clone()),
+        };
+        mgr.save(&fact).unwrap();
+        let loaded = mgr.load("session-fact").unwrap().unwrap();
+        assert_eq!(loaded.session.as_deref(), Some(sid.as_str()));
+    }
+
+    #[test]
+    fn test_fact_visible_to_scoping() {
+        let sess_a = uuid::Uuid::new_v4();
+        let sess_b = uuid::Uuid::new_v4();
+
+        let legacy = MemoryFact {
+            session: None,
+            ..fact_skeleton("legacy")
+        };
+        let global = MemoryFact {
+            session: Some("global".into()),
+            ..fact_skeleton("global")
+        };
+        let owned_a = MemoryFact {
+            session: Some(sess_a.to_string()),
+            ..fact_skeleton("owned-a")
+        };
+
+        // Legacy (untagged) + explicit global = visible to every session.
+        assert!(fact_visible_to(&legacy, Some(&sess_b)));
+        assert!(fact_visible_to(&global, Some(&sess_b)));
+        // Owned facts are visible only to their own session.
+        assert!(fact_visible_to(&owned_a, Some(&sess_a)));
+        assert!(!fact_visible_to(&owned_a, Some(&sess_b)));
+        // Without a session context, only global facts are visible.
+        assert!(fact_visible_to(&global, None));
+        assert!(!fact_visible_to(&owned_a, None));
+    }
+
+    fn fact_skeleton(name: &str) -> MemoryFact {
+        MemoryFact {
+            name: name.into(),
+            description: "d".into(),
+            content: "c".into(),
+            fact_type: FactType::Project,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            projection: ProjectionMetadata::new("test", "none", vec![], 1.0),
+            links: vec![],
+            session: None,
+        }
     }
 
     /// When a serialized writer queue is attached, `save()` must enqueue the
@@ -423,6 +483,7 @@ mod tests {
             updated_at: chrono::Utc::now(),
             projection: ProjectionMetadata::new("test", "none", vec![], 1.0),
             links: vec![],
+            session: None,
         };
         mgr.save(&fact).unwrap();
 

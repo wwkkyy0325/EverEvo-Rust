@@ -158,6 +158,14 @@ impl ContentBlockStreamer {
                 self.full_response = final_text;
                 StreamerAction::Done
             }
+            AgentEvent::Retrospective { summary } => {
+                let _ = tx
+                    .send(Ok(Event::default()
+                        .event("retrospective")
+                        .data(serde_json::json!({"summary": summary}).to_string())))
+                    .await;
+                StreamerAction::Continue
+            }
             AgentEvent::Error { message } => {
                 let _ = tx
                     .send(Ok(Event::default().event("error").data(&message)))

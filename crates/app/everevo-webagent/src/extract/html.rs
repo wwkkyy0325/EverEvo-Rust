@@ -27,7 +27,9 @@ pub fn html_to_markdown(html: &str) -> String {
         let mut j = start;
         while j < chars.len() && j < start + 20 {
             let c = chars[j];
-            if c == '>' || c == ' ' || c == '\n' { break; }
+            if c == '>' || c == ' ' || c == '\n' {
+                break;
+            }
             s.push(c.to_ascii_lowercase());
             j += 1;
         }
@@ -42,7 +44,9 @@ pub fn html_to_markdown(html: &str) -> String {
             let rest = &buf[pos + needle.len()..];
             let delim = rest.chars().next().unwrap_or('"');
             let inner: String = rest.chars().skip(1).take_while(|&c| c != delim).collect();
-            if !inner.is_empty() { return Some(inner); }
+            if !inner.is_empty() {
+                return Some(inner);
+            }
         }
         None
     };
@@ -64,9 +68,20 @@ pub fn html_to_markdown(html: &str) -> String {
                 // Check <script>, <style>, <pre>
                 let tag = peek_tag(&chars, i);
                 match tag.as_str() {
-                    "<script" => { in_script = true; i += 7; continue; }
-                    "<style" => { in_style = true; i += 6; continue; }
-                    "<pre" | "<code" => { in_pre = true; ensure_nl(&mut out, &mut last_was_newline); }
+                    "<script" => {
+                        in_script = true;
+                        i += 7;
+                        continue;
+                    }
+                    "<style" => {
+                        in_style = true;
+                        i += 6;
+                        continue;
+                    }
+                    "<pre" | "<code" => {
+                        in_pre = true;
+                        ensure_nl(&mut out, &mut last_was_newline);
+                    }
                     _ => {}
                 }
 
@@ -74,10 +89,15 @@ pub fn html_to_markdown(html: &str) -> String {
                 if tag.starts_with("</") {
                     match tag.as_str() {
                         "</script>" | "</style>" => {
-                            in_script = false; in_style = false;
-                            i += tag.len() + 1; continue;
+                            in_script = false;
+                            in_style = false;
+                            i += tag.len() + 1;
+                            continue;
                         }
-                        "</pre>" | "</code>" => { in_pre = false; ensure_nl(&mut out, &mut last_was_newline); }
+                        "</pre>" | "</code>" => {
+                            in_pre = false;
+                            ensure_nl(&mut out, &mut last_was_newline);
+                        }
                         "</p>" | "</div>" => {
                             ensure_nl(&mut out, &mut last_was_newline);
                             ensure_nl(&mut out, &mut last_was_newline);
@@ -86,11 +106,19 @@ pub fn html_to_markdown(html: &str) -> String {
                             ensure_nl(&mut out, &mut last_was_newline);
                             ensure_nl(&mut out, &mut last_was_newline);
                         }
-                        "</li>" => { ensure_nl(&mut out, &mut last_was_newline); }
+                        "</li>" => {
+                            ensure_nl(&mut out, &mut last_was_newline);
+                        }
                         "</a>" => { /* text already pushed during content collection */ }
-                        "</b>" | "</strong>" => { out.push_str("**"); }
-                        "</i>" | "</em>" => { out.push('*'); }
-                        "</br>" | "<br/>" | "<br />" => { ensure_nl(&mut out, &mut last_was_newline); }
+                        "</b>" | "</strong>" => {
+                            out.push_str("**");
+                        }
+                        "</i>" | "</em>" => {
+                            out.push('*');
+                        }
+                        "</br>" | "<br/>" | "<br />" => {
+                            ensure_nl(&mut out, &mut last_was_newline);
+                        }
                         _ => {}
                     }
                 }
@@ -98,25 +126,41 @@ pub fn html_to_markdown(html: &str) -> String {
             '>' => {
                 // Opening tag: process heading levels and list markers
                 let lower = tag_buf.to_lowercase();
-                if lower.starts_with("h1") { out.push_str("\n# "); last_was_newline = false; }
-                else if lower.starts_with("h2") { out.push_str("\n## "); last_was_newline = false; }
-                else if lower.starts_with("h3") { out.push_str("\n### "); last_was_newline = false; }
-                else if lower.starts_with("h4") { out.push_str("\n#### "); last_was_newline = false; }
-                else if lower.starts_with("h5") { out.push_str("\n##### "); last_was_newline = false; }
-                else if lower.starts_with("h6") { out.push_str("\n###### "); last_was_newline = false; }
-                else if lower.starts_with("p") { /* paragraph: just track newlines */ }
-                else if lower.starts_with("br") { ensure_nl(&mut out, &mut last_was_newline); }
-                else if lower.starts_with("li") { out.push_str("- "); last_was_newline = false; }
-                else if lower.starts_with("b") || lower.starts_with("strong") { out.push_str("**"); }
-                else if lower.starts_with("i") || lower.starts_with("em") { out.push('*'); }
-                else if lower.starts_with("a ") {
+                if lower.starts_with("h1") {
+                    out.push_str("\n# ");
+                    last_was_newline = false;
+                } else if lower.starts_with("h2") {
+                    out.push_str("\n## ");
+                    last_was_newline = false;
+                } else if lower.starts_with("h3") {
+                    out.push_str("\n### ");
+                    last_was_newline = false;
+                } else if lower.starts_with("h4") {
+                    out.push_str("\n#### ");
+                    last_was_newline = false;
+                } else if lower.starts_with("h5") {
+                    out.push_str("\n##### ");
+                    last_was_newline = false;
+                } else if lower.starts_with("h6") {
+                    out.push_str("\n###### ");
+                    last_was_newline = false;
+                } else if lower.starts_with("p") { /* paragraph: just track newlines */
+                } else if lower.starts_with("br") {
+                    ensure_nl(&mut out, &mut last_was_newline);
+                } else if lower.starts_with("li") {
+                    out.push_str("- ");
+                    last_was_newline = false;
+                } else if lower.starts_with("b") || lower.starts_with("strong") {
+                    out.push_str("**");
+                } else if lower.starts_with("i") || lower.starts_with("em") {
+                    out.push('*');
+                } else if lower.starts_with("a ") {
                     // Extract href for Markdown link
                     if let Some(_href) = extract_attr(&tag_buf, "href") {
                         out.push('[');
                         // We'll collect link text and flush at </a>
                     }
-                }
-                else if lower.starts_with("img") {
+                } else if lower.starts_with("img") {
                     if let Some(src) = extract_attr(&tag_buf, "src") {
                         let alt = extract_attr(&tag_buf, "alt").unwrap_or_default();
                         out.push_str(&format!("![{}]({})", alt, src));
@@ -131,7 +175,10 @@ pub fn html_to_markdown(html: &str) -> String {
                 } else if !in_script && !in_style {
                     if !in_pre && (ch == '\n' || ch == '\r') {
                         // Collapse whitespace
-                        if !last_was_newline { out.push(' '); last_was_newline = true; }
+                        if !last_was_newline {
+                            out.push(' ');
+                            last_was_newline = true;
+                        }
                     } else {
                         out.push(ch);
                         last_was_newline = false;
@@ -154,7 +201,9 @@ pub fn html_to_markdown(html: &str) -> String {
     let result = result.lines().fold(String::new(), |mut acc, line| {
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            if !acc.ends_with("\n\n") { acc.push_str("\n\n"); }
+            if !acc.ends_with("\n\n") {
+                acc.push_str("\n\n");
+            }
         } else {
             acc.push_str(trimmed);
             acc.push('\n');
@@ -170,9 +219,6 @@ mod tests {
 
     #[test]
     fn test_basic_html_to_md() {
-        assert_eq!(
-            html_to_markdown("<p>Hello World</p>"),
-            "Hello World"
-        );
+        assert_eq!(html_to_markdown("<p>Hello World</p>"), "Hello World");
     }
 }

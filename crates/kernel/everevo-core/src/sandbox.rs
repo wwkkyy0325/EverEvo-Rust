@@ -47,7 +47,7 @@ impl ExecutionConfig {
             args: vec![],
             working_dir: None,
             env_vars: HashMap::new(),
-            timeout_secs: 30,
+            timeout_secs: 90,
             memory_limit_mb: None,
             network_allowed: true,
             confirmed: false,

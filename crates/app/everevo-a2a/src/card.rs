@@ -137,14 +137,12 @@ mod tests {
     #[test]
     fn test_builder_with_skills() {
         let card = AgentCardBuilder::new("http://localhost:3000")
-            .with_skills(&[
-                SkillDef {
-                    id: "code-review".into(),
-                    name: "Code Review".into(),
-                    description: "Review code changes".into(),
-                    tags: vec!["code".into()],
-                },
-            ])
+            .with_skills(&[SkillDef {
+                id: "code-review".into(),
+                name: "Code Review".into(),
+                description: "Review code changes".into(),
+                tags: vec!["code".into()],
+            }])
             .build();
         assert_eq!(card.skills.len(), 1);
         assert_eq!(card.skills[0].id, "code-review");

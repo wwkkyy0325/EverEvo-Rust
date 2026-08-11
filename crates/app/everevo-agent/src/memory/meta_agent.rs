@@ -49,10 +49,7 @@ pub struct MetaAgentState {
 impl MetaAgentState {
     /// Create a new meta-agent state. Pass `None` for llm/fact_manager to
     /// disable meta-agent functionality (opt-out pattern).
-    pub fn new(
-        llm: Option<Arc<HttpClient>>,
-        fact_manager: Option<Arc<FactManager>>,
-    ) -> Self {
+    pub fn new(llm: Option<Arc<HttpClient>>, fact_manager: Option<Arc<FactManager>>) -> Self {
         Self {
             turns_since_last_meta: 0,
             trigger_interval: 5,
@@ -108,7 +105,10 @@ impl std::fmt::Debug for MetaAgentState {
             .field("trigger_interval", &self.trigger_interval)
             .field("pending_hint", &self.pending_hint)
             .field("llm", &self.llm.as_ref().map(|_| "HttpClient"))
-            .field("fact_manager", &self.fact_manager.as_ref().map(|_| "FactManager"))
+            .field(
+                "fact_manager",
+                &self.fact_manager.as_ref().map(|_| "FactManager"),
+            )
             .finish()
     }
 }
@@ -173,7 +173,12 @@ pub async fn meta_diagnose(
     }
 
     // Optionally save the diagnosis as a Feedback fact for future recall
+    // Benchmark mode (EVEREVO_BENCHMARK=1) skips the save — the diagnosis is
+    // written to the GLOBAL tier and would leak trajectory into later sessions.
     if let Some(fm) = fact_manager {
+        if std::env::var("EVEREVO_BENCHMARK").is_ok() {
+            return Some(hint);
+        }
         let fact = MemoryFact {
             name: format!("meta-diag-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S")),
             description: truncate_str(&hint, 120),
@@ -186,6 +191,8 @@ pub async fn meta_diagnose(
             updated_at: chrono::Utc::now(),
             projection: ProjectionMetadata::new("meta-agent", "llm", vec![], 0.6),
             links: vec![],
+            // Cross-session diagnosis — deliberately global long-term memory.
+            session: Some("global".into()),
         };
         let _ = fm.save_async(fact).await;
     }
@@ -319,9 +326,7 @@ mod tests {
 
     #[test]
     fn test_diagnosis_prompt_includes_escalation() {
-        let digests = vec![
-            TurnDigest::new("shell", false, Some("err"), "test", "fail"),
-        ];
+        let digests = vec![TurnDigest::new("shell", false, Some("err"), "test", "fail")];
         let prompt = build_meta_diagnosis_prompt(&digests, 3, "user asked to deploy");
         assert!(prompt.contains("Escalation level 3"));
         assert!(prompt.contains("fixation"));
@@ -329,9 +334,7 @@ mod tests {
 
     #[test]
     fn test_diagnosis_prompt_no_escalation_for_normal() {
-        let digests = vec![
-            TurnDigest::new("shell", true, None, "ok", "done"),
-        ];
+        let digests = vec![TurnDigest::new("shell", true, None, "ok", "done")];
         let prompt = build_meta_diagnosis_prompt(&digests, 0, "simple task");
         assert!(!prompt.contains("Escalation level"));
     }

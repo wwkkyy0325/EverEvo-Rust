@@ -61,6 +61,8 @@ pub(crate) enum WriteCmd {
         latency_ms: i64,
         tokens_input: i64,
         tokens_output: i64,
+        error_type: Option<String>,
+        error_message: Option<String>,
         experiment_id: Option<String>,
         variant: Option<String>,
     },

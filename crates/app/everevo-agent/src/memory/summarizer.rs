@@ -177,6 +177,8 @@ pub async fn summarize_session(
             updated_at: chrono::Utc::now(),
             projection: ProjectionMetadata::new("summarizer-agent", "llm", vec![], 0.7),
             links: vec![],
+            // Session handoff summary — deliberately cross-session (global tier).
+            session: Some("global".into()),
         };
         let _ = fact_manager.save_async(fact).await;
     }
@@ -239,6 +241,8 @@ async fn extract_session_paradigms(
             updated_at: chrono::Utc::now(),
             projection: ProjectionMetadata::new("summarizer-agent", "llm", vec![], 0.65),
             links: vec![],
+            // Reusable action paradigm — deliberately cross-session (global tier).
+            session: Some("global".into()),
         };
         match fact_manager.save_async(fact).await {
             Ok(()) => saved += 1,
@@ -267,12 +271,7 @@ fn build_summary_prompt(
             .as_ref()
             .map(|e| format!(" [{}]", e))
             .unwrap_or_default();
-        turns.push_str(&format!(
-            "  T{}: {} {}{err}\n",
-            i + 1,
-            t.tool_name,
-            status
-        ));
+        turns.push_str(&format!("  T{}: {} {}{err}\n", i + 1, t.tool_name, status));
     }
 
     format!(
@@ -298,13 +297,17 @@ fn build_summary_prompt(
     )
 }
 
-fn build_session_paradigm_prompt(
-    trajectory: &[crate::memory::paradigm::TurnDigest],
-) -> String {
+fn build_session_paradigm_prompt(trajectory: &[crate::memory::paradigm::TurnDigest]) -> String {
     let mut turns = String::new();
     for (i, t) in trajectory.iter().enumerate() {
         let status = if t.success { "✓" } else { "✗" };
-        turns.push_str(&format!("  T{}: {} {} | {}\n", i + 1, t.tool_name, status, t.user_intent));
+        turns.push_str(&format!(
+            "  T{}: {} {} | {}\n",
+            i + 1,
+            t.tool_name,
+            status,
+            t.user_intent
+        ));
     }
 
     format!(

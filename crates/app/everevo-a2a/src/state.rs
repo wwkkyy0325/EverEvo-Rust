@@ -34,7 +34,11 @@ impl TaskState {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            TaskState::Completed | TaskState::Failed | TaskState::Canceled | TaskState::Rejected | TaskState::Unknown
+            TaskState::Completed
+                | TaskState::Failed
+                | TaskState::Canceled
+                | TaskState::Rejected
+                | TaskState::Unknown
         )
     }
 

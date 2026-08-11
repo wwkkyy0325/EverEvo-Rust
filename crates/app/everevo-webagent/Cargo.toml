@@ -11,6 +11,7 @@ name = "everevo-webagent"
 path = "src/main.rs"
 
 [dependencies]
+everevo-net = { path = "../../infra/everevo-net" }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["process", "io-util", "net"] }

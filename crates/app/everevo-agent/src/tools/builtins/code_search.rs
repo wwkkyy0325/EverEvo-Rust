@@ -46,6 +46,12 @@ pub struct CodeSearchTool {
     /// Signaled when background index build completes (success or failure).
     index_ready: Arc<Notify>,
     workspace_root: PathBuf,
+    /// Consecutive auto-reindex failures since the last success. Drives an
+    /// exponential backoff so a persistently broken index stops re-attempting
+    /// (and re-warning) on every 10s poll (user requirement #3: fix tool warnings).
+    reindex_failures: Arc<std::sync::Mutex<u32>>,
+    /// Earliest `Instant` at which the next auto-reindex attempt is allowed.
+    next_reindex_at: Arc<std::sync::Mutex<std::time::Instant>>,
 }
 
 impl CodeSearchTool {
@@ -54,6 +60,8 @@ impl CodeSearchTool {
             index: Arc::new(tokio::sync::Mutex::new(None)),
             index_ready: Arc::new(Notify::new()),
             workspace_root,
+            reindex_failures: Arc::new(std::sync::Mutex::new(0)),
+            next_reindex_at: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
         }
     }
 
@@ -97,6 +105,16 @@ impl CodeSearchTool {
     /// run an incremental reindex. Called on every `code_search` invocation
     /// so the index stays fresh without manual `reindex: true`.
     async fn auto_reindex_if_stale(&self) {
+        // Backoff gate: after a reindex failure, skip further attempts (and the
+        // associated warn) until the backoff window elapses — a broken index
+        // must not retry/log every 10s.
+        {
+            let next = *self.next_reindex_at.lock().unwrap();
+            if next > std::time::Instant::now() {
+                return;
+            }
+        }
+
         let mut guard = self.index.lock().await;
         if let Some(ref mut idx) = *guard {
             // Only check once every 10 seconds to avoid thrashing.
@@ -143,8 +161,24 @@ impl CodeSearchTool {
                         );
                     }
                     idx.wal_checkpoint().await;
+                    // Successful reindex resets the failure backoff.
+                    *self.reindex_failures.lock().unwrap() = 0;
+                    *self.next_reindex_at.lock().unwrap() = std::time::Instant::now();
                 }
-                Err(e) => tracing::warn!(error = %e, "Auto-reindex failed"),
+                Err(e) => {
+                    // Exponential backoff: 1min → 10min cap (1,2,4,… min).
+                    // Warn once per window instead of every 10s poll.
+                    let mut failures = self.reindex_failures.lock().unwrap();
+                    *failures = (*failures).saturating_add(1).min(10);
+                    let backoff_secs = auto_reindex_backoff_secs(*failures);
+                    *self.next_reindex_at.lock().unwrap() =
+                        std::time::Instant::now() + std::time::Duration::from_secs(backoff_secs);
+                    tracing::warn!(
+                        error = %e,
+                        backoff_secs,
+                        "Auto-reindex failed; backing off"
+                    );
+                }
             }
             idx.last_indexed = Some(std::time::Instant::now());
         }
@@ -283,7 +317,8 @@ impl CodeSearchTool {
                         return format!("No matches found for '{query}'.");
                     }
                     let count = files.len();
-                    let mut out = format!("{count} files matching '{query}' (PowerShell Select-String):\n");
+                    let mut out =
+                        format!("{count} files matching '{query}' (PowerShell Select-String):\n");
                     for f in &files {
                         out.push_str(&format!("- `{f}`\n"));
                     }
@@ -307,6 +342,12 @@ impl CodeSearchTool {
     }
 }
 
+/// Backoff seconds for consecutive auto-reindex failures: 1, 2, 4, … minutes,
+/// capped at 10 minutes (so a broken index stops hammering and stops warning).
+fn auto_reindex_backoff_secs(failures: u32) -> u64 {
+    60u64.saturating_mul(failures.max(1) as u64).min(600)
+}
+
 /// Format the stdout output from `rg -l` or `grep -rnl` into the standard
 /// compact result block.
 fn format_grep_output(stdout: &[u8], query: &str, max_count: usize, tool_name: &str) -> String {
@@ -318,7 +359,9 @@ fn format_grep_output(stdout: &[u8], query: &str, max_count: usize, tool_name: &
         .collect();
 
     if files.is_empty() {
-        return format!("No matches found for '{query}' with {tool_name}. Try a different keyword.");
+        return format!(
+            "No matches found for '{query}' with {tool_name}. Try a different keyword."
+        );
     }
 
     let count = files.len();
@@ -656,6 +699,19 @@ mod tests {
         assert_eq!(tool.risk_level(), RiskLevel::Low);
         let schema = tool.parameters_schema();
         assert_eq!(schema["required"][0], "query");
+    }
+
+    #[test]
+    fn test_auto_reindex_backoff_escapes_to_cap() {
+        // 1st failure → 1 min, 2nd → 2 min, ... capped at 10 min.
+        assert_eq!(auto_reindex_backoff_secs(1), 60);
+        assert_eq!(auto_reindex_backoff_secs(2), 120);
+        assert_eq!(auto_reindex_backoff_secs(10), 600);
+        // Beyond the cap, backoff stays at 10 min (no overflow / unbounded wait).
+        assert_eq!(auto_reindex_backoff_secs(100), 600);
+        // Failures counter is capped at 10 before being passed in, but the
+        // helper is defensive about 0 as well.
+        assert_eq!(auto_reindex_backoff_secs(0), 60);
     }
 
     #[test]

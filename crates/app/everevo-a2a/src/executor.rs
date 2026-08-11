@@ -85,8 +85,8 @@ impl EverEvoExecutor {
                     messages.push(LlmMessage::user(&desc));
                 }
                 Part::Data { data, .. } => {
-                    let text = serde_json::to_string_pretty(data)
-                        .unwrap_or_else(|_| format!("{data}"));
+                    let text =
+                        serde_json::to_string_pretty(data).unwrap_or_else(|_| format!("{data}"));
                     messages.push(LlmMessage::user(format!("[Structured data]:\n{text}")));
                 }
             }
@@ -96,16 +96,8 @@ impl EverEvoExecutor {
     }
 
     /// Convert the final assistant response → A2A Artifacts + Task.
-    fn to_a2a_task(
-        task_id: &str,
-        context_id: &str,
-        result: &str,
-        state: TaskState,
-    ) -> A2aTask {
-        let artifact = Artifact::new(
-            vec![Part::text(result)],
-            "everevo-response",
-        );
+    fn to_a2a_task(task_id: &str, context_id: &str, result: &str, state: TaskState) -> A2aTask {
+        let artifact = Artifact::new(vec![Part::text(result)], "everevo-response");
 
         let status_msg = A2aMessage::agent(vec![Part::text(result)]);
 
@@ -204,7 +196,11 @@ mod tests {
 
     #[test]
     fn test_to_llm_messages_with_file() {
-        let msg = A2aMessage::user(vec![Part::file_uri("doc.pdf", "application/pdf", "/doc.pdf")]);
+        let msg = A2aMessage::user(vec![Part::file_uri(
+            "doc.pdf",
+            "application/pdf",
+            "/doc.pdf",
+        )]);
         let llm_msgs = EverEvoExecutor::to_llm_messages(&msg);
         assert_eq!(llm_msgs.len(), 2);
         assert!(llm_msgs[1].content.contains("doc.pdf"));
@@ -212,9 +208,7 @@ mod tests {
 
     #[test]
     fn test_to_a2a_task_completed() {
-        let task = EverEvoExecutor::to_a2a_task(
-            "t1", "c1", "result text", TaskState::Completed,
-        );
+        let task = EverEvoExecutor::to_a2a_task("t1", "c1", "result text", TaskState::Completed);
         assert_eq!(task.id, "t1");
         assert_eq!(task.status.state, TaskState::Completed);
         assert_eq!(task.artifacts.len(), 1);
@@ -225,9 +219,9 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let msg = A2aMessage::user(vec![Part::text("hello")]);
         let executor = EchoExecutor;
-        let task = rt.block_on(executor.execute(
-            "t1", "c1", &msg, CancellationToken::new(),
-        )).unwrap();
+        let task = rt
+            .block_on(executor.execute("t1", "c1", &msg, CancellationToken::new()))
+            .unwrap();
         assert_eq!(task.status.state, TaskState::Completed);
         let text = task.status.message.unwrap().text_content().unwrap();
         assert!(text.contains("Echo: hello"));

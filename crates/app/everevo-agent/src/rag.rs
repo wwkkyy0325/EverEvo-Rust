@@ -48,9 +48,9 @@ pub struct RagPipeline {
 impl RagPipeline {
     /// Create a RAG pipeline using the active model from the registry.
     pub fn new(data_dir: &Path, registry: &ModelRegistry) -> Result<Self, EverEvoError> {
-        let active = registry.active().ok_or_else(|| {
-            EverEvoError::Config("No active embedding model available".into())
-        })?;
+        let active = registry
+            .active()
+            .ok_or_else(|| EverEvoError::Config("No active embedding model available".into()))?;
         let memory_vector_dir = data_dir.join("memory").join("vector");
         let domain_vector_dir = data_dir.join("domain").join("vector");
         let old_vector_dir = data_dir.join("vector");
@@ -69,9 +69,15 @@ impl RagPipeline {
             };
 
         // Migrate old `data/vector/*.bin` → new layout on first start
-        Self::migrate_old_vectors(&old_vector_dir, &memory_vector_dir, &domain_vector_dir, active.dim);
+        Self::migrate_old_vectors(
+            &old_vector_dir,
+            &memory_vector_dir,
+            &domain_vector_dir,
+            active.dim,
+        );
 
-        let memory_store = MultiCollectionStore::open(&memory_vector_dir, active.dim, Some(&old_json))?;
+        let memory_store =
+            MultiCollectionStore::open(&memory_vector_dir, active.dim, Some(&old_json))?;
         let domain_store = MultiCollectionStore::open(&domain_vector_dir, active.dim, None)?;
 
         tracing::info!(
@@ -95,12 +101,7 @@ impl RagPipeline {
 
     /// Migrate old `data/vector/{name}-{dim}.bin` files to the new co-located
     /// layout. One-time operation — skips if old dir doesn't exist.
-    fn migrate_old_vectors(
-        old_dir: &Path,
-        memory_dir: &Path,
-        domain_dir: &Path,
-        dim: usize,
-    ) {
+    fn migrate_old_vectors(old_dir: &Path, memory_dir: &Path, domain_dir: &Path, dim: usize) {
         if !old_dir.exists() {
             return;
         }
@@ -111,7 +112,8 @@ impl RagPipeline {
         for &collection in MEMORY_COLLECTIONS {
             let old_file = old_dir.join(format!("{}-{}.bin", collection, dim));
             let new_file = memory_dir.join(format!("{}-{}.bin", collection, dim));
-            if old_file.exists() && !new_file.exists()
+            if old_file.exists()
+                && !new_file.exists()
                 && std::fs::rename(&old_file, &new_file).is_ok()
             {
                 moved += 1;
@@ -120,7 +122,8 @@ impl RagPipeline {
         for &collection in DOMAIN_COLLECTIONS {
             let old_file = old_dir.join(format!("{}-{}.bin", collection, dim));
             let new_file = domain_dir.join(format!("{}-{}.bin", collection, dim));
-            if old_file.exists() && !new_file.exists()
+            if old_file.exists()
+                && !new_file.exists()
                 && std::fs::rename(&old_file, &new_file).is_ok()
             {
                 moved += 1;
@@ -141,9 +144,9 @@ impl RagPipeline {
         data_dir: &Path,
         registry: &ModelRegistry,
     ) -> Result<(), EverEvoError> {
-        let active = registry.active().ok_or_else(|| {
-            EverEvoError::Config("No active embedding model available".into())
-        })?;
+        let active = registry
+            .active()
+            .ok_or_else(|| EverEvoError::Config("No active embedding model available".into()))?;
         let models_dir = data_dir.join("models");
         let memory_vector_dir = data_dir.join("memory").join("vector");
         let domain_vector_dir = data_dir.join("domain").join("vector");
@@ -208,7 +211,8 @@ impl RagPipeline {
         top_k: usize,
     ) -> Result<Vec<ScoredChunk>, EverEvoError> {
         let query_vector = self.embedder.encode(query)?;
-        self.store_for(collection).search(collection, &query_vector, top_k)
+        self.store_for(collection)
+            .search(collection, &query_vector, top_k)
     }
 
     /// Cross-collection search with RRF fusion.
@@ -235,12 +239,18 @@ impl RagPipeline {
 
         let mut all_results: Vec<ScoredChunk> = Vec::new();
         if !memory_cols.is_empty() {
-            if let Ok(r) = self.memory_store.search_multi(&memory_cols, &query_vector, top_k) {
+            if let Ok(r) = self
+                .memory_store
+                .search_multi(&memory_cols, &query_vector, top_k)
+            {
                 all_results.extend(r);
             }
         }
         if !domain_cols.is_empty() {
-            if let Ok(r) = self.domain_store.search_multi(&domain_cols, &query_vector, top_k) {
+            if let Ok(r) = self
+                .domain_store
+                .search_multi(&domain_cols, &query_vector, top_k)
+            {
                 all_results.extend(r);
             }
         }
@@ -248,7 +258,11 @@ impl RagPipeline {
             // Fallback: single collection search in whichever store
             return self.search_in(collections[0], query, top_k);
         }
-        all_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        all_results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         all_results.truncate(top_k);
         Ok(all_results)
     }

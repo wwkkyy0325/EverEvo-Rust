@@ -77,7 +77,9 @@ pub struct AppConfig {
     pub subagent_max_depth: u32,
 }
 
-fn default_subagent_max_depth() -> u32 { 3 }
+fn default_subagent_max_depth() -> u32 {
+    3
+}
 
 /// Configuration for an MCP server connection.
 /// Mirrors Claude Code's `.mcp.json` format with three transport types.
@@ -226,6 +228,22 @@ impl AppConfig {
             config.server_port = port
                 .parse()
                 .map_err(|_| crate::EverEvoError::Config(format!("Invalid port: {port}")))?;
+        }
+        // Sandbox permission level from env (e.g. "fully_auto" for unattended
+        // benchmarks in containers — no human to approve shell commands).
+        // Note: this field is NOT read from config.toml, so env is the only
+        // way to set it without changing AppConfig::default().
+        if let Ok(level) = std::env::var("EVEREVO_PERMISSION_LEVEL") {
+            config.default_permission_level = level;
+        } else if std::env::var("EVEREVO_BENCHMARK").is_ok() {
+            // Unattended benchmark (EVEREVO_BENCHMARK=1) has no human to approve
+            // shell commands. Under the default semi_auto, dangerous-pattern /
+            // external-path commands block on a confirmation that never arrives,
+            // burning the question's 300s wall-clock (GAIA mini-run: 4/10 hangs
+            // from the `at ` substring pattern matching "eat"/"task"/"import").
+            // Force fully_auto — the host-critical deny rules (system_deny_paths)
+            // still apply at FullyAuto, so the benchmark stays sandboxed.
+            config.default_permission_level = "fully_auto".into();
         }
 
         // LLM providers from env

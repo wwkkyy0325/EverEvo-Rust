@@ -169,10 +169,7 @@ regardless of reply language."
 /// - `verbosity` based on average message length preference
 /// - `code_first` based on tool usage patterns
 /// - `system_prompt_injection` from high-confidence feedback facts
-pub fn update_persona_from_facts(
-    profile_path: &Path,
-    facts: &[everevo_core::memory::MemoryFact],
-) {
+pub fn update_persona_from_facts(profile_path: &Path, facts: &[everevo_core::memory::MemoryFact]) {
     let mut profile = load_profile(profile_path).unwrap_or_default();
     let mut changed = false;
 
@@ -208,7 +205,9 @@ pub fn update_persona_from_facts(
         .iter()
         .filter(|f| {
             f.fact_type == everevo_core::memory::FactType::Project
-                && (f.content.contains("fn ") || f.content.contains("struct ") || f.content.contains("import "))
+                && (f.content.contains("fn ")
+                    || f.content.contains("struct ")
+                    || f.content.contains("import "))
         })
         .count();
     let text_facts = facts

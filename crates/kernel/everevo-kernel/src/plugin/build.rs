@@ -70,10 +70,7 @@ pub struct BuildResult {
 ///
 /// Returns a `BuildResult` describing success/failure. On failure, the
 /// plugin source is automatically reverted to its last committed state.
-pub fn compile_and_stage(
-    config: &BuildConfig,
-    new_version: &str,
-) -> Result<BuildResult, String> {
+pub fn compile_and_stage(config: &BuildConfig, new_version: &str) -> Result<BuildResult, String> {
     let source_dir = &config.source_dir;
     let plugin_id = &config.plugin_id;
     let pkg_name = format!("plugin-{plugin_id}");
@@ -112,8 +109,8 @@ pub fn compile_and_stage(
     let binary_path = build_result.binary_path.unwrap();
 
     // ── 4. Checksum ──────────────────────────────────────────────────
-    let checksum = sha256_file(&binary_path)
-        .map_err(|e| format!("Failed to compute checksum: {e}"))?;
+    let checksum =
+        sha256_file(&binary_path).map_err(|e| format!("Failed to compute checksum: {e}"))?;
 
     // ── 5. Git tag ────────────────────────────────────────────────────
     let _ = git_tag(source_dir, new_version, &git_diff);
@@ -279,7 +276,12 @@ fn git_tag(source_dir: &Path, version: &str, _diff: &str) -> Result<(), String> 
 
     // Tag the version
     let _ = Command::new("git")
-        .args(["tag", &format!("v{version}"), "-m", &format!("Plugin build v{version}")])
+        .args([
+            "tag",
+            &format!("v{version}"),
+            "-m",
+            &format!("Plugin build v{version}"),
+        ])
         .current_dir(source_dir)
         .output();
 

@@ -40,3 +40,7 @@ src-tauri/gen/
 tmp/
 sample-project/*
 *.bak
+target-linux/*
+data-pre-gaia/*
+__pycache__/*
+*.pyc

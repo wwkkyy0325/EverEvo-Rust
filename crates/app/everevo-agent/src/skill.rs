@@ -31,11 +31,26 @@ use crate::memory::frontmatter::parse_frontmatter;
 /// Content for built-in skills, embedded in the binary at compile time.
 /// Each entry: (directory_name, "SKILL.md content").
 const BUILTIN_SKILLS: &[(&str, &str)] = &[
-    ("anti-fixation", include_str!("../builtin-skills/anti-fixation/SKILL.md")),
-    ("code-review", include_str!("../builtin-skills/code-review/SKILL.md")),
-    ("debug-error", include_str!("../builtin-skills/debug-error/SKILL.md")),
-    ("web-research", include_str!("../../everevo-webagent/builtin-skills/web-research/SKILL.md")),
-    ("write-tests", include_str!("../builtin-skills/write-tests/SKILL.md")),
+    (
+        "anti-fixation",
+        include_str!("../builtin-skills/anti-fixation/SKILL.md"),
+    ),
+    (
+        "code-review",
+        include_str!("../builtin-skills/code-review/SKILL.md"),
+    ),
+    (
+        "debug-error",
+        include_str!("../builtin-skills/debug-error/SKILL.md"),
+    ),
+    (
+        "web-research",
+        include_str!("../../everevo-webagent/builtin-skills/web-research/SKILL.md"),
+    ),
+    (
+        "write-tests",
+        include_str!("../builtin-skills/write-tests/SKILL.md"),
+    ),
 ];
 
 // ── Skill ─────────────────────────────────────────────────────────────────
@@ -213,7 +228,11 @@ impl SkillRegistry {
         }
         // Slow path: reload
         if let Ok(reloaded) = SkillRegistry::load(&self.skills_dir) {
-            let count = reloaded.skills.read().unwrap_or_else(|e| e.into_inner()).len();
+            let count = reloaded
+                .skills
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .len();
             let mut skills = self.skills.write().unwrap_or_else(|e| e.into_inner());
             let reloaded_skills = reloaded.skills.into_inner().unwrap_or_default();
             *skills = reloaded_skills;
@@ -271,7 +290,10 @@ impl SkillRegistry {
                     if keywords.is_empty() {
                         continue;
                     }
-                    let hits = keywords.iter().filter(|k| msg.contains(&k.to_lowercase())).count();
+                    let hits = keywords
+                        .iter()
+                        .filter(|k| msg.contains(&k.to_lowercase()))
+                        .count();
                     if hits > 0 {
                         score += 3.0 * (hits as f64 / keywords.len() as f64);
                     }
@@ -484,10 +506,7 @@ fn parse_skill_md(content: &str, path: &Path) -> Result<Skill, String> {
     let description = fm.get("description").cloned().unwrap_or_default();
 
     // tools: try "allowed-tools" (agentskills.io standard) first, fall back to "tools" (legacy)
-    let tools_raw = fm
-        .get("allowed-tools")
-        .or_else(|| fm.get("tools"))
-        .cloned();
+    let tools_raw = fm.get("allowed-tools").or_else(|| fm.get("tools")).cloned();
     let tools = tools_raw
         .as_deref()
         .map(parse_list_value)
@@ -672,10 +691,10 @@ Body here.";
                 when_to_use: vec!["User asks for code review".into()],
                 persona: None,
                 path: PathBuf::from("test"),
-            source: crate::skill::SkillSource::User,
-            disable_model_invocation: false,
-            model_override: None,
-            user_invocable: true,
+                source: crate::skill::SkillSource::User,
+                disable_model_invocation: false,
+                model_override: None,
+                user_invocable: true,
             },
             Skill {
                 name: "diagram".into(),
@@ -685,10 +704,10 @@ Body here.";
                 when_to_use: vec!["User provides an image".into()],
                 persona: None,
                 path: PathBuf::from("test"),
-            source: crate::skill::SkillSource::User,
-            disable_model_invocation: false,
-            model_override: None,
-            user_invocable: true,
+                source: crate::skill::SkillSource::User,
+                disable_model_invocation: false,
+                model_override: None,
+                user_invocable: true,
             },
         ];
         let registry = SkillRegistry {
@@ -772,10 +791,10 @@ Body here.";
                 when_to_use: vec![],
                 persona: None,
                 path: PathBuf::from("test"),
-            source: crate::skill::SkillSource::User,
-            disable_model_invocation: false,
-            model_override: None,
-            user_invocable: true,
+                source: crate::skill::SkillSource::User,
+                disable_model_invocation: false,
+                model_override: None,
+                user_invocable: true,
             },
             Skill {
                 name: "b".into(),
@@ -785,10 +804,10 @@ Body here.";
                 when_to_use: vec![],
                 persona: None,
                 path: PathBuf::from("test"),
-            source: crate::skill::SkillSource::User,
-            disable_model_invocation: false,
-            model_override: None,
-            user_invocable: true,
+                source: crate::skill::SkillSource::User,
+                disable_model_invocation: false,
+                model_override: None,
+                user_invocable: true,
             },
         ];
         let registry = SkillRegistry {

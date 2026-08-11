@@ -103,7 +103,7 @@ impl Tool for SkillTool {
                 let metadata = self.registry.list_metadata();
                 if metadata.is_empty() {
                     return Ok(ToolOutput::text(
-                        "No skills available. Use Skill(action='create', ...) to create one."
+                        "No skills available. Use Skill(action='create', ...) to create one.",
                     ));
                 }
                 let lines: Vec<String> = metadata
@@ -147,7 +147,11 @@ impl Tool for SkillTool {
                 let body = params["body"].as_str().unwrap_or("").to_string();
                 let when_to_use: Vec<String> = params["when_to_use"]
                     .as_array()
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default();
 
                 if name.is_empty() || body.is_empty() {
@@ -170,7 +174,7 @@ impl Tool for SkillTool {
                         let _ = self.registry.rescan();
                         Ok(ToolOutput::text(format!(
                             "Skill '{name}' created at {path}. Available immediately.",
-                        path = path.display()
+                            path = path.display()
                         )))
                     }
                     Err(e) => Ok(ToolOutput {
@@ -233,7 +237,11 @@ impl Tool for SkillTool {
                 let body = params["body"].as_str().unwrap_or("").to_string();
                 let when_to_use: Vec<String> = params["when_to_use"]
                     .as_array()
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default();
 
                 // Validate
@@ -278,7 +286,8 @@ impl Tool for SkillTool {
             }
 
             _ => Ok(ToolOutput {
-                content: "Unknown action. Use 'list', 'load', 'search', 'compose', or 'create'.".into(),
+                content: "Unknown action. Use 'list', 'load', 'search', 'compose', or 'create'."
+                    .into(),
                 is_error: true,
                 ..Default::default()
             }),
@@ -288,15 +297,12 @@ impl Tool for SkillTool {
 
 /// Simple token-overlap relevance score (0-100) for a skill against a query.
 /// Name matches weighted 3x, description 2x, trigger 1x. Caps at 100.
-fn skill_relevance_score(
-    name: &str,
-    description: &str,
-    triggers: &[String],
-    query: &str,
-) -> u32 {
+fn skill_relevance_score(name: &str, description: &str, triggers: &[String], query: &str) -> u32 {
     let query_lower = query.to_lowercase();
     let tokens: Vec<&str> = query_lower.split_whitespace().collect();
-    if tokens.is_empty() { return 0; }
+    if tokens.is_empty() {
+        return 0;
+    }
 
     let name_lower = name.to_lowercase();
     let desc_lower = description.to_lowercase();
@@ -304,10 +310,18 @@ fn skill_relevance_score(
 
     let mut score = 0u32;
     for token in &tokens {
-        if name_lower.contains(token) { score += 30; }
-        if desc_lower.contains(token) { score += 20; }
-        if trigger_text.contains(token) { score += 10; }
+        if name_lower.contains(token) {
+            score += 30;
+        }
+        if desc_lower.contains(token) {
+            score += 20;
+        }
+        if trigger_text.contains(token) {
+            score += 10;
+        }
     }
-    if name_lower == query_lower { score += 50; }
+    if name_lower == query_lower {
+        score += 50;
+    }
     score.min(100)
 }

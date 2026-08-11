@@ -32,15 +32,22 @@ pub mod write_file;
 /// Pass the PluginRegistry so `plugin_status` and `plugin_rollback`
 /// can query and manage plugin versions.
 /// Pass `plugins_dir` for `plugin_dev` source access (default: workspace plugins/).
+/// Pass `work_dir` for `read_file` and `write_file` relative path resolution
+/// (the sandbox session directory).
 pub fn register_all(
     registry: &mut ToolRegistry,
     plugin_registry: Option<Arc<PluginRegistry>>,
     plugins_dir: Option<PathBuf>,
+    work_dir: Option<PathBuf>,
 ) {
     let pd = plugins_dir.unwrap_or_else(|| PathBuf::from("plugins"));
     registry.register(Arc::new(shell::BootstrapShell));
-    registry.register(Arc::new(read_file::BootstrapReadFile));
-    registry.register(Arc::new(write_file::BootstrapWriteFile));
+    registry.register(Arc::new(
+        read_file::BootstrapReadFile::new().with_work_dir(work_dir.clone().unwrap_or_default()),
+    ));
+    registry.register(Arc::new(
+        write_file::BootstrapWriteFile::new().with_work_dir(work_dir.clone().unwrap_or_default()),
+    ));
     registry.register(Arc::new(plugin_dev::PluginDev::new(pd)));
     registry.register(Arc::new(plugin_status::PluginStatus::new(
         plugin_registry.clone(),

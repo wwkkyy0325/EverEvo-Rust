@@ -39,15 +39,16 @@ use futures::FutureExt;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::panic::AssertUnwindSafe;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
-use everevo_core::llm::{LlmMessage, LlmRole, StreamEvent, ToolSchema};
+use everevo_core::llm::{LlmMessage, LlmProvider, LlmRole, StreamEvent, ToolSchema};
 use everevo_core::tool::ToolRegistry;
 use everevo_core::types::ToolCall;
 use everevo_core::EverEvoError;
-use everevo_core::{AgentTurnRecord, Telemetry};
+use everevo_core::{TelemetryEmitContext, TelemetryPipeline};
 use uuid::Uuid;
 
 // ── Panic Recovery ────────────────────────────────────────────────────────
@@ -257,8 +258,8 @@ pub struct AgentLoop {
     max_tool_result_chars: usize,
     /// Approximate max total characters in the message history before trimming.
     max_context_chars: usize,
-    /// Optional telemetry handle for recording agent turn metrics.
-    telemetry: Option<Arc<Telemetry>>,
+    /// Optional telemetry pipeline for recording agent turn metrics.
+    telemetry: Option<Arc<TelemetryPipeline>>,
     /// Trace ID for correlating telemetry records.
     trace_id: Option<Uuid>,
     /// Pending subagent results channel — TaskTool pushes, AgentLoop drains.
@@ -278,6 +279,16 @@ pub struct AgentLoop {
     /// Hook feedback slot — ReflectGateHook writes tool error feedback here;
     /// the loop reads+clears it after tool execution and injects as a user message.
     hook_feedback_slot: Option<Arc<std::sync::Mutex<Option<String>>>>,
+    /// Layer-1 background rolling-summary maintenance (wired by the server for
+    /// real sessions; None for sub-agents). Runs at soft-threshold turn
+    /// boundaries without blocking the main loop.
+    background_maintenance: Option<Arc<crate::context::BackgroundMaintenance>>,
+    /// Optional compaction model (cheap model for summarization). None → fall
+    /// back to the main loop model (decision 1: "有哪个用哪个").
+    compact_llm: Option<Arc<dyn LlmProvider>>,
+    /// Directory for paged tool outputs (`data/sessions/<id>/tool_cache`).
+    /// None → large tool outputs are truncated in context as before (sub-agents).
+    tool_cache_dir: Option<PathBuf>,
 }
 
 impl AgentLoop {
@@ -295,7 +306,34 @@ impl AgentLoop {
             proactivity_state: None,
             meta_agent_state: None,
             hook_feedback_slot: None,
+            background_maintenance: None,
+            compact_llm: None,
+            tool_cache_dir: None,
         }
+    }
+
+    /// Set the directory where large tool outputs are paged to disk (spec
+    /// deliverable 6). The agent can re-read them via `tool_cache_read`.
+    pub fn with_tool_cache_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.tool_cache_dir = dir;
+        self
+    }
+
+    /// Wire Layer-1 background rolling-summary maintenance. Pass `None` for
+    /// sub-agents and tests.
+    pub fn with_background_maintenance(
+        mut self,
+        bg: Option<Arc<crate::context::BackgroundMaintenance>>,
+    ) -> Self {
+        self.background_maintenance = bg;
+        self
+    }
+
+    /// Set the compaction model (used by autocompact and rolling summary).
+    /// `None` falls back to the main loop model.
+    pub fn with_compact_llm(mut self, llm: Option<Arc<dyn LlmProvider>>) -> Self {
+        self.compact_llm = llm;
+        self
     }
 
     pub fn with_compact_focus(mut self, focus: Arc<std::sync::Mutex<Option<String>>>) -> Self {
@@ -324,10 +362,7 @@ impl AgentLoop {
 
     /// Wire the ReflectGateHook feedback slot so the loop reads tool error
     /// feedback after each tool execution and injects it into the conversation.
-    pub fn with_hook_feedback(
-        mut self,
-        slot: Arc<std::sync::Mutex<Option<String>>>,
-    ) -> Self {
+    pub fn with_hook_feedback(mut self, slot: Arc<std::sync::Mutex<Option<String>>>) -> Self {
         self.hook_feedback_slot = Some(slot);
         self
     }
@@ -362,7 +397,7 @@ impl AgentLoop {
         self
     }
 
-    pub fn with_telemetry(mut self, telemetry: Arc<Telemetry>, trace_id: Uuid) -> Self {
+    pub fn with_telemetry(mut self, telemetry: Arc<TelemetryPipeline>, trace_id: Uuid) -> Self {
         self.telemetry = Some(telemetry);
         self.trace_id = Some(trace_id);
         self
@@ -425,16 +460,37 @@ impl AgentLoop {
         let proactivity = self.proactivity_state.clone();
         let meta_agent = self.meta_agent_state.clone();
         let hook_feedback_slot = self.hook_feedback_slot.clone();
+        let background = self.background_maintenance.clone();
+        let compact_llm = self.compact_llm.clone();
+        let tool_cache_dir = self.tool_cache_dir.clone();
         tokio::spawn(async move {
-            let tool_schemas: Vec<ToolSchema> = tools
+            let mut tool_schemas: Vec<ToolSchema> = tools
                 .as_tool_schemas()
                 .into_iter()
                 .map(|s| ToolSchema {
                     name: s["function"]["name"].as_str().unwrap_or("").into(),
                     description: s["function"]["description"].as_str().unwrap_or("").into(),
                     parameters: s["function"]["parameters"].clone(),
+                    native_type: None,
                 })
                 .collect();
+            // Native server-side web search: drop any registry schema named
+            // "web_search" (webagent MCP collision), then declare the native tool.
+            if let Some(native) = llm.native_web_search_tool() {
+                tool_schemas.retain(|t| t.name != "web_search");
+                tool_schemas.push(native);
+            }
+
+            // Benchmark mode (EVEREVO_BENCHMARK=1): thread a task-level wall-clock
+            // deadline so the loop can inject escalating convergence nudges and a
+            // forced terminal commit instead of the plain max_turns error. The
+            // default 300s matches the harness per-question timeout. Non-benchmark
+            // runs pass None and keep byte-identical behavior.
+            let wall_deadline = if std::env::var("EVEREVO_BENCHMARK").is_ok() {
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(300))
+            } else {
+                None
+            };
 
             match AssertUnwindSafe(run_loop(
                 &llm,
@@ -442,6 +498,7 @@ impl AgentLoop {
                 &tool_schemas,
                 &mut messages,
                 max_turns,
+                wall_deadline,
                 max_tool_result_chars,
                 max_context_chars,
                 confirmation.as_deref(),
@@ -455,6 +512,9 @@ impl AgentLoop {
                 &proactivity,
                 &meta_agent,
                 &hook_feedback_slot,
+                compact_llm.as_deref(),
+                background.as_ref(),
+                tool_cache_dir.as_deref(),
             ))
             .catch_unwind()
             .await
@@ -504,18 +564,26 @@ impl AgentLoop {
         } else {
             self.max_turns
         };
-        let tool_schemas: Vec<ToolSchema> = tools
+        let mut tool_schemas: Vec<ToolSchema> = tools
             .as_tool_schemas()
             .into_iter()
             .map(|s| ToolSchema {
                 name: s["function"]["name"].as_str().unwrap_or("").into(),
                 description: s["function"]["description"].as_str().unwrap_or("").into(),
                 parameters: s["function"]["parameters"].clone(),
+                native_type: None,
             })
             .collect();
+        // Native server-side web search (see run()).
+        if let Some(native) = llm.native_web_search_tool() {
+            tool_schemas.retain(|t| t.name != "web_search");
+            tool_schemas.push(native);
+        }
 
         let mut text = String::new();
         let mut messages = messages;
+        // Bound native-server-search truncation-continue retries across turns.
+        let mut truncation_continues = 0;
 
         for _turn in 0..max_turns {
             if cancel.is_cancelled() {
@@ -539,14 +607,13 @@ impl AgentLoop {
             let mut current_thinking = String::new();
             let mut tool_calls: Vec<everevo_core::types::ToolCall> = Vec::new();
             let mut pending_tool: Option<(String, String, String)> = None;
+            let mut saw_server_tool = false;
+            let mut last_stop_reason: Option<String> = None;
 
             let mut rx = token_rx;
             loop {
-                let event = tokio::time::timeout(
-                    std::time::Duration::from_secs(120),
-                    rx.recv(),
-                )
-                .await;
+                let event =
+                    tokio::time::timeout(std::time::Duration::from_secs(120), rx.recv()).await;
                 let event = match event {
                     Ok(Some(e)) => e,
                     Ok(None) => break, // channel closed
@@ -576,7 +643,12 @@ impl AgentLoop {
                             }
                         }
                     }
-                    StreamEvent::Done => {
+                    StreamEvent::ServerToolUse { .. } => {
+                        // Provider-executed tool (native web search) — nothing to dispatch.
+                        saw_server_tool = true;
+                    }
+                    StreamEvent::Done { stop_reason, .. } => {
+                        last_stop_reason = stop_reason;
                         if let Some((id, name, args_str)) = pending_tool.take() {
                             let args: serde_json::Value =
                                 serde_json::from_str(&args_str).unwrap_or_default();
@@ -588,7 +660,34 @@ impl AgentLoop {
                         }
                         break;
                     }
+                    StreamEvent::Error(msg) => {
+                        turn_text.push_str(&format!("\n[LLM Error] {msg}"));
+                        break;
+                    }
                 }
+            }
+
+            // Native server-side search truncated (stop_reason=max_tokens): continue
+            // with the partial context; server blocks are NOT replayed (400 risk).
+            if tool_calls.is_empty()
+                && saw_server_tool
+                && last_stop_reason.as_deref() == Some("max_tokens")
+                && truncation_continues < 4
+            {
+                truncation_continues += 1;
+                messages.push(LlmMessage {
+                    role: LlmRole::Assistant,
+                    content: turn_text.clone(),
+                    thinking: if current_thinking.is_empty() {
+                        None
+                    } else {
+                        Some(std::mem::take(&mut current_thinking))
+                    },
+                    tool_calls: None,
+                    tool_call_id: None,
+                    images: Vec::new(),
+                });
+                continue;
             }
 
             // No tool calls → check for pending sub-agents before declaring Done
@@ -677,6 +776,88 @@ impl Default for AgentLoop {
     }
 }
 
+// ── Retrospective ──────────────────────────────────────────────────────
+// End-of-run execution summary: turns, tool calls, and failures classified
+// as transient (environment) vs structural (implementation defect).
+
+/// Cap a failure message for the retrospective (keep it compact).
+fn truncate_for_retro(msg: &str) -> String {
+    const MAX: usize = 160;
+    if msg.len() <= MAX {
+        msg.to_string()
+    } else {
+        format!("{}…", &msg[..MAX])
+    }
+}
+
+/// Classify a failure message as transient (environmental, retryable) or
+/// structural (needs a code fix). Mirrors `HttpClient::is_retryable` semantics
+/// for tool/LLM failures surfaced in the loop.
+fn classify_failure(msg: &str) -> &'static str {
+    let lower = msg.to_ascii_lowercase();
+    const TRANSIENT: &[&str] = &[
+        "timed out",
+        "timeout",
+        "stalled",
+        "network",
+        "connection reset",
+        "connection refused",
+        "rate limit",
+        "temporarily unavailable",
+        "429",
+        "502",
+        "503",
+        "504",
+        "retry",
+    ];
+    if TRANSIENT.iter().any(|k| lower.contains(k)) {
+        "transient"
+    } else {
+        "structural"
+    }
+}
+
+/// Build the end-of-run retrospective markdown block.
+fn build_retrospective(
+    turns: i32,
+    total_tool_calls: i32,
+    total_tool_success: i32,
+    failures: &[String],
+) -> String {
+    let failed = total_tool_calls - total_tool_success;
+    let transient = failures
+        .iter()
+        .filter(|f| classify_failure(f) == "transient")
+        .count();
+    let structural = failures.len() - transient;
+
+    let mut out = format!(
+        "## 执行复盘\n\n- 轮次：{turns}\n- 工具调用：{total_tool_calls} 次（成功 {total_tool_success}，失败 {failed}）"
+    );
+    if failures.is_empty() {
+        out.push_str("\n- 故障：无");
+    } else {
+        out.push_str(&format!(
+            "\n- 故障：{} 处（临时性 {}，结构性 {}）",
+            failures.len(),
+            transient,
+            structural
+        ));
+        for f in failures.iter().take(3) {
+            out.push_str(&format!("\n  - {f}"));
+        }
+        if failures.len() > 3 {
+            out.push_str(&format!("\n  - … 另有 {} 处", failures.len() - 3));
+        }
+    }
+    if structural > 0 {
+        out.push_str("\n- 优化点：结构性故障需修复底层逻辑；临时性故障可在后续轮次重试。");
+    } else {
+        out.push_str("\n- 优化点：本轮无结构性故障。");
+    }
+    out
+}
+
 // ── Loop Core ───────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -686,10 +867,11 @@ async fn run_loop(
     tool_schemas: &[ToolSchema],
     messages: &mut Vec<LlmMessage>,
     max_turns: usize,
+    wall_clock_deadline: Option<std::time::Instant>,
     max_tool_result_chars: usize,
     max_context_chars: usize,
     confirmation: Option<&(dyn Fn(&str, &serde_json::Value) -> bool + Send + Sync)>,
-    telemetry: Option<&Arc<Telemetry>>,
+    telemetry: Option<&Arc<TelemetryPipeline>>,
     trace_id: Option<Uuid>,
     mut subagent_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
     pending_subagents: &std::sync::atomic::AtomicUsize,
@@ -699,10 +881,19 @@ async fn run_loop(
     proactivity: &Option<Arc<std::sync::Mutex<ProactivityState>>>,
     meta_agent_state: &Option<Arc<std::sync::Mutex<crate::memory::meta_agent::MetaAgentState>>>,
     hook_feedback_slot: &Option<Arc<std::sync::Mutex<Option<String>>>>,
+    compact_llm: Option<&dyn LlmProvider>,
+    background: Option<&Arc<crate::context::BackgroundMaintenance>>,
+    tool_cache_dir: Option<&Path>,
 ) -> Result<(), EverEvoError> {
     let mut turn = 0;
+    // Bound the native-server-search truncation-continue retries across turns.
+    let mut truncation_continues = 0;
     // Track the previous turn's tool signature for fixation detection.
     let mut prev_tool_sig: Option<(String, u64)> = None;
+    // ── Run-level stats for the end-of-run retrospective ──────────
+    let mut total_tool_calls = 0i32;
+    let mut total_tool_success = 0i32;
+    let mut failure_messages: Vec<String> = Vec::new();
 
     while max_turns == 0 || turn < max_turns {
         turn += 1;
@@ -721,12 +912,38 @@ async fn run_loop(
         let turn_start = Instant::now();
 
         // ── Context management (Claude Code-aligned multi-layer) ────
-        // Layer 1: Snip — zero-cost pruning of low-value tool results
+        // Layer 0: Snip — zero-cost pruning of low-value tool results
         trim::snip_low_value_messages(messages);
-        // Layer 3+4: Autocompact (LLM summarization) → Trim (hard drop fallback)
-        // Trigger when approximate token count exceeds (context limit - buffer)
+        // Layer 1: Observation Masking — keep last N tool results, header older ones
+        trim::mask_observations(messages);
+        // Layer 2 (background): per-turn incremental rolling summary at the soft
+        // threshold — non-blocking, writes only persisted state (spec rules
+        // 5/6/7). Keeps the watermark low so Layer 3 rarely fires.
         let token_usage = trim::approx_tokens(messages.iter().map(|m| m.content.len()).sum());
         let token_limit = max_context_chars / 4;
+        if let Some(bg) = background {
+            use std::sync::atomic::Ordering;
+            if !bg.in_flight.load(Ordering::Relaxed) && token_usage > (token_limit * 7) / 10
+            // soft threshold 70%
+            {
+                bg.in_flight.store(true, Ordering::Relaxed);
+                let bg = Arc::clone(bg);
+                tokio::spawn(async move {
+                    if let Err(e) = bg.maintain().await {
+                        tracing::warn!(error = %e, "Background rolling-summary maintenance failed");
+                    }
+                    bg.in_flight.store(false, Ordering::Relaxed);
+                });
+                tracing::info!(
+                    token_usage,
+                    soft_limit = (token_limit * 7) / 10,
+                    "Background rolling-summary maintenance spawned"
+                );
+            }
+        }
+        // Layer 3+4: Autocompact (LLM summarization) → Trim (hard drop fallback)
+        // Trigger when approximate token count exceeds (context limit - buffer).
+        // Uses the compaction model when configured, else the main model.
         if token_usage > token_limit.saturating_sub(trim::COMPACTION_BUFFER_TOKENS) {
             tracing::info!(token_usage, token_limit, "Context compaction triggered");
             // Read focus hint from CompactTool (if set), then clear it
@@ -734,7 +951,10 @@ async fn run_loop(
                 let mut guard = f.lock().unwrap_or_else(|e| e.into_inner());
                 guard.take()
             });
-            if trim::autocompact(messages, max_context_chars, llm, focus.as_deref()).await == 0 {
+            let compact_model = compact_llm.unwrap_or(llm as &dyn LlmProvider);
+            if trim::autocompact(messages, max_context_chars, compact_model, focus.as_deref()).await
+                == 0
+            {
                 trim::trim_context(messages, max_context_chars);
             }
         }
@@ -792,9 +1012,28 @@ async fn run_loop(
         let mut current_thinking = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut pending_tool: Option<(String, String, String)> = None;
+        let mut saw_server_tool = false;
+        let mut last_stop_reason: Option<String> = None;
 
         let mut token_rx = token_rx;
-        while let Some(event) = token_rx.recv().await {
+        loop {
+            // Stall guard — mirror the sub-agent loop's 120s per-event timeout so
+            // a hung LLM stream can't block the main loop indefinitely.
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(120), token_rx.recv()).await;
+            let event = match event {
+                Ok(Some(e)) => e,
+                Ok(None) => break, // channel closed
+                Err(_elapsed) => {
+                    let msg = "LLM stream stalled (no events for 120s)".to_string();
+                    let _ = tx
+                        .send(AgentEvent::Error {
+                            message: msg.clone(),
+                        })
+                        .await;
+                    return Err(EverEvoError::Agent(msg));
+                }
+            };
             match event {
                 StreamEvent::Thinking(t) => {
                     current_thinking.push_str(&t);
@@ -814,7 +1053,13 @@ async fn run_loop(
                         }
                     }
                 }
-                StreamEvent::Done => {
+                StreamEvent::ServerToolUse { .. } => {
+                    // Provider-executed tool (native web search) — the provider
+                    // runs it within this turn; nothing to dispatch.
+                    saw_server_tool = true;
+                }
+                StreamEvent::Done { stop_reason, .. } => {
+                    last_stop_reason = stop_reason;
                     if let Some((id, name, args_str)) = pending_tool.take() {
                         let arguments: serde_json::Value =
                             serde_json::from_str(&args_str).unwrap_or(serde_json::Value::Null);
@@ -833,7 +1078,45 @@ async fn run_loop(
                     }
                     break;
                 }
+                StreamEvent::Error(msg) => {
+                    let _ = tx
+                        .send(AgentEvent::Error {
+                            message: msg.clone(),
+                        })
+                        .await;
+                    return Err(EverEvoError::LlmProvider(msg));
+                }
             }
+        }
+
+        // Native server-side search truncated (stop_reason=max_tokens): continue
+        // the turn with the partial context instead of emitting a premature Done.
+        // Server blocks are intentionally NOT replayed (an incomplete
+        // `server_tool_use` in history makes the API reject with 400).
+        if tool_calls.is_empty()
+            && saw_server_tool
+            && last_stop_reason.as_deref() == Some("max_tokens")
+            && truncation_continues < 4
+        {
+            truncation_continues += 1;
+            let thinking = if current_thinking.is_empty() {
+                None
+            } else {
+                Some(current_thinking.clone())
+            };
+            messages.push(LlmMessage {
+                role: LlmRole::Assistant,
+                content: current_text.clone(),
+                thinking,
+                tool_calls: None,
+                tool_call_id: None,
+                images: Vec::new(),
+            });
+            tracing::info!(
+                truncation_continues,
+                "Native server-side search truncated (max_tokens) — continuing turn"
+            );
+            continue;
         }
 
         // If text but no tool calls → check for pending sub-agents first.
@@ -854,6 +1137,13 @@ async fn run_loop(
             }
             // No pending sub-agents → truly done.
             let final_text = current_text.clone();
+            let summary = build_retrospective(
+                turn as i32,
+                total_tool_calls,
+                total_tool_success,
+                &failure_messages,
+            );
+            let _ = tx.send(AgentEvent::Retrospective { summary }).await;
             let _ = tx.send(AgentEvent::Done { final_text }).await;
             return Ok(());
         }
@@ -883,6 +1173,7 @@ async fn run_loop(
         let mut tool_calls_success = 0i32;
 
         for tc in &tool_calls {
+            total_tool_calls += 1;
             let tool = tools.get(&tc.name);
             if let Some(confirm_fn) = confirmation {
                 if !confirm_fn(&tc.name, &tc.arguments) {
@@ -941,6 +1232,7 @@ async fn run_loop(
                                     images: Vec::new(),
                                 })
                                 .await;
+                            failure_messages.push(format!("{}: blocked", tc.name));
                             tool_result_pairs.push((
                                 tc.id.clone(),
                                 format!("Tool blocked: {e}"),
@@ -959,7 +1251,20 @@ async fn run_loop(
 
             match result {
                 Ok(output) => {
-                    let truncated = trim::truncate_output(&output.content, max_tool_result_chars);
+                    // Large tool outputs are paged to disk (spec deliverable 6):
+                    // the context keeps a 2KB preview + absolute path, and the
+                    // full text is retrievable via the `tool_cache_read` tool.
+                    let truncated = match trim::page_tool_output(
+                        &tc.name,
+                        &tc.id,
+                        &output.content,
+                        tool_cache_dir,
+                    )
+                    .await
+                    {
+                        Some(paged) => paged,
+                        None => trim::truncate_output(&output.content, max_tool_result_chars),
+                    };
                     let _ = tx
                         .send(AgentEvent::ToolCallEnd {
                             id: tc.id.clone(),
@@ -985,14 +1290,21 @@ async fn run_loop(
                                 })
                                 .await;
                         }
+                        failure_messages.push(format!(
+                            "{}: {}",
+                            tc.name,
+                            truncate_for_retro(&truncated)
+                        ));
                         tracing::warn!(tool = %tc.name, "Tool returned error");
                     } else {
                         tool_calls_success += 1;
+                        total_tool_success += 1;
                     }
                     tool_result_pairs.push((tc.id.clone(), truncated, output.images.clone()));
                 }
                 Err(e) => {
                     let err_msg = format!("Tool execution failed: {e}");
+                    failure_messages.push(format!("{}: {err_msg}", tc.name));
                     let _ = tx
                         .send(AgentEvent::ToolCallEnd {
                             id: tc.id.clone(),
@@ -1004,6 +1316,18 @@ async fn run_loop(
                         .await;
                     tool_result_pairs.push((tc.id.clone(), err_msg, Vec::new()));
                 }
+            }
+        }
+
+        // ── 3.5 Deduplicate near-identical tool results ─────────────
+        // When N sub-agents/tools return the SAME observation (e.g.
+        // "list_dir vs shell path inconsistency"), pushing all N results
+        // floods the context with duplicates → model loops its thinking.
+        if tool_result_pairs.len() > 3 {
+            let original = tool_result_pairs.len();
+            deduplicate_tool_results(&mut tool_result_pairs);
+            if tool_result_pairs.len() < original {
+                // At least one group was collapsed — log the reduction.
             }
         }
 
@@ -1047,9 +1371,7 @@ async fn run_loop(
         if let Some(ref slot) = hook_feedback_slot {
             let mut fb = slot.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(feedback) = fb.take() {
-                messages.push(LlmMessage::user(format!(
-                    "[TOOL FEEDBACK]\n{feedback}"
-                )));
+                messages.push(LlmMessage::user(format!("[TOOL FEEDBACK]\n{feedback}")));
                 tracing::debug!(feedback_len = feedback.len(), "Hook feedback injected");
             }
         }
@@ -1058,9 +1380,7 @@ async fn run_loop(
         if let Some(ref meta_state) = meta_agent_state {
             let mut ms = meta_state.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(hint) = ms.take_hint() {
-                messages.push(LlmMessage::user(format!(
-                    "[META-AGENT HINT]\n{hint}"
-                )));
+                messages.push(LlmMessage::user(format!("[META-AGENT HINT]\n{hint}")));
                 tracing::debug!(hint_len = hint.len(), "Meta-agent hint injected");
             }
         }
@@ -1153,24 +1473,65 @@ async fn run_loop(
         // ── 5. Emit turn complete ───────────────────────────────────
         let _ = tx.send(AgentEvent::TurnComplete).await;
 
-        if let (Some(telemetry), Some(trace_id)) = (telemetry, trace_id) {
-            let latency_ms = turn_start.elapsed().as_millis() as i64;
-            telemetry.record_agent_turn(AgentTurnRecord {
+        if let Some(telemetry) = telemetry {
+            let turn_error = (tool_calls_success as usize) < tool_calls.len();
+            let (error_type, error_message) = if turn_error {
+                let failed = tool_calls.len() as i32 - tool_calls_success;
+                (
+                    Some("tool_error".to_string()),
+                    Some(format!(
+                        "{failed} of {} tool calls failed",
+                        tool_calls.len()
+                    )),
+                )
+            } else {
+                (None, None)
+            };
+            telemetry.emit(&TelemetryEmitContext {
                 trace_id,
-                turn_number: turn as i32,
-                tool_calls_total: tool_calls.len() as i32,
-                tool_calls_success,
-                task_completed: false,
-                latency_ms,
-                tokens_input: 0,
-                tokens_output: 0,
-                experiment_id: None,
-                variant: None,
+                turn_number: Some(turn as i32),
+                tool_calls_total: Some(tool_calls.len() as i32),
+                tool_calls_success: Some(tool_calls_success),
+                task_completed: Some(false),
+                turn_latency_ms: Some(turn_start.elapsed().as_millis() as i64),
+                error_type,
+                error_message,
+                ..Default::default()
             });
         }
 
         // ── 6. Check if we should inject a reminder ─────────────────
-        if max_turns > 0 && turn >= max_turns - 2 && turn < max_turns {
+        if let Some(deadline) = wall_clock_deadline {
+            // Benchmark mode: escalating convergence nudges + a per-turn budget
+            // line so the model feels both turn and wall-clock pressure.
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let wall_frac = (remaining.as_secs_f64() / 300.0).clamp(0.0, 1.0);
+            match convergence_stage(turn, max_turns, wall_frac) {
+                Convergence::Commit => {
+                    messages.push(LlmMessage::user(
+                        "⏰ Deadline: STOP exploring. Your very next response MUST end with a \
+                         single `Final answer:` line containing ONLY the value — best-effort \
+                         beats no answer.",
+                    ));
+                }
+                Convergence::Converge => {
+                    messages.push(LlmMessage::user(
+                        "⏰ Time check: start converging. Commit to a root cause, stop new \
+                         exploration, and prepare a single `Final answer:` line.",
+                    ));
+                }
+                Convergence::None => {}
+            }
+            let turns_left = if max_turns > 0 {
+                Some(max_turns.saturating_sub(turn))
+            } else {
+                None
+            };
+            messages.push(LlmMessage::user(budget_line(
+                turns_left,
+                Some(remaining.as_secs()),
+            )));
+        } else if max_turns > 0 && turn >= max_turns - 2 && turn < max_turns {
             messages.push(LlmMessage::user(
                 "You have only a few turns remaining. Please provide your final answer now.",
             ));
@@ -1178,14 +1539,120 @@ async fn run_loop(
     }
 
     if max_turns > 0 {
-        let _ = tx
-            .send(AgentEvent::Error {
-                message: format!("Max turns ({max_turns}) reached. Please try a simpler request."),
-            })
-            .await;
+        if wall_clock_deadline.is_some() {
+            // Benchmark forced terminal commit: one last no-tool LLM call for
+            // ONLY the final answer, seeded from the full conversation (which
+            // holds the model's own prior committed text), then emit Done so the
+            // harness scorer / re-prompt sees a final_text instead of an error.
+            messages.push(LlmMessage::user(forced_final_prompt()));
+            let final_text = match llm.chat(messages, &[]).await {
+                Ok(resp) => resp.content.unwrap_or_default(),
+                Err(_) => String::new(),
+            };
+            let _ = tx.send(AgentEvent::Done { final_text }).await;
+        } else {
+            let _ = tx
+                .send(AgentEvent::Error {
+                    message: format!(
+                        "Max turns ({max_turns}) reached. Please try a simpler request."
+                    ),
+                })
+                .await;
+        }
     }
 
     Ok(())
+}
+
+// ── Convergence nudges (benchmark mode) ─────────────────────────────────────
+
+/// Escalating convergence stage for the turn budget. Pure logic, unit-tested.
+enum Convergence {
+    /// Keep exploring (budget not yet tight).
+    None,
+    /// ~70% of turn budget / ~30% wall-clock left — start converging.
+    Converge,
+    /// ~85% of turn budget / ~15% wall-clock left — commit now.
+    Commit,
+}
+
+fn convergence_stage(turn: usize, max_turns: usize, wall_left_frac: f64) -> Convergence {
+    let turn_pct = if max_turns > 0 {
+        turn as f64 / max_turns as f64
+    } else {
+        0.0
+    };
+    if (max_turns > 0 && turn_pct >= 0.85) || wall_left_frac <= 0.15 {
+        Convergence::Commit
+    } else if (max_turns > 0 && turn_pct >= 0.70) || wall_left_frac <= 0.30 {
+        Convergence::Converge
+    } else {
+        Convergence::None
+    }
+}
+
+/// Per-turn budget line appended to the conversation (benchmark mode).
+fn budget_line(turns_left: Option<usize>, wall_left_secs: Option<u64>) -> String {
+    let turns = match turns_left {
+        Some(n) => format!("{n} turns left"),
+        None => "unbounded turns left".to_string(),
+    };
+    match wall_left_secs {
+        Some(s) => format!("[Budget: {turns}, ~{s}s wall-clock left]"),
+        None => format!("[Budget: {turns}]"),
+    }
+}
+
+/// Prompt for the forced terminal commit (benchmark mode).
+fn forced_final_prompt() -> &'static str {
+    "⏰ Turn budget exhausted. Do NOT call any tools. Based on everything you \
+     have already gathered, output exactly one line: Final answer: <value>. \
+     Nothing else."
+}
+
+// ── Tool Result Deduplication ──────────────────────────────────────────────
+
+/// When N tool results in the same turn are near-identical (e.g. 3 sub-agents
+/// all reporting the same path inconsistency bug), keep the first 2 and replace
+/// the rest with a collapsed summary. This prevents flooding the LLM context
+/// with duplicate observations that cause repetition loops in the thinking output.
+fn deduplicate_tool_results(results: &mut [(String, String, Vec<everevo_core::ImageData>)]) {
+    if results.len() < 3 {
+        return;
+    }
+
+    // Phase 1: fingerprint each result
+    let fingerprints: Vec<u64> = results
+        .iter()
+        .map(|(_, content, _)| {
+            let prefix: String = content.chars().take(200).collect();
+            hash_str(&prefix)
+        })
+        .collect();
+
+    // Phase 2: find groups with high similarity
+    let mut seen: std::collections::HashMap<u64, Vec<usize>> = std::collections::HashMap::new();
+    for (i, &fp) in fingerprints.iter().enumerate() {
+        seen.entry(fp).or_default().push(i);
+    }
+
+    // Phase 3: collapse groups with >2 members
+    for indices in seen.values() {
+        if indices.len() <= 2 {
+            continue;
+        }
+        let keep_id = results[indices[0]].0.clone();
+        let dup_count = indices.len() - 2;
+        for &idx in &indices[2..] {
+            results[idx] = (
+                results[idx].0.clone(),
+                format!(
+                    "(duplicate of {keep_id} — {dup_count} similar results collapsed to save context)"
+                ),
+                Vec::new(),
+            );
+        }
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -1280,6 +1747,57 @@ mod tests {
         assert_eq!(agent.max_turns, 0);
         let limited = agent.with_max_turns(5);
         assert_eq!(limited.max_turns, 5);
+    }
+
+    // ── Convergence nudge thresholds (benchmark mode) ─────────────────────
+
+    fn is_commit(s: Convergence) -> bool {
+        matches!(s, Convergence::Commit)
+    }
+    fn is_converge(s: Convergence) -> bool {
+        matches!(s, Convergence::Converge)
+    }
+
+    #[test]
+    fn test_convergence_turn_thresholds() {
+        // max_turns=10: turn 7 → 70% → Converge; turn 9 → 90% → Commit.
+        assert!(is_converge(convergence_stage(7, 10, 1.0)));
+        assert!(is_commit(convergence_stage(9, 10, 1.0)));
+        // Early turns stay None regardless of wall-clock.
+        assert!(matches!(convergence_stage(3, 10, 1.0), Convergence::None));
+        // Boundary: exactly 70% is Converge, 85% is Commit.
+        assert!(is_converge(convergence_stage(7, 10, 1.0)));
+        assert!(is_commit(convergence_stage(9, 10, 1.0)));
+    }
+
+    #[test]
+    fn test_convergence_wall_clock_thresholds() {
+        // Wall-clock alone drives convergence when turns are unbounded.
+        assert!(matches!(convergence_stage(1, 0, 0.5), Convergence::None));
+        assert!(is_converge(convergence_stage(1, 0, 0.30)));
+        assert!(is_commit(convergence_stage(1, 0, 0.15)));
+        // Wall-clock can force Commit even when turn budget is fresh.
+        assert!(is_commit(convergence_stage(1, 10, 0.10)));
+    }
+
+    #[test]
+    fn test_budget_line_format() {
+        assert_eq!(
+            budget_line(Some(3), Some(90)),
+            "[Budget: 3 turns left, ~90s wall-clock left]"
+        );
+        assert_eq!(
+            budget_line(None, Some(90)),
+            "[Budget: unbounded turns left, ~90s wall-clock left]"
+        );
+        assert_eq!(budget_line(Some(1), None), "[Budget: 1 turns left]");
+    }
+
+    #[test]
+    fn test_forced_final_prompt_contains_marker() {
+        let p = forced_final_prompt();
+        assert!(p.contains("Final answer: <value>"));
+        assert!(p.contains("Do NOT call any tools"));
     }
 
     #[test]

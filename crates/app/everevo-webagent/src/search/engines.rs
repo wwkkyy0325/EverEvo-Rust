@@ -53,9 +53,7 @@ impl SearchEngine {
                 if !resp.status().is_success() {
                     return Err(format!("bing HTTP {}", resp.status()));
                 }
-                resp.text()
-                    .await
-                    .map_err(|e| format!("bing body: {e}"))
+                resp.text().await.map_err(|e| format!("bing body: {e}"))
             }
             Self::DdgLite | Self::DdgHtml => {
                 let endpoint = match self {
@@ -71,9 +69,7 @@ impl SearchEngine {
                 if !resp.status().is_success() {
                     return Err(format!("ddg HTTP {}", resp.status()));
                 }
-                resp.text()
-                    .await
-                    .map_err(|e| format!("ddg body: {e}"))
+                resp.text().await.map_err(|e| format!("ddg body: {e}"))
             }
         }
     }
@@ -143,42 +139,17 @@ fn build_search_client() -> Result<reqwest::Client, String> {
 
     let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
-    // Proxy detection
-    let mut builder = reqwest::Client::builder()
+    // Proxy detection — single egress in everevo-net.
+    let builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(15))
         .user_agent(ua)
         .default_headers(headers)
         .redirect(reqwest::redirect::Policy::limited(3))
         .tcp_nodelay(true);
-
-    if let Some(proxy_url) = detect_proxy() {
-        if let Ok(proxy) = reqwest::Proxy::all(&proxy_url) {
-            builder = builder.proxy(proxy);
-        }
-    }
+    let builder = everevo_net::reqwest_apply_proxy(builder);
 
     builder.build().map_err(|e| format!("client build: {e}"))
-}
-
-fn detect_proxy() -> Option<String> {
-    for var in &[
-        "EVEREVO_HTTP_PROXY",
-        "HTTPS_PROXY",
-        "https_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-    ] {
-        if let Ok(val) = std::env::var(var) {
-            let val = val.trim().to_string();
-            if !val.is_empty() {
-                return Some(val);
-            }
-        }
-    }
-    None
 }
 
 // ── HTML parsing ─────────────────────────────────────────────────────────
@@ -243,7 +214,11 @@ fn parse_bing_results(html: &str, limit: usize) -> Vec<SearchResult> {
 
         let snippet = extract_bing_snippet(block);
         if !results.iter().any(|r: &SearchResult| r.url == href) {
-            results.push(SearchResult { title, url: href, snippet });
+            results.push(SearchResult {
+                title,
+                url: href,
+                snippet,
+            });
         }
     }
 
@@ -264,12 +239,17 @@ fn parse_generic_results(html: &str, limit: usize) -> Vec<SearchResult> {
                     Some(u) => u,
                     None => continue,
                 };
-                if title.is_empty() || is_internal_link(&url) || title.eq_ignore_ascii_case("here") {
+                if title.is_empty() || is_internal_link(&url) || title.eq_ignore_ascii_case("here")
+                {
                     continue;
                 }
                 let snippet = extract_snippet(&chars, i);
                 if !results.iter().any(|r: &SearchResult| r.url == url) {
-                    results.push(SearchResult { title, url, snippet });
+                    results.push(SearchResult {
+                        title,
+                        url,
+                        snippet,
+                    });
                 }
             }
             None => break,
@@ -304,7 +284,9 @@ fn extract_link_text(html_fragment: &str) -> String {
         Some(p) => tag_end + p,
         None => return String::new(),
     };
-    strip_html_tags(&html_fragment[tag_end..close]).trim().to_string()
+    strip_html_tags(&html_fragment[tag_end..close])
+        .trim()
+        .to_string()
 }
 
 fn extract_bing_snippet(block: &str) -> String {

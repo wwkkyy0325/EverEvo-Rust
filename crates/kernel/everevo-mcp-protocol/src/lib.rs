@@ -357,8 +357,7 @@ mod tests {
 
     #[test]
     fn test_tool_def_deserialization() {
-        let json =
-            r#"{"name":"read","description":"Read a file","inputSchema":{"type":"object"}}"#;
+        let json = r#"{"name":"read","description":"Read a file","inputSchema":{"type":"object"}}"#;
         let td: ToolDef = serde_json::from_str(json).unwrap();
         assert_eq!(td.name, "read");
         assert_eq!(td.description, "Read a file");

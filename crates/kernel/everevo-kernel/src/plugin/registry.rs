@@ -73,13 +73,12 @@ impl PluginRegistry {
         // Verify checksum before spawning
         self.store
             .verify_checksum(plugin_id, &version)
-            .map_err(|e| format!("checksum verification failed for '{plugin_id}@{version}': {e}"))?;
+            .map_err(|e| {
+                format!("checksum verification failed for '{plugin_id}@{version}': {e}")
+            })?;
 
         // Get or spawn MCP client
-        let client = self
-            .pool
-            .acquire(plugin_id, &version, &exe_path)
-            .await?;
+        let client = self.pool.acquire(plugin_id, &version, &exe_path).await?;
 
         // Discover tools and wrap as Tool trait objects
         let tools = {
@@ -104,13 +103,7 @@ impl PluginRegistry {
     }
 
     /// Record a tool call result for metrics.
-    pub fn record_call(
-        &self,
-        plugin_id: &str,
-        version: &str,
-        success: bool,
-        latency_ms: u64,
-    ) {
+    pub fn record_call(&self, plugin_id: &str, version: &str, success: bool, latency_ms: u64) {
         if let Err(e) = self
             .store
             .record_call(plugin_id, version, success, latency_ms)

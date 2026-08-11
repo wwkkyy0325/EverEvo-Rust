@@ -37,6 +37,7 @@ fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
 /// memory extraction, reflection, workflow auto-compose, persona update.
 pub(super) async fn spawn_post_turn_tasks(
     state: &Arc<AppState>,
+    session_id: uuid::Uuid,
     user_msg: &str,
     assistant_msg: &str,
 ) {
@@ -47,60 +48,77 @@ pub(super) async fn spawn_post_turn_tasks(
     let fm = state.fact_manager.clone();
     let um = user_msg.to_string();
     let am = assistant_msg.to_string();
+    // Benchmark mode (EVEREVO_BENCHMARK=1): skip the GLOBAL-tier writers
+    // (reflection lessons, workflow recipes, persona profile) so one GAIA
+    // question's answer never leaks into later questions' context. Memory
+    // extraction stays — it is session-scoped and strictly isolated.
+    let benchmark = std::env::var("EVEREVO_BENCHMARK").is_ok();
 
-    // Memory extraction (Mem0 pattern: durable facts)
+    // Memory extraction (Mem0 pattern: durable facts) — tagged with the
+    // originating session so cross-session recall stays strictly isolated.
     spawn_guarded("memory_extraction", {
         let p = Arc::clone(&primary);
         let fm = Arc::clone(&fm);
         let um = um.clone();
         let am = am.clone();
         async move {
-            everevo_agent::memory::extractor::extract_from_turn(&p, &fm, &um, &am).await;
-        }
-    });
-
-    // Reflection (Reflexion pattern: lessons → feedback facts)
-    spawn_guarded("reflection", {
-        let p = Arc::clone(&primary);
-        let fm = Arc::clone(&fm);
-        let um = um.clone();
-        let am = am.clone();
-        async move {
-            everevo_agent::memory::reflection::reflect_on_turn(&p, &fm, &um, &am).await;
-        }
-    });
-
-    // Workflow auto-compose (repeatable task → reusable workflow)
-    // Clone primary BEFORE moving into the closure chain
-    let p_wf = Arc::clone(&primary);
-    spawn_guarded("workflow_compose", {
-        let dir = state.config.data_dir.join("workflows");
-        let um = um.clone();
-        let am = am.clone();
-        async move {
-            everevo_agent::memory::reflection::compose_workflow_if_reusable(
-                &p_wf, &dir, &um, &am,
+            everevo_agent::memory::extractor::extract_from_turn(
+                &p,
+                &fm,
+                Some(session_id),
+                &um,
+                &am,
             )
             .await;
         }
     });
 
+    // Reflection (Reflexion pattern: lessons → feedback facts)
+    if !benchmark {
+        spawn_guarded("reflection", {
+            let p = Arc::clone(&primary);
+            let fm = Arc::clone(&fm);
+            let um = um.clone();
+            let am = am.clone();
+            async move {
+                everevo_agent::memory::reflection::reflect_on_turn(&p, &fm, &um, &am).await;
+            }
+        });
+    }
+
+    // Workflow auto-compose (repeatable task → reusable workflow)
+    // Clone primary BEFORE moving into the closure chain
+    if !benchmark {
+        let p_wf = Arc::clone(&primary);
+        spawn_guarded("workflow_compose", {
+            let dir = state.config.data_dir.join("workflows");
+            let um = um.clone();
+            let am = am.clone();
+            async move {
+                everevo_agent::memory::reflection::compose_workflow_if_reusable(
+                    &p_wf, &dir, &um, &am,
+                )
+                .await;
+            }
+        });
+    }
+
     // Persona auto-update (evolves communication style from accumulated facts)
-    spawn_guarded("persona_update", {
-        let profile_path = state
-            .config
-            .data_dir
-            .join("memory")
-            .join("persona")
-            .join("profile.json");
-        let fm = Arc::clone(&fm);
-        async move {
-            let facts = fm.load_all().unwrap_or_default();
-            everevo_agent::stages::persona::update_persona_from_facts(
-                &profile_path, &facts,
-            );
-        }
-    });
+    if !benchmark {
+        spawn_guarded("persona_update", {
+            let profile_path = state
+                .config
+                .data_dir
+                .join("memory")
+                .join("persona")
+                .join("profile.json");
+            let fm = Arc::clone(&fm);
+            async move {
+                let facts = fm.load_all().unwrap_or_default();
+                everevo_agent::stages::persona::update_persona_from_facts(&profile_path, &facts);
+            }
+        });
+    }
 
     // Paradigm extraction (SAMULE pattern: extract reusable action patterns)
     spawn_guarded("paradigm_extraction", {

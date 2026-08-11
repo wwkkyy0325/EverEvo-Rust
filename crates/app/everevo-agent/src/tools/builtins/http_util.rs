@@ -30,14 +30,11 @@ pub const BROWSER_UA: &str = concat!(
 ///
 /// # Proxy resolution order
 ///
-/// 1. `EVEREVO_HTTP_PROXY` env var — explicit override. When set, it is the
-///    ONLY proxy used (reqwest disables automatic env detection once any
-///    explicit `.proxy()` is configured). This lets users force traffic
-///    through a residential/VPN proxy to escape a blocked datacenter IP.
-/// 2. Standard env vars (`HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`) — reqwest
-///    applies these automatically when no explicit proxy is configured.
-///
-/// No `.no_proxy()` is ever called, so proxy usage is never suppressed.
+/// The proxy comes from `everevo-net` (the project's single HTTP egress):
+/// `EVEREVO_HTTP_PROXY` env var first — the explicit override that lets users
+/// force traffic through a residential/VPN proxy to escape a blocked
+/// datacenter IP — then the standard `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`
+/// vars. No `.no_proxy()` is ever called, so proxy usage is never suppressed.
 pub fn build_browser_client(
     connect_timeout: Duration,
     request_timeout: Duration,
@@ -84,7 +81,7 @@ pub fn build_browser_client(
         HeaderValue::from_static("1"),
     );
 
-    let mut builder = reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .connect_timeout(connect_timeout)
         .timeout(request_timeout)
         .user_agent(HeaderValue::from_str(BROWSER_UA).expect("static UA is valid"))
@@ -92,22 +89,10 @@ pub fn build_browser_client(
         .redirect(reqwest::redirect::Policy::limited(3))
         .tcp_nodelay(true);
 
-    // Proxy detection — explicit override, then standard env vars.
-    // Reuse the same detection logic as the LLM client.
-    let proxy_url: Option<String> = if let Ok(val) = std::env::var("EVEREVO_HTTP_PROXY") {
-        let val = val.trim().to_string();
-        if !val.is_empty() { Some(val) } else { None }
-    } else {
-        crate::llm::http::detect_proxy_sync()
-    };
-
-    if let Some(ref proxy_url) = proxy_url {
-        tracing::debug!(proxy = %proxy_url, "Routing web tool traffic through proxy");
-        let proxy = reqwest::Proxy::all(proxy_url).map_err(|e| {
-            EverEvoError::Network(format!("Invalid proxy URL '{proxy_url}': {e}"))
-        })?;
-        builder = builder.proxy(proxy);
-    }
+    // Proxy detection — single egress in everevo-net (explicit override then
+    // standard env vars). An invalid URL falls back to direct rather than
+    // erroring, so a misconfigured proxy can't brick the web tools.
+    let builder = everevo_net::reqwest_apply_proxy(builder);
 
     builder
         .build()

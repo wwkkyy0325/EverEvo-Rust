@@ -373,4 +373,139 @@ mod tests {
         let store = MultiCollectionStore::open(&base, 3, Some(&old_bin)).unwrap();
         assert_eq!(store.count("memory"), 1);
     }
+
+    // ── Enhanced isolation & fusion tests ────────────────────────────────
+
+    #[test]
+    fn test_cross_collection_no_leak() {
+        // Data in one collection must NOT appear in another collection's search.
+        let dir = TempDir::new().unwrap();
+        let store = MultiCollectionStore::open(dir.path().join("vector"), 4, None).unwrap();
+
+        store
+            .insert(
+                COLLECTION_MEMORY,
+                vec![make_chunk(Uuid::new_v4(), vec![1.0, 0.0, 0.0, 0.0])],
+            )
+            .unwrap();
+        store
+            .insert(
+                COLLECTION_DOMAIN,
+                vec![make_chunk(Uuid::new_v4(), vec![0.0, 1.0, 0.0, 0.0])],
+            )
+            .unwrap();
+
+        // Search COLLECTION_DOMAIN with a query close to the COLLECTION_MEMORY vector
+        let domain_results = store
+            .search(COLLECTION_DOMAIN, &[1.0, 0.0, 0.0, 0.0], 5)
+            .unwrap();
+        // The COLLECTION_DOMAIN vector is [0,1,0,0], similarity to [1,0,0,0] ≈ 0
+        // Should return 1 result (only its own chunk, with low score)
+        assert_eq!(domain_results.len(), 1);
+        // Verify no memory chunk leaks into domain search
+        let memory_results = store
+            .search(COLLECTION_MEMORY, &[1.0, 0.0, 0.0, 0.0], 5)
+            .unwrap();
+        assert_eq!(memory_results.len(), 1);
+        // The two results should be different chunks
+        assert_ne!(domain_results[0].chunk.id, memory_results[0].chunk.id);
+    }
+
+    #[test]
+    fn test_delete_collection_isolation() {
+        let dir = TempDir::new().unwrap();
+        let store = MultiCollectionStore::open(dir.path().join("vector"), 4, None).unwrap();
+
+        let mem_id = Uuid::new_v4();
+        let code_id = Uuid::new_v4();
+        store
+            .insert("memory", vec![make_chunk(mem_id, vec![1.0, 0.0, 0.0, 0.0])])
+            .unwrap();
+        store
+            .insert("code", vec![make_chunk(code_id, vec![0.0, 1.0, 0.0, 0.0])])
+            .unwrap();
+        assert_eq!(store.count("memory"), 1);
+        assert_eq!(store.count("code"), 1);
+
+        // Delete only from memory
+        store.delete("memory", &[mem_id]).unwrap();
+        assert_eq!(store.count("memory"), 0);
+        assert_eq!(store.count("code"), 1); // code unaffected
+    }
+
+    #[test]
+    fn test_search_multi_empty_collections() {
+        let dir = TempDir::new().unwrap();
+        let store = MultiCollectionStore::open(dir.path().join("vector"), 4, None).unwrap();
+        let results = store.search_multi(&[], &[1.0, 0.0, 0.0, 0.0], 5).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_multi_single_collection() {
+        let dir = TempDir::new().unwrap();
+        let store = MultiCollectionStore::open(dir.path().join("vector"), 4, None).unwrap();
+
+        let id = Uuid::new_v4();
+        store
+            .insert("memory", vec![make_chunk(id, vec![1.0, 0.0, 0.0, 0.0])])
+            .unwrap();
+
+        let multi = store
+            .search_multi(&["memory"], &[1.0, 0.0, 0.0, 0.0], 5)
+            .unwrap();
+        let single = store.search("memory", &[1.0, 0.0, 0.0, 0.0], 5).unwrap();
+
+        assert_eq!(multi.len(), single.len());
+        assert_eq!(multi[0].chunk.id, single[0].chunk.id);
+    }
+
+    #[test]
+    fn test_rrf_fusion_ordering() {
+        // Verify RRF fusion produces meaningful ordering.
+        // Strategy: insert known vectors, verify fused ranking is non-empty and sorted.
+        let dir = TempDir::new().unwrap();
+        let store = MultiCollectionStore::open(dir.path().join("vector"), 4, None).unwrap();
+
+        // Collection A: vector close to query
+        store
+            .insert(
+                "a",
+                vec![make_chunk(Uuid::new_v4(), vec![1.0, 0.0, 0.0, 0.0])],
+            )
+            .unwrap();
+        // Collection B: vector also close to query (slightly different)
+        store
+            .insert(
+                "b",
+                vec![make_chunk(Uuid::new_v4(), vec![0.95, 0.05, 0.0, 0.0])],
+            )
+            .unwrap();
+        // Collection B: vector far from query
+        store
+            .insert(
+                "b",
+                vec![make_chunk(Uuid::new_v4(), vec![0.0, 1.0, 0.0, 0.0])],
+            )
+            .unwrap();
+
+        let results = store
+            .search_multi(&["a", "b"], &[1.0, 0.0, 0.0, 0.0], 5)
+            .unwrap();
+        // Should return 3 results, sorted by descending RRF score
+        assert_eq!(results.len(), 3);
+        // Verify sorted: scores should be non-increasing
+        for w in results.windows(2) {
+            assert!(w[0].score >= w[1].score, "RRF results not sorted correctly");
+        }
+    }
+
+    #[test]
+    fn test_collection_names() {
+        let dir = TempDir::new().unwrap();
+        let store = MultiCollectionStore::open(dir.path().join("vector"), 4, None).unwrap();
+        let names = store.collection_names();
+        // "memory" always present; other collections created lazily
+        assert!(names.contains(&"memory".to_string()));
+    }
 }

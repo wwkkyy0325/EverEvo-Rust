@@ -116,8 +116,8 @@ pub async fn resolve_session(
     session::resolve_and_load(state, session_id_opt, message).await
 }
 
-pub use tools::AssembledTools;
 pub use session_coordinator::{SessionCoordinator, SessionReceivers};
+pub use tools::AssembledTools;
 
 /// Build the per-session tool registry with all dependencies injected.
 pub async fn build_registry(
@@ -152,6 +152,8 @@ pub async fn finalize_response(
     thinking_open: bool,
     text_block_idx: Option<usize>,
     block_index: usize,
+    input_tokens: u64,
+    output_tokens: u64,
 ) -> Result<(), OrchestrationError> {
     // Wrap in a 5-second timeout — if the DB is slow, we still send done
     let result = tokio::time::timeout(
@@ -167,6 +169,8 @@ pub async fn finalize_response(
             thinking_open,
             text_block_idx,
             block_index,
+            input_tokens,
+            output_tokens,
         ),
     )
     .await;
@@ -175,8 +179,8 @@ pub async fn finalize_response(
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(OrchestrationError::new("response", e)),
         Err(_elapsed) => {
-            // Timeout: send a minimal done event so the frontend doesn't hang
-            let done = serde_json::json!({"session_id": session_id, "message_id": assistant_id});
+            // Timeout: send a minimal done event (token counts unknown = 0)
+            let done = serde_json::json!({"session_id": session_id, "message_id": assistant_id, "input_tokens": 0, "output_tokens": 0});
             let _ = tx
                 .send(Ok(Event::default().event("done").data(done.to_string())))
                 .await;
@@ -196,7 +200,7 @@ pub(crate) fn send_sse_error(
     code: everevo_core::ErrorCode,
     msg: &str,
 ) {
-    let _ = tx.try_send(Ok(Event::default().event("error").data(
-        serde_json::json!({"code": code, "message": msg}).to_string(),
-    )));
+    let _ = tx.try_send(Ok(Event::default()
+        .event("error")
+        .data(serde_json::json!({"code": code, "message": msg}).to_string())));
 }

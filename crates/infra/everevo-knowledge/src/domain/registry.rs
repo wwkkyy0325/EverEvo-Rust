@@ -278,4 +278,168 @@ mod tests {
         let loaded = DomainRegistry::load(&path).unwrap();
         assert!(loaded.domains.contains_key("test"));
     }
+
+    #[test]
+    fn test_centroid_update_formula() {
+        // Incremental centroid should match the mathematical running average.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("domains.json");
+        let mut reg = DomainRegistry::load(&path).unwrap();
+        reg.create("math".into(), "Math".into(), "Math domain".into());
+
+        // Add 3 identical vectors
+        let v = vec![0.5_f32; 384];
+        reg.update_centroid("math", &v);
+        reg.update_centroid("math", &v);
+        reg.update_centroid("math", &v);
+
+        let domain = &reg.domains["math"];
+        assert_eq!(domain.document_count, 3);
+        // Centroid of identical vectors should be the same vector (within float tolerance)
+        for &c in &domain.centroid {
+            assert!(
+                (c - 0.5).abs() < 1e-6,
+                "centroid element should be ~0.5, got {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_centroid_update_mixed() {
+        // Verify centroid is the correct average of different vectors.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("domains.json");
+        let mut reg = DomainRegistry::load(&path).unwrap();
+        reg.create("mix".into(), "Mix".into(), "Mixed domain".into());
+
+        // First vector: all 0.0
+        let v1 = vec![0.0_f32; 384];
+        reg.update_centroid("mix", &v1);
+        // Second vector: all 1.0
+        let v2 = vec![1.0_f32; 384];
+        reg.update_centroid("mix", &v2);
+
+        let domain = &reg.domains["mix"];
+        assert_eq!(domain.document_count, 2);
+        // Average of [0,0,...] and [1,1,...] = [0.5, 0.5, ...]
+        for &c in &domain.centroid {
+            assert!(
+                (c - 0.5).abs() < 1e-6,
+                "centroid element should be 0.5, got {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_merge_domains_centroid() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("domains.json");
+        let mut reg = DomainRegistry::load(&path).unwrap();
+        reg.create("target".into(), "Target".into(), "Target domain".into());
+        reg.create("source".into(), "Source".into(), "Source domain".into());
+
+        reg.update_centroid("target", &vec![0.0_f32; 384]);
+        reg.update_centroid("target", &vec![0.0_f32; 384]); // target: 2 docs, centroid=[0.0]
+        reg.update_centroid("source", &vec![1.0_f32; 384]); // source: 1 doc, centroid=[1.0]
+
+        reg.merge_domains("target", "source").unwrap();
+
+        let target = &reg.domains["target"];
+        assert_eq!(target.document_count, 3);
+        // Weighted average: (2*0.0 + 1*1.0) / 3 = 0.333...
+        for &c in &target.centroid {
+            assert!(
+                (c - 1.0 / 3.0).abs() < 1e-5,
+                "merged centroid should be ~0.333, got {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_merge_domains_self_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("domains.json");
+        let mut reg = DomainRegistry::load(&path).unwrap();
+        reg.create("solo".into(), "Solo".into(), "Solo domain".into());
+
+        let result = reg.merge_domains("solo", "solo");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_merge_nonexistent_source_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("domains.json");
+        let mut reg = DomainRegistry::load(&path).unwrap();
+        reg.create("target".into(), "Target".into(), "Target".into());
+
+        let result = reg.merge_domains("target", "nonexistent");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_classify_empty_registry() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("domains.json");
+        let reg = DomainRegistry::load(&path).unwrap();
+        let (id, sim) = reg.classify(&vec![1.0_f32; 384]);
+        assert!(id.is_none());
+        assert_eq!(sim, 0.0);
+    }
+
+    #[test]
+    fn test_classify_skips_merged_domain() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("domains.json");
+        let mut reg = DomainRegistry::load(&path).unwrap();
+        reg.create("a".into(), "A".into(), "Domain A".into());
+        reg.create("b".into(), "B".into(), "Domain B".into());
+        reg.update_centroid("a", &vec![1.0_f32; 384]);
+        reg.update_centroid("b", &vec![0.5_f32; 384]);
+        reg.merge_domains("a", "b").unwrap();
+
+        // b is now merged_into a; classify should NOT return b
+        let (id, _) = reg.classify(&vec![0.5_f32; 384]);
+        assert_eq!(id.unwrap(), "a"); // only a is active
+    }
+
+    #[test]
+    fn test_suggest_relations_threshold() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("domains.json");
+        let mut reg = DomainRegistry::load(&path).unwrap();
+        reg.create("rust".into(), "Rust".into(), "Rust lang".into());
+        reg.create("python".into(), "Python".into(), "Python lang".into());
+        reg.create("cooking".into(), "Cooking".into(), "Cooking recipes".into());
+        reg.update_centroid("rust", &vec![1.0_f32; 384]);
+        reg.update_centroid("python", &vec![0.9_f32; 384]); // similar to rust
+        reg.update_centroid("cooking", &vec![0.0_f32; 384]); // dissimilar
+
+        // High threshold: only very similar domains
+        let related = reg.suggest_relations("rust", 0.95);
+        assert!(related.iter().any(|(id, _)| id == "python"));
+        assert!(!related.iter().any(|(id, _)| id == "cooking"));
+    }
+
+    #[test]
+    fn test_add_relation_symmetric() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("domains.json");
+        let mut reg = DomainRegistry::load(&path).unwrap();
+        reg.create("a".into(), "A".into(), "Domain A".into());
+        reg.create("b".into(), "B".into(), "Domain B".into());
+
+        reg.add_relation("a", "b", "related").unwrap();
+        assert!(reg.domains["a"].related_ids.contains(&"b".to_string()));
+        assert!(reg.domains["b"].related_ids.contains(&"a".to_string()));
+    }
+
+    #[test]
+    fn test_add_document_to_nonexistent_domain() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("domains.json");
+        let mut reg = DomainRegistry::load(&path).unwrap();
+        let result = reg.add_document("nonexistent", &vec![1.0_f32; 384]);
+        assert!(result.is_err());
+    }
 }

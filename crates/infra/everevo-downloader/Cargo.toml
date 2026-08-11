@@ -8,6 +8,7 @@ description = "EverEvo download engine — multi-mirror, resumable, concurrent, 
 
 [dependencies]
 everevo-core = { path = "../../kernel/everevo-core" }
+everevo-net = { path = "../everevo-net" }
 
 tokio = { workspace = true, features = ["fs", "io-util", "sync", "time", "macros"] }
 reqwest.workspace = true

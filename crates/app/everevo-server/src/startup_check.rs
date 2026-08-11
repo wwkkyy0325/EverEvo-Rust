@@ -106,6 +106,9 @@ pub async fn run_startup_check(data_dir: &Path, requested_port: u16) -> StartupR
     // 8. LLM configuration
     items.push(check_llm_config(data_dir));
 
+    // 8.5 Vision provider (context ≤ 32K VRAM guard)
+    items.push(check_vision_config(data_dir));
+
     // 9. Runtime smoke test
     items.push(check_runtime_smoke(data_dir));
 
@@ -537,6 +540,89 @@ fn check_llm_config(data_dir: &Path) -> CheckItem {
             start.elapsed().as_millis() as u64,
         ),
     }
+}
+
+/// Warn if a vision provider is configured but its context window exceeds the
+/// 32K VRAM guard (6GB local GPU). llama-server must run with `-c ≤ 32768`.
+fn check_vision_config(data_dir: &Path) -> CheckItem {
+    let start = Instant::now();
+    let config_path = data_dir.join("config.toml");
+    let Ok(content) = std::fs::read_to_string(&config_path) else {
+        return item(
+            "Vision Provider",
+            CheckStatus::Pass,
+            "no config.toml — skip".into(),
+            start.elapsed().as_millis() as u64,
+        );
+    };
+    let Ok(table) = content.parse::<toml::Value>() else {
+        return item(
+            "Vision Provider",
+            CheckStatus::Pass,
+            "config.toml malformed — skip".into(),
+            start.elapsed().as_millis() as u64,
+        );
+    };
+
+    let has_vision = table
+        .get("routing")
+        .and_then(|r| r.get("visionModelId"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty())
+        || table
+            .get("llm")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .any(|e| e.get("id").and_then(|v| v.as_str()) == Some("vision"))
+            })
+            .unwrap_or(false);
+
+    if !has_vision {
+        return item(
+            "Vision Provider",
+            CheckStatus::Pass,
+            "no vision provider configured".into(),
+            start.elapsed().as_millis() as u64,
+        );
+    }
+
+    // Find the vision entry (by routing id, else id "vision") and check its window.
+    let routing_id = table
+        .get("routing")
+        .and_then(|r| r.get("visionModelId"))
+        .and_then(|v| v.as_str());
+    let entries = table
+        .get("llm")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let vision_entry = entries.iter().find(|e| {
+        let id = e.get("id").and_then(|v| v.as_str()).unwrap_or("primary");
+        Some(id) == routing_id || (routing_id.is_none() && id == "vision")
+    });
+
+    let ctx = vision_entry
+        .and_then(|e| e.get("context_window"))
+        .and_then(|v| v.as_integer());
+    let status = match ctx {
+        Some(w) if w > 32_768 => CheckStatus::Warn,
+        Some(w) if w > 0 => CheckStatus::Pass,
+        _ => CheckStatus::Warn, // unset window → warn, window unknown
+    };
+    let detail = match ctx {
+        Some(w) if w > 32_768 => format!(
+            "Vision provider context_window={w} exceeds 32K VRAM guard — llama-server must run with -c ≤ 32768"
+        ),
+        Some(w) => format!("Vision provider active, context_window={w} ≤ 32K ✓ (llama-server -c ≤ 32768)"),
+        _ => "Vision provider active — ensure llama-server runs with -c ≤ 32768 (VRAM guard); context_window unset".into(),
+    };
+    item(
+        "Vision Provider",
+        status,
+        detail,
+        start.elapsed().as_millis() as u64,
+    )
 }
 
 /// Smoke-test bundled runtimes by running `--version` on each.

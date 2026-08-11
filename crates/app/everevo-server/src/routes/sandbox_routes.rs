@@ -448,9 +448,7 @@ async fn interrupt_chat(
             "data": { "interrupted": true, "session_id": session_id.to_string() }
         })))
     } else {
-        Err(ApiError::not_found(
-            "No active agent run for this session",
-        ))
+        Err(ApiError::not_found("No active agent run for this session"))
     }
 }
 
@@ -460,10 +458,22 @@ mod tests {
 
     #[test]
     fn test_level_key_mapping() {
-        assert_eq!(level_key(everevo_sandbox::PermissionLevel::ReadOnly), "read_only");
-        assert_eq!(level_key(everevo_sandbox::PermissionLevel::FullyManual), "fully_manual");
-        assert_eq!(level_key(everevo_sandbox::PermissionLevel::SemiAuto), "semi_auto");
-        assert_eq!(level_key(everevo_sandbox::PermissionLevel::FullyAuto), "fully_auto");
+        assert_eq!(
+            level_key(everevo_sandbox::PermissionLevel::ReadOnly),
+            "read_only"
+        );
+        assert_eq!(
+            level_key(everevo_sandbox::PermissionLevel::FullyManual),
+            "fully_manual"
+        );
+        assert_eq!(
+            level_key(everevo_sandbox::PermissionLevel::SemiAuto),
+            "semi_auto"
+        );
+        assert_eq!(
+            level_key(everevo_sandbox::PermissionLevel::FullyAuto),
+            "fully_auto"
+        );
     }
 
     #[test]

@@ -97,10 +97,21 @@ pub async fn assemble(
     // instead of current_dir() which varies by launcher (Tauri → src-tauri/).
     let project_root = project_root_dir();
     let plugins_source_dir = project_root.join("plugins");
+    // Read the sandbox work_dir ONCE so:
+    // (a) read_file/write_file resolve relative paths against it
+    // (b) SandboxedShellTool uses it as cwd
+    // (c) DownloadTool is scoped to it
+    // Without this, relative paths resolve against the server's own cwd
+    // (src-tauri/ under Tauri), which breaks file tools.
+    let session_work_dir = {
+        let sandboxes = state.sandboxes.read().await;
+        sandboxes.get(&session_id).map(|sb| sb.work_dir().clone())
+    };
     everevo_kernel::bootstrap::register_all(
         &mut registry,
         Some(Arc::clone(&state.plugin_registry)),
-        Some(plugins_source_dir),
+        Some(plugins_source_dir.clone()),
+        session_work_dir.clone(),
     );
 
     // ── MCP Plugin auto-loading: spawn plugin binaries, register their tools ──
@@ -148,7 +159,17 @@ pub async fn assemble(
             .chain(hook_plugins.iter())
             .chain(stage_plugins.iter())
         {
-            let path = search_dirs.iter().map(|d| d.join(exe_name)).find(|p| p.exists());
+            // Benchmark mode (EVEREVO_BENCHMARK=1): skip the MCP write_file
+            // plugin — its relative paths resolve against the server CWD (repo
+            // root) with no checks, which could pollute the host. The bootstrap
+            // write_file (work_dir-relative + kernel-protected) is used instead.
+            if std::env::var("EVEREVO_BENCHMARK").is_ok() && *plugin_id == "write_file" {
+                continue;
+            }
+            let path = search_dirs
+                .iter()
+                .map(|d| d.join(exe_name))
+                .find(|p| p.exists());
             if let Some(path) = path {
                 match everevo_mcp::McpClient::connect_stdio(
                     &path.to_string_lossy(),
@@ -181,17 +202,21 @@ pub async fn assemble(
     }
 
     // ── Per-session tools ──
-    let session_work_dir = {
+    // Reuse the work_dir from the sandbox (already read above).
+    // Register sandbox-scoped shell and download tools.
+    if let Some(ref work_dir) = session_work_dir {
         let sandboxes = state.sandboxes.read().await;
         if let Some(sb) = sandboxes.get(&session_id) {
-            let work_dir = sb.work_dir().clone();
             let shell = Arc::new(SandboxedShellTool {
                 inner: sb.provider(),
                 work_dir: work_dir.clone(),
                 session_id,
                 confirmations: state.confirmations.clone(),
                 notif_tx: notif_tx.clone(),
-                auto_confirm: false,
+                // Under fully_auto (unattended containers) even admin commands
+                // (sudo/su/…) must fail fast instead of blocking on a human
+                // confirmation that never arrives — mirror the sub-agent branch.
+                auto_confirm: is_fully_auto,
             });
             registry.register(shell);
 
@@ -200,12 +225,8 @@ pub async fn assemble(
                 everevo_agent::tools::builtins::DownloadTool::new(state.downloader.clone());
             dl = dl.with_work_dir(work_dir.clone());
             registry.register(Arc::new(dl));
-
-            Some(work_dir)
-        } else {
-            None
         }
-    };
+    }
 
     // ── Global tools ──
     registry.register(Arc::new(
@@ -214,7 +235,9 @@ pub async fn assemble(
     registry.register(Arc::new(
         everevo_agent::tools::builtins::MemoryTool::new(state.fact_manager.clone())
             .with_db(state.db.clone())
-            .with_kg(state.knowledge_graph.clone()),
+            .with_kg(state.knowledge_graph.clone())
+            // 分层记忆: tag saved facts with this session so recall is isolated.
+            .with_session_id(Some(session_id)),
     ));
     registry.register(Arc::new(
         everevo_agent::tools::builtins::TodoWriteTool::new(state.todo_store.clone())
@@ -248,6 +271,30 @@ pub async fn assemble(
         everevo_agent::tools::builtins::CompactTool::new()
             .with_compact_focus(Arc::clone(&compact_focus))
             .with_dreaming_engine(state.dreaming_engine.clone()),
+    ));
+    // ── describe_image — dedicated vision model for image processing ──
+    // Primary: routing.visionModelId (a separate [[llm]] entry, e.g. qwen3-vl-2b).
+    // Fallback: deterministic offline scripts (chess_fen.py / fractions_ocr.py).
+    let vision_llm = state
+        .vision_llm
+        .read()
+        .await
+        .as_ref()
+        .map(|v| Arc::clone(&v.client) as Arc<dyn everevo_core::llm::LlmProvider>);
+    let tooltest_dir = {
+        let p = state.config.data_dir.join("bench").join("tooltest");
+        if p.is_dir() {
+            Some(p)
+        } else {
+            None
+        }
+    };
+    registry.register(Arc::new(
+        everevo_agent::tools::builtins::DescribeImageTool::new(vision_llm, tooltest_dir),
+    ));
+    // ── tool_cache_read — re-read paged tool outputs from disk (stateless) ──
+    registry.register(Arc::new(
+        everevo_agent::tools::builtins::ToolCacheReadTool::new(),
     ));
     // TeamTool needs LLM + tools wired in later via with_llm()/with_base_tools()
     // ── Team tool — wired with LLM + tools for real sub-agent dispatch ──
@@ -325,6 +372,8 @@ pub async fn assemble(
                             0.8,
                         ),
                         links: vec![],
+                        // Workflow recipes are cross-session reusable — global tier.
+                        session: Some("global".into()),
                     };
                     self.facts.save(&fact).map_err(|e| e.to_string())
                 }
@@ -396,21 +445,23 @@ pub async fn assemble(
     registry.register(Arc::new(everevo_agent::skill::PromoteSkillTool::new(
         state.config.data_dir.join("skills"),
     )));
-    let workspace = session_work_dir
-        .clone()
-        .unwrap_or_else(|| state.config.data_dir.clone());
-
     // Code tools: MCP plugin provides simpler versions; in-process fallback for
-    // background indexing and workspace-scoped paths.
+    // background indexing and full-scope paths.
+    // These tools are read-only (RiskLevel::Low) and MUST scan the whole project
+    // source tree — scope them to the project root, NOT the sandbox work dir
+    // (which defaults to an isolated `data/sandbox/{id}/work`). Otherwise
+    // code_map/code_search only see the empty sandbox and every project-path
+    // query fails with a read_dir error. (User requirement #3: 全域只读源码检索.)
+    let code_workspace = project_root.clone();
     if registry.get("code_search").is_none() {
         let code_search =
-            everevo_agent::tools::builtins::CodeSearchTool::new(workspace.clone());
+            everevo_agent::tools::builtins::CodeSearchTool::new(code_workspace.clone());
         code_search.start_background_index();
         registry.register(Arc::new(code_search));
     }
     if registry.get("code_map").is_none() {
         registry.register(Arc::new(everevo_agent::tools::builtins::CodeMapTool::new(
-            workspace.clone(),
+            code_workspace.clone(),
         )));
     }
     // list_dir, read_file, write_file are provided by:
@@ -664,7 +715,9 @@ pub async fn assemble(
     //
     // ── Review gate (PRE-ACT) — blocks unsafe/redundant tool calls ──
     registry.add_hook(Arc::new(
-        everevo_agent::tools::review_gate::ReviewGateHook::new(everevo_core::types::RiskLevel::High),
+        everevo_agent::tools::review_gate::ReviewGateHook::new(
+            everevo_core::types::RiskLevel::High,
+        ),
     ));
 
     // ── Audit hook — logs every tool call ──
@@ -708,9 +761,8 @@ pub async fn assemble(
 
     // ── Symbol registry: populate knowledge graph with tool entities ──
     // Idempotent — re-running doesn't duplicate entities.
-    let sr = everevo_knowledge::graph::SymbolRegistry::new(Some(Arc::clone(
-        &state.knowledge_graph,
-    )));
+    let sr =
+        everevo_knowledge::graph::SymbolRegistry::new(Some(Arc::clone(&state.knowledge_graph)));
     if let Err(e) = sr.register_tools(&tools) {
         tracing::warn!(error = %e, "Symbol registry: tool registration failed (non-fatal)");
     }

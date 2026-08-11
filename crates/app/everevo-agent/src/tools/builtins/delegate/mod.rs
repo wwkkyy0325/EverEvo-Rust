@@ -43,8 +43,8 @@ pub type SharedPending = Arc<std::sync::atomic::AtomicUsize>;
 mod spawn;
 mod types;
 
-pub use types::*;
 use spawn::*;
+pub use types::*;
 
 // ── TaskTool ──────────────────────────────────────────────────────────────
 
@@ -281,13 +281,12 @@ impl TaskTool {
 
         let handle = tokio::spawn(async move {
             let Some(llm_client) = llm else {
-                let err_msg = format!(
-                    "[SubAgent FAILED] {desc}\nNo LLM configured for sub-agent."
-                );
-                backlog
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push((subagent_id.to_string(), desc.to_string(), err_msg.clone()));
+                let err_msg = format!("[SubAgent FAILED] {desc}\nNo LLM configured for sub-agent.");
+                backlog.lock().unwrap_or_else(|e| e.into_inner()).push((
+                    subagent_id.to_string(),
+                    desc.to_string(),
+                    err_msg.clone(),
+                ));
                 if let Some(ref t) = tx {
                     let _ = t.send(err_msg);
                 }

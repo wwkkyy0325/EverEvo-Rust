@@ -102,7 +102,11 @@ impl HybridFusion {
 
     /// Reciprocal Rank Fusion: score = Σ 1/(k + rank_i)
     /// Each result gets a score from every retriever list where it appears.
-    fn fuse_rrf(&self, result_sets: &[Vec<SearchResult>], output_k: usize) -> Vec<SearchResult> {
+    pub fn fuse_rrf(
+        &self,
+        result_sets: &[Vec<SearchResult>],
+        output_k: usize,
+    ) -> Vec<SearchResult> {
         use std::collections::HashMap;
 
         // Map id → (best_result, accumulated_rrf_score)

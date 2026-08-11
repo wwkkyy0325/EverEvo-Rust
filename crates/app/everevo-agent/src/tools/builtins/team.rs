@@ -253,10 +253,7 @@ impl TeamTool {
     /// are injected into the main agent loop as `[SubAgent Result]` messages.
     /// Without this, team results only appear in the backlog and may be
     /// missed by the agent until the next auto-continue cycle.
-    pub fn with_result_tx(
-        mut self,
-        tx: tokio::sync::mpsc::UnboundedSender<String>,
-    ) -> Self {
+    pub fn with_result_tx(mut self, tx: tokio::sync::mpsc::UnboundedSender<String>) -> Self {
         self.result_tx = Some(tx);
         self
     }
@@ -370,9 +367,11 @@ impl TeamTool {
 
             // Push into shared backlog so auto-continue loop can read it
             if let Some(ref bl) = shared_backlog {
-                bl.lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push((subagent_id_str.clone(), desc_clone, result_text));
+                bl.lock().unwrap_or_else(|e| e.into_inner()).push((
+                    subagent_id_str.clone(),
+                    desc_clone,
+                    result_text,
+                ));
             }
             if let Some(ref sp) = shared_pending {
                 sp.fetch_sub(1, std::sync::atomic::Ordering::Release);
@@ -525,10 +524,7 @@ impl Tool for TeamTool {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         // Collect any results that arrived so far
-        let results = self
-            .results
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let results = self.results.lock().unwrap_or_else(|e| e.into_inner());
         let mut synthesis = format!(
             "## Team Dispatch: {task}\n\n**{count} members dispatched:**\n{members}\n\n---\n\n",
             count = dispatched.len(),

@@ -10,8 +10,9 @@
 //! - System proxy (IE settings): auto-detected via `native-tls`
 //! - Env var: `HTTPS_PROXY=http://your-proxy:port`
 
-use async_trait::async_trait;
+use std::sync::Arc;
 
+use async_trait::async_trait;
 use everevo_core::llm::{LlmMessage, LlmProvider, LlmResponse, StreamEvent, ToolSchema};
 use everevo_core::EverEvoError;
 
@@ -26,30 +27,11 @@ use everevo_core::EverEvoError;
 /// V2Ray: 10808) by attempting a TCP connect. Returns `None` only if
 /// no proxy is configured and no known proxy port responds.
 pub async fn detect_proxy() -> Option<String> {
-    // 1. Explicit override (EverEvo-specific)
-    if let Ok(val) = std::env::var("EVEREVO_HTTP_PROXY") {
-        let val = val.trim().to_string();
-        if !val.is_empty() {
-            tracing::info!(proxy = %val, "Using EVEREVO_HTTP_PROXY");
-            return Some(val);
-        }
-    }
-    // 2. Standard env vars
-    for var in &[
-        "HTTPS_PROXY",
-        "https_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-    ] {
-        if let Ok(val) = std::env::var(var) {
-            let val = val.trim().to_string();
-            if !val.is_empty() {
-                tracing::info!(proxy_var = var, proxy = %val, "Proxy detected from env");
-                return Some(val);
-            }
-        }
+    // 1+2. Explicit override then standard env vars — single egress in
+    // everevo-net. Fall through to port auto-detect when none is set.
+    if let Some(val) = everevo_net::env_proxy_url() {
+        tracing::info!(proxy = %val, "Using proxy from env");
+        return Some(val);
     }
     // 3. Auto-detect common local proxy ports (Clash / V2Ray / Shadowsocks)
     // These are the most common in mainland China; a TCP connect to the
@@ -72,30 +54,10 @@ pub async fn detect_proxy() -> Option<String> {
     None
 }
 
-/// Sync proxy detection from env vars only (no network I/O).
+/// Sync proxy detection from env vars only (no network I/O). Delegates to
+/// `everevo-net` — the project's single HTTP egress.
 pub fn detect_proxy_sync() -> Option<String> {
-    if let Ok(val) = std::env::var("EVEREVO_HTTP_PROXY") {
-        let val = val.trim().to_string();
-        if !val.is_empty() {
-            return Some(val);
-        }
-    }
-    for var in &[
-        "HTTPS_PROXY",
-        "https_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-    ] {
-        if let Ok(val) = std::env::var(var) {
-            let val = val.trim().to_string();
-            if !val.is_empty() {
-                return Some(val);
-            }
-        }
-    }
-    None
+    everevo_net::env_proxy_url()
 }
 
 /// Build a reqwest client with optional proxy.
@@ -132,6 +94,9 @@ pub struct HttpClient {
     base_url: String,
     model: String,
     client: reqwest::Client, // shared connection pool — created once, reused
+    /// Accumulated token usage across all API calls made by this client.
+    total_input_tokens: Arc<std::sync::atomic::AtomicU64>,
+    total_output_tokens: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl HttpClient {
@@ -154,13 +119,30 @@ impl HttpClient {
             base_url: base_url.into(),
             model: model.into(),
             client,
+            total_input_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            total_output_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Return accumulated token usage across all API calls.
+    pub fn token_usage(&self) -> (u64, u64) {
+        (
+            self.total_input_tokens
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.total_output_tokens
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// Classify HTTP error for better diagnostics.
     fn classify_http_error(status: reqwest::StatusCode, body: &str) -> String {
         let code = status.as_u16();
-        let detail = if body.chars().count() > 300 { let s: String = body.chars().take(300).collect(); s } else { body.to_string() };
+        let detail = if body.chars().count() > 300 {
+            let s: String = body.chars().take(300).collect();
+            s
+        } else {
+            body.to_string()
+        };
         let detail = detail.as_str();
         match code {
             401 | 403 => format!(
@@ -304,15 +286,38 @@ impl HttpClient {
 
         let mut body = serde_json::json!({
             "model": self.model,
-            "max_tokens": 4096,
+            "max_tokens": 16384,
+            "temperature": 0.0,
             "messages": msgs,
         });
+        // Bound extended-thinking latency: DeepSeek v4-flash otherwise emits up
+        // to max_tokens of thinking per request (60-100s round-trips → only ~3
+        // rounds fit in the GAIA 300s wall-clock). EVEREVO_THINKING_BUDGET=N
+        // caps thinking via budget_tokens (N>0); 0/unset = DeepSeek default.
+        if let Ok(budget) = std::env::var("EVEREVO_THINKING_BUDGET") {
+            if let Ok(n) = budget.trim().parse::<u32>() {
+                if n > 0 {
+                    body["thinking"] = serde_json::json!({"type": "enabled", "budget_tokens": n});
+                }
+            }
+        }
         if !tools.is_empty() {
             body["tools"] = serde_json::json!(tools
                 .iter()
-                .map(|t| serde_json::json!({
-                    "name": t.name, "description": t.description, "input_schema": t.parameters,
-                }))
+                .map(|t| {
+                    if let Some(native_type) = &t.native_type {
+                        // Server-side tool: no input_schema — the API executes it.
+                        serde_json::json!({
+                            "name": t.name,
+                            "type": native_type,
+                            "description": t.description,
+                        })
+                    } else {
+                        serde_json::json!({
+                            "name": t.name, "description": t.description, "input_schema": t.parameters,
+                        })
+                    }
+                })
                 .collect::<Vec<_>>());
         }
         if stream {
@@ -411,6 +416,25 @@ impl HttpClient {
 
 #[async_trait]
 impl LlmProvider for HttpClient {
+    /// DeepSeek's Anthropic-compatible endpoint natively executes web search
+    /// server-side (`server_tool_use` → `web_search_tool_result`) within the
+    /// turn — avoiding the plugin engine cascade (Sogou rate-limits, GFW,
+    /// cn.bing garbage for rare entities). Disable with `EVEREVO_NATIVE_WEB_SEARCH=0`.
+    fn native_web_search_tool(&self) -> Option<ToolSchema> {
+        if self.api_format == "anthropic"
+            && std::env::var("EVEREVO_NATIVE_WEB_SEARCH").as_deref() != Ok("0")
+        {
+            Some(ToolSchema {
+                name: "web_search".into(),
+                description: "Server-side web search executed by the API. Use FIRST for general factual questions, current events, Wikipedia facts, or anything needing up-to-date web knowledge; supports multi-step research within a single turn.".into(),
+                parameters: serde_json::json!({}),
+                native_type: Some("web_search_20250305".into()),
+            })
+        } else {
+            None
+        }
+    }
+
     async fn chat(
         &self,
         messages: &[LlmMessage],
@@ -618,54 +642,119 @@ impl HttpClient {
         let body = self.build_body(messages, tools, true);
 
         let client = self.client.clone();
+        let input_counter = Arc::clone(&self.total_input_tokens);
+        let output_counter = Arc::clone(&self.total_output_tokens);
         tokio::spawn(async move {
-            let mut req = client.post(&endpoint).json(&body);
-            if api_format == "anthropic" {
-                req = req
-                    .header("x-api-key", &api_key)
-                    .header("anthropic-version", "2023-06-01");
-            } else {
-                req = req.header("Authorization", format!("Bearer {}", api_key));
+            // Send with retries for transient failures (mirrors chat()). A
+            // transient 429/5xx/connect/timeout must not silently become the
+            // model's "answer" — retry before streaming. Non-retryable client
+            // errors (400/401/403) surface as StreamEvent::Error so the agent
+            // loop reports them as a real error (SSE `error` event) instead of
+            // scoring error text as the answer.
+            let mut resp = None;
+            for attempt in 0..=HttpClient::MAX_RETRIES {
+                if attempt > 0 {
+                    let delay_ms = HttpClient::BASE_BACKOFF_MS * (1u64 << (attempt - 1)); // 1s, 2s, 4s
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
+                let mut req = client.post(&endpoint).json(&body);
+                if api_format == "anthropic" {
+                    req = req
+                        .header("x-api-key", &api_key)
+                        .header("anthropic-version", "2023-06-01");
+                } else {
+                    req = req.header("Authorization", format!("Bearer {}", api_key));
+                }
+
+                tracing::debug!(%endpoint, msg_count = body["messages"].as_array().map(|a| a.len()).unwrap_or(0), tool_count = body.get("tools").and_then(|t| t.as_array()).map(|a| a.len()).unwrap_or(0), "LLM request");
+
+                let r = match req.send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let retryable = e.is_connect() || e.is_timeout();
+                        let msg = if e.is_connect() {
+                            format!("Connection failed — cannot reach {endpoint}. Check network, VPN, or base_url in config.")
+                        } else if e.is_timeout() {
+                            "Request timed out after 10 minutes — the model may be overloaded. Try a shorter prompt or different model.".to_string()
+                        } else {
+                            format!("HTTP error: {e}")
+                        };
+                        if retryable && attempt < HttpClient::MAX_RETRIES {
+                            tracing::warn!(attempt, %e, "LLM HTTP request failed — retrying");
+                            continue;
+                        }
+                        tracing::error!(%e, "LLM HTTP request failed");
+                        let _ = tx.send(StreamEvent::Error(msg)).await;
+                        let _ = tx
+                            .send(StreamEvent::Done {
+                                input_tokens: 0,
+                                output_tokens: 0,
+                                stop_reason: None,
+                            })
+                            .await;
+                        return;
+                    }
+                };
+                if !r.status().is_success() {
+                    let status = r.status();
+                    let body_text = r.text().await.unwrap_or_default();
+                    let classified = Self::classify_http_error(status, &body_text);
+                    if HttpClient::is_retryable(status) && attempt < HttpClient::MAX_RETRIES {
+                        tracing::warn!(attempt, %status, "LLM API transient error — retrying");
+                        continue;
+                    }
+                    tracing::error!(%status, %body_text, "LLM API error");
+                    let _ = tx.send(StreamEvent::Error(classified)).await;
+                    let _ = tx
+                        .send(StreamEvent::Done {
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            stop_reason: None,
+                        })
+                        .await;
+                    return;
+                }
+                resp = Some(r);
+                break;
             }
 
-            tracing::debug!(%endpoint, msg_count = body["messages"].as_array().map(|a| a.len()).unwrap_or(0), tool_count = body.get("tools").and_then(|t| t.as_array()).map(|a| a.len()).unwrap_or(0), "LLM request");
-
-            let resp = match req.send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    let msg = if e.is_connect() {
-                        format!("Connection failed — cannot reach {endpoint}. Check network, VPN, or base_url in config.")
-                    } else if e.is_timeout() {
-                        "Request timed out after 10 minutes — the model may be overloaded. Try a shorter prompt or different model.".to_string()
-                    } else {
-                        format!("HTTP error: {e}")
-                    };
-                    tracing::error!(%e, "LLM HTTP request failed");
-                    let _ = tx.send(StreamEvent::Text(msg)).await;
-                    let _ = tx.send(StreamEvent::Done).await;
+            let mut stream = match resp {
+                Some(r) => r.bytes_stream(),
+                None => {
+                    // Unreachable: the loop always returns or breaks with a response.
+                    let _ = tx
+                        .send(StreamEvent::Error(
+                            "LLM request failed after retries".into(),
+                        ))
+                        .await;
+                    let _ = tx
+                        .send(StreamEvent::Done {
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            stop_reason: None,
+                        })
+                        .await;
                     return;
                 }
             };
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let body_text = resp.text().await.unwrap_or_default();
-                let classified = Self::classify_http_error(status, &body_text);
-                tracing::error!(%status, %body_text, "LLM API error");
-                let _ = tx.send(StreamEvent::Text(classified)).await;
-                let _ = tx.send(StreamEvent::Done).await;
-                return;
-            }
-
-            let mut stream = resp.bytes_stream();
             let mut buf = String::new();
             let mut detected_format: Option<&str> = None;
             let mut active_tool_id: Option<String> = None;
+            let mut last_stop_reason: Option<String> = None;
+            let mut total_input_tokens: u32 = 0;
+            let mut total_output_tokens: u32 = 0;
             use futures::StreamExt;
             while let Some(chunk) = stream.next().await {
                 // Check cancellation periodically (every chunk)
                 if cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
                     tracing::info!("LLM stream cancelled by user");
-                    let _ = tx.send(StreamEvent::Done).await;
+                    let _ = tx
+                        .send(StreamEvent::Done {
+                            input_tokens: total_input_tokens,
+                            output_tokens: total_output_tokens,
+                            stop_reason: last_stop_reason.clone(),
+                        })
+                        .await;
                     return;
                 }
                 let chunk = match chunk {
@@ -681,7 +770,13 @@ impl HttpClient {
                     }
                     if let Some(data) = line.strip_prefix("data: ") {
                         if data == "[DONE]" {
-                            let _ = tx.send(StreamEvent::Done).await;
+                            let _ = tx
+                                .send(StreamEvent::Done {
+                                    input_tokens: total_input_tokens,
+                                    output_tokens: total_output_tokens,
+                                    stop_reason: last_stop_reason.clone(),
+                                })
+                                .await;
                             return;
                         }
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
@@ -704,6 +799,21 @@ impl HttpClient {
 
                             match detected_format {
                                 Some("anthropic") => match json["type"].as_str() {
+                                    Some("message_start") => {
+                                        if let Some(u) =
+                                            json["message"]["usage"]["input_tokens"].as_u64()
+                                        {
+                                            total_input_tokens = u as u32;
+                                        }
+                                    }
+                                    Some("message_delta") => {
+                                        if let Some(u) = json["usage"]["output_tokens"].as_u64() {
+                                            total_output_tokens = u as u32;
+                                        }
+                                        if let Some(sr) = json["delta"]["stop_reason"].as_str() {
+                                            last_stop_reason = Some(sr.to_string());
+                                        }
+                                    }
                                     Some("content_block_start") => {
                                         let cb = &json["content_block"];
                                         match cb["type"].as_str() {
@@ -722,6 +832,28 @@ impl HttpClient {
                                                         name: name.into(),
                                                     })
                                                     .await;
+                                            }
+                                            Some("server_tool_use") => {
+                                                // Server-side tool (e.g. native web search):
+                                                // the provider executes it within this turn —
+                                                // do NOT dispatch it as a client tool.
+                                                let name = cb["name"].as_str().unwrap_or("");
+                                                active_tool_id = None;
+                                                tracing::info!(
+                                                    server_tool = name,
+                                                    "LLM server-side tool call (provider-executed, not dispatched)"
+                                                );
+                                                let _ = tx
+                                                    .send(StreamEvent::ServerToolUse {
+                                                        name: name.into(),
+                                                    })
+                                                    .await;
+                                            }
+                                            Some("web_search_tool_result") => {
+                                                active_tool_id = None;
+                                                tracing::info!(
+                                                    "LLM server-side web search result received"
+                                                );
                                             }
                                             _ => {
                                                 active_tool_id = None;
@@ -763,8 +895,26 @@ impl HttpClient {
                                         active_tool_id = None;
                                     }
                                     Some("message_stop") => {
-                                        tracing::info!("LLM stream ended (message_stop)");
-                                        let _ = tx.send(StreamEvent::Done).await;
+                                        tracing::info!(
+                                            input_tokens = total_input_tokens,
+                                            output_tokens = total_output_tokens,
+                                            "LLM stream ended (message_stop)"
+                                        );
+                                        input_counter.fetch_add(
+                                            total_input_tokens as u64,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                        output_counter.fetch_add(
+                                            total_output_tokens as u64,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                        let _ = tx
+                                            .send(StreamEvent::Done {
+                                                input_tokens: total_input_tokens,
+                                                output_tokens: total_output_tokens,
+                                                stop_reason: last_stop_reason.clone(),
+                                            })
+                                            .await;
                                         return;
                                     }
                                     _ => {}
@@ -803,14 +953,26 @@ impl HttpClient {
                                     }
                                     if choice["finish_reason"].as_str() == Some("stop") {
                                         tracing::info!("LLM stream ended (finish_reason=stop)");
-                                        let _ = tx.send(StreamEvent::Done).await;
+                                        let _ = tx
+                                            .send(StreamEvent::Done {
+                                                input_tokens: total_input_tokens,
+                                                output_tokens: total_output_tokens,
+                                                stop_reason: last_stop_reason.clone(),
+                                            })
+                                            .await;
                                         return;
                                     }
                                     if choice["finish_reason"].as_str() == Some("tool_calls") {
                                         tracing::info!(
                                             "LLM stream ended (finish_reason=tool_calls)"
                                         );
-                                        let _ = tx.send(StreamEvent::Done).await;
+                                        let _ = tx
+                                            .send(StreamEvent::Done {
+                                                input_tokens: total_input_tokens,
+                                                output_tokens: total_output_tokens,
+                                                stop_reason: last_stop_reason.clone(),
+                                            })
+                                            .await;
                                         return;
                                     }
                                 }
@@ -821,7 +983,13 @@ impl HttpClient {
                 }
             }
             tracing::info!("LLM stream ended (connection closed)");
-            let _ = tx.send(StreamEvent::Done).await;
+            let _ = tx
+                .send(StreamEvent::Done {
+                    input_tokens: total_input_tokens,
+                    output_tokens: total_output_tokens,
+                    stop_reason: last_stop_reason.clone(),
+                })
+                .await;
         });
 
         Ok(rx)

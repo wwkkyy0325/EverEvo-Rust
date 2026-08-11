@@ -89,7 +89,9 @@ async fn reindex_collection(
         .get("collection")
         .and_then(|v| v.as_str())
         .unwrap_or("memory");
-    let rag = state.rag_pipeline.as_ref()
+    let rag = state
+        .rag_pipeline
+        .as_ref()
         .ok_or_else(|| ApiError::bad_request("RAG pipeline not initialized"))?;
 
     let start = std::time::Instant::now();
