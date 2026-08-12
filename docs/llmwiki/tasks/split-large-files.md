@@ -1,9 +1,11 @@
 # Task: Semantic Split of Large Source Files
 
-> **Status: RECORDED / DEFERRED.** Execute only after (a) the GAIA benchmark
-> questions are resolved and (b) a full benchmark re-run confirms no problems
-> (approaching launch readiness). Do NOT split now — splitting mid-benchmark
-> risks regressions and invalidates the current baseline.
+> **Status: IN PROGRESS (2026-08-12).** The gate has opened: GAIA benchmark
+> resolved — full 53 re-run (run-4) completed **45/53 (84.9%) official exact**,
+> up from the 27/53 baseline, no problems confirmed → approaching launch
+> readiness. Per the standing autonomy grant, semantic splitting is now being
+> executed. Splitting is **semantic/logical, never forced** (模块内聚边界).
+> One verification after each split + a final full verification once.
 
 User directive (2026-08-11): after the current failing-question subset run,
 **record** a plan to semantically split source files over 800 lines. After the
@@ -53,12 +55,22 @@ module is being refactored)
 
 ## Execution checklist (to be done at launch-readiness)
 
-- [ ] Re-inventory files >900 lines (may have shifted).
-- [ ] For each file, write a per-file split plan: proposed submodule layout,
+- [x] Re-inventory files >900 lines (may have shifted).
+- [x] For each file, write a per-file split plan: proposed submodule layout,
       public API surface, what moves where, and the verify check.
-- [ ] Split one file at a time, smallest first (skill.rs → engine.rs → … →
+- [x] Split one file at a time, smallest first (skill.rs → engine.rs → … →
       loop_/mod.rs). Verify after each.
-- [ ] Full verification once after all splits: fmt, clippy -D warnings,
-      workspace tests, frontend tsc + vite build, harness `--self-test`.
-- [ ] Update `docs/llmwiki/design.md` + `changelog.md` + `api-registry.md` if
-      any public item moved.
+      **DONE 2026-08-12 — all 9 splits landed** (lib.rs, engine.rs, graph.rs,
+      http.rs, pipeline.rs, app_state.rs, context.rs, loop_/mod.rs,
+      web_search main.rs). `handler.rs` judged not-worthwhile (thin transport
+      wrapper) and left intact. See changelog entry for the per-file map.
+- [x] Full verification once after all splits: fmt 0 diffs, clippy
+      `-D warnings` green, workspace tests **764 passed / 0 failed**, plugins
+      32 passed, frontend tsc + vite build OK. (Harness `--self-test` not run
+      this cycle — the GAIA harness is quarantined; benchmark state untouched.)
+- [x] Update `docs/llmwiki/design.md` + `changelog.md` + `api-registry.md` if
+      any public item moved. (Public paths preserved via re-exports; docs
+      updated 2026-08-12.)
+
+**Status: COMPLETE (2026-08-12).** All splits verified green; the task is
+finished.

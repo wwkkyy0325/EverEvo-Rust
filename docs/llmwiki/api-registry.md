@@ -4,6 +4,15 @@
 
 ---
 
+> **2026-08-12 — file-split note:** the 9-file semantic split moved several public items into
+> sibling submodules, but every public path below remains valid via root `pub use` re-exports
+> (e.g. `everevo_agent::llm::http::detect_proxy`, `everevo_core::context::{ContextPipeline,
+> estimate_tokens, shell_specific_guide}`, `everevo_bootstrap::pipeline::{InitEvent, InitError,
+> InitPipeline}`, `crate::app_state::{ResolvedProvider, ...}`). No interface signature, kind,
+> stability, or endpoint changed in the split.
+
+---
+
 ## everevo-core (Traits & Types)
 
 | Interface | Kind | Stability | Last Changed | ADR |

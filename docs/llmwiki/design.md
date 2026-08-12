@@ -2,7 +2,12 @@
 
 ## Current State (2026-08)
 
-**14 crates, 493 tests**, 22+ tools running on a content-block SSE streaming architecture. Desktop AI agent with sandboxed tool execution, MCP server + A2A protocol integration, long-term memory (facts + diary + knowledge graph), sub-agent orchestration with git worktree isolation, pluggable context pipeline with LLM autocompact, and embedded ONNX embeddings with HNSW vector store.
+**14 crates + 2 binaries, 796 tests (764 root workspace + 32 plugins)**, 22+ tools running on a content-block SSE streaming architecture. Desktop AI agent with sandboxed tool execution, MCP server + A2A protocol integration, long-term memory (facts + diary + knowledge graph), sub-agent orchestration with git worktree isolation, pluggable context pipeline with LLM autocompact, and embedded ONNX embeddings with HNSW vector store.
+
+> **File organization (2026-08-12):** the 9 largest source files were split along semantic
+> module-cohesion boundaries (never by line count) into sibling submodules; public paths are
+> preserved via root `pub use` re-exports, so external call sites are unchanged. See the per-file
+> map in `docs/llmwiki/changelog.md` (2026-08-12 split entry).
 
 ## Architecture
 

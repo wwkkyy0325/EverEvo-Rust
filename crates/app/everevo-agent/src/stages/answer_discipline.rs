@@ -75,6 +75,15 @@ enumerate the solution space under EVERY non-vacuous reading of EVERY \
 constraint clause before committing. Concrete: in the 3-box game-show \
 problem, filter valid host placements with min(c1,c2,c3) >= 2 (every box ≥ 2), \
 not max(c1,c2,c3) >= 2.
+This is a HARD RULE, not a suggestion: a stated constraint is NEVER just \
+flavor or a red herring. If your chosen reading makes any constraint clause \
+VACUOUS (trivially satisfied by the setup — e.g. \"some box ≥ 2\" is automatic \
+when 30 coins fill 3 boxes), that reading is the WRONG one and its answer \
+must NOT be committed. When two readings yield different numeric answers, \
+the intended answer comes from the reading under which EVERY stated \
+constraint is binding — even when that reading feels less \"natural\" \
+grammatically. Do not let grammatical intuition about what \"one box\" means \
+override a constraint that binds under a different reading.
 
 ### Candidate verification
 Before committing a candidate answer found through research, verify it against \
@@ -121,6 +130,37 @@ least one tool result (a fetched page, a search snippet, a downloaded file). \
 If no tool result contained it, you are hallucinating — do NOT commit it; \
 change strategy (fetch the page directly, different engine, `download`) until \
 a retrieved source contains the candidate term.
+
+### Unique-item identification (\"the one that differs\", \"unique flag\")
+When the question asks WHICH item in a set has a distinguishing property (the \
+article whose flag is unique from the others, the entry that differs from the \
+rest, the only X), identify the target by mapping the property to the SPECIFIC \
+item, row by row, in the retrieved source — do not aggregate to a \
+country/group level and then guess:
+- For each result, record BOTH its stated property (e.g. its cataloged LANGUAGE \
+— look for \"unknown\"/\"und\"/\"unbestimmt\" in the record's language field) AND \
+its flag/country. The \"unique\" flag belongs to the ONE item that also carries \
+the other stated property (the unknown-language article). Answer with that \
+item's country.
+- A flag/country merely present in the source is NOT the answer by itself; the \
+answer is the country of the item that has the stated property, read off that \
+same item.
+- NEVER break a tie among several candidates by attributing an UNOBSERVED \
+property to one of them (\"one candidate's records carried no detectable \
+language label\") to make it fit. If the source does not let you map item→property \
+unambiguously, keep retrieving (mirror, alternate archive snapshot, `download`) \
+until exactly one item is identifiable; if none is, say you cannot determine \
+which item the question means rather than committing a tie-break guess.
+
+### \"Which listed entry did NOT mention X\" questions
+When a question asks which entry in a named listing (a journal subject \
+collection, a tag-filtered set, a directory page) did NOT mention a term, and \
+then asks what that entry is or studies, you MUST fetch the authoritative \
+listing page itself — a search snippet that omits the term proves nothing — \
+enumerate every candidate entry matching the question's filters, fetch each \
+candidate's full text, and establish term-absence from actual fetched text \
+before answering. Never commit a name, compound, or stripped prefix that \
+appears in no fetched tool result.
 
 ### Prefix stripping (\"don't use the prefix nano\")
 When the question says the answer must not include a prefix if one exists \

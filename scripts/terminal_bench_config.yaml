@@ -1,0 +1,44 @@
+# Harbor job configuration for EverEvo Agent on Terminal-Bench 2.0
+# Usage: harbor run --config scripts/terminal_bench_config.yaml
+
+# Job identity
+job_name: everevo-terminal-bench
+description: "EverEvo Agent evaluated on Terminal-Bench 2.0 (89 terminal tasks)"
+
+# Agent configuration
+agent:
+  import_path: scripts.everevo_harbor_agent:EverEvoAgent
+  model_name: glm-5.2
+  kwargs:
+    port: 13456
+    startup_timeout: 60
+    agent_timeout: 300
+    # binary_path: "target/x86_64-unknown-linux-gnu/release/everevo-server"
+    # config_path: "data/config.toml"
+
+# Dataset
+dataset:
+  name: terminal-bench
+  version: "2.0"
+
+# Environment
+environment:
+  type: docker
+  force_build: false
+  delete_after: true
+
+# Execution
+execution:
+  n_concurrent: 2        # 2 containers at a time (conservative for API rate limits)
+  n_attempts: 1           # single attempt per task (no retry to keep scores honest)
+  timeout_multiplier: 2.0  # double default timeouts (EverEvo agent loop is slower)
+  max_retries: 0           # no retries — temperature=0 means same result
+  quiet: false
+
+# Scoring
+verifier:
+  disable: false  # Use Harbor's built-in verifier (binary pass/fail)
+
+# Output
+output:
+  jobs_dir: data/bench/terminal-bench-results
