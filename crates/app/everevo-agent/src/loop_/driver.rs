@@ -22,7 +22,7 @@ use super::AgentEvent;
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(crate) async fn run_loop(
-    llm: &crate::llm::HttpClient,
+    llm: &dyn LlmProvider,
     tools: &ToolRegistry,
     tool_schemas: &[ToolSchema],
     messages: &mut Vec<LlmMessage>,
@@ -111,7 +111,7 @@ pub(crate) async fn run_loop(
                 let mut guard = f.lock().unwrap_or_else(|e| e.into_inner());
                 guard.take()
             });
-            let compact_model = compact_llm.unwrap_or(llm as &dyn LlmProvider);
+            let compact_model = compact_llm.unwrap_or(llm);
             if trim::autocompact(messages, max_context_chars, compact_model, focus.as_deref()).await
                 == 0
             {
@@ -295,6 +295,50 @@ pub(crate) async fn run_loop(
                 let _ = tx.send(AgentEvent::WaitingForSubAgents { pending }).await;
                 return Ok(());
             }
+
+            // The model produced reasoning (thinking) but NO text and NO tool
+            // call — it never committed an answer. Committing an empty
+            // final_text turns the whole turn into an empty prediction, which
+            // the GAIA harness scores as a FAIL (Q3/Q37/Q46 in run-4 died
+            // exactly here: brute-force enumeration in thinking burned the
+            // budget without ever emitting a value). Instead, push the
+            // reasoning back and run ONE no-tool convergence call so a value
+            // actually gets committed — an over-confident guess beats a silent
+            // empty answer, and the model's own reasoning is preserved as the
+            // seed. No sub-agent yield, no early return with empty text.
+            if current_text.is_empty() && !current_thinking.is_empty() {
+                tracing::warn!(
+                    turn,
+                    thinking_chars = current_thinking.len(),
+                    "LLM produced reasoning but no answer — forcing terminal convergence"
+                );
+                messages.push(LlmMessage {
+                    role: LlmRole::Assistant,
+                    content: String::new(),
+                    thinking: Some(current_thinking.clone()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    images: Vec::new(),
+                });
+                messages.push(LlmMessage::user(forced_final_prompt()));
+                let final_text = match llm.chat(messages, &[]).await {
+                    Ok(resp) => resp.content.unwrap_or_default(),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Forced convergence call failed");
+                        String::new()
+                    }
+                };
+                let summary = build_retrospective(
+                    turn as i32,
+                    total_tool_calls,
+                    total_tool_success,
+                    &failure_messages,
+                );
+                let _ = tx.send(AgentEvent::Retrospective { summary }).await;
+                let _ = tx.send(AgentEvent::Done { final_text }).await;
+                return Ok(());
+            }
+
             // No pending sub-agents → truly done.
             let final_text = current_text.clone();
             let summary = build_retrospective(
@@ -669,15 +713,18 @@ pub(crate) async fn run_loop(
             match convergence_stage(turn, max_turns, wall_frac) {
                 Convergence::Commit => {
                     messages.push(LlmMessage::user(
-                        "⏰ Deadline: STOP exploring. Your very next response MUST end with a \
-                         single `Final answer:` line containing ONLY the value — best-effort \
-                         beats no answer.",
+                        "⏰ Deadline: STOP exploring. Do NOT start new research, do NOT write \
+                         plans or code. Your very next response MUST end with a single \
+                         `Final answer:` line containing ONLY the value — best-effort beats \
+                         no answer, and an uncertain value extracted from what you already \
+                         found beats narration.",
                     ));
                 }
                 Convergence::Converge => {
                     messages.push(LlmMessage::user(
-                        "⏰ Time check: start converging. Commit to a root cause, stop new \
-                         exploration, and prepare a single `Final answer:` line.",
+                        "⏰ Time check: start converging. Commit to the answer you believe \
+                         best from what you already gathered, stop new exploration, and \
+                         prepare a single `Final answer:` line.",
                     ));
                 }
                 Convergence::None => {}

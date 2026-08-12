@@ -18,6 +18,7 @@ export interface RoutingConfig {
   mainEffort: EffortLevel;      // orchestrator thinking depth
   visionModelId: string;        // image description provider (describe_image) — '' = off
   compactModelId: string;       // context compaction/rolling-summary provider — '' = main model
+  metaAgentEnabled: boolean;    // meta-agent self-diagnosis — product ON, benchmark OFF
   tiers: [TierConfig, TierConfig, TierConfig]; // sub-agent execution cascade
 }
 
@@ -28,6 +29,7 @@ const DEFAULT: RoutingConfig = {
   mainEffort: 'auto',
   visionModelId: '',
   compactModelId: '',
+  metaAgentEnabled: true,
   tiers: [
     { modelId: '', effort: 'auto' },
     { modelId: '', effort: 'high' },
@@ -67,6 +69,7 @@ export function useRoutingConfig() {
             mainEffort: data.mainEffort || 'auto',
             visionModelId: data.visionModelId || '',
             compactModelId: data.compactModelId || '',
+            metaAgentEnabled: data.metaAgentEnabled !== false,
             tiers: tiers as [TierConfig, TierConfig, TierConfig],
           };
           setConfig(remote);
@@ -102,5 +105,9 @@ export function useRoutingConfig() {
     setConfig(prev => { const next = { ...prev, compactModelId: modelId }; persist(next); return next; });
   }, []);
 
-  return { config, synced, setMainModel, setMainEffort, setTier, setVisionModel, setCompactModel };
+  const setMetaAgentEnabled = useCallback((enabled: boolean) => {
+    setConfig(prev => { const next = { ...prev, metaAgentEnabled: enabled }; persist(next); return next; });
+  }, []);
+
+  return { config, synced, setMainModel, setMainEffort, setTier, setVisionModel, setCompactModel, setMetaAgentEnabled };
 }

@@ -314,7 +314,7 @@ impl AgentLoop {
             };
 
             match AssertUnwindSafe(run_loop(
-                &llm,
+                llm.as_ref(),
                 &tools,
                 &tool_schemas,
                 &mut messages,
@@ -741,6 +741,93 @@ mod tests {
         let p = forced_final_prompt();
         assert!(p.contains("Final answer: <value>"));
         assert!(p.contains("Do NOT call any tools"));
+    }
+
+    // ── Thinking-only turn must not commit an empty answer ────────────────
+    // Regression test for the GAIA run-4 empty-prediction failures (Q3/Q37/Q46):
+    // when the model streams reasoning but no text and no tool call, the loop
+    // used to commit `final_text=""`, which the harness scores as a FAIL. It
+    // must instead push the reasoning back and run one no-tool convergence call
+    // so a value actually gets committed.
+
+    #[tokio::test]
+    async fn test_thinking_only_forces_terminal_convergence() {
+        use crate::llm::MockLlmProvider;
+
+        // First stream: reasoning only, no text, no tool call.
+        let mock = MockLlmProvider::new()
+            .with_stream(vec![
+                StreamEvent::Thinking("Let me enumerate the box placements...".into()),
+                StreamEvent::Done {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    stop_reason: Some("end_turn".into()),
+                },
+            ])
+            // Second call = the forced convergence chat() — commit a value.
+            .with_text("Final answer: 16000");
+
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        let tool_schemas: Vec<ToolSchema> = reg
+            .as_tool_schemas()
+            .into_iter()
+            .map(|s| ToolSchema {
+                name: s["function"]["name"].as_str().unwrap_or("").into(),
+                description: s["function"]["description"].as_str().unwrap_or("").into(),
+                parameters: s["function"]["parameters"].clone(),
+                native_type: None,
+            })
+            .collect();
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
+        let pending = std::sync::atomic::AtomicUsize::new(0);
+        let mut messages = vec![LlmMessage::user("solve it")];
+
+        run_loop(
+            &mock,
+            &reg,
+            &tool_schemas,
+            &mut messages,
+            3,
+            None,
+            4000,
+            80000,
+            None,
+            None,
+            None,
+            None,
+            &pending,
+            &tx,
+            None,
+            &None,
+            &None,
+            &None,
+            &None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("run_loop should not error");
+
+        // Drop the sender so the receiver below sees channel close (run_loop
+        // only borrows tx; without this, recv() would wait forever).
+        drop(tx);
+
+        let mut final_text = String::new();
+        while let Some(ev) = rx.recv().await {
+            if let AgentEvent::Done { final_text: ft } = ev {
+                final_text = ft;
+            }
+        }
+        assert!(
+            !final_text.is_empty(),
+            "thinking-only turn must not commit an empty final answer"
+        );
+        assert_eq!(final_text, "Final answer: 16000");
+
+        // The convergence call must have happened: 2 LLM calls (1 stream + 1 chat).
+        assert_eq!(mock.call_count(), 2);
     }
 
     #[test]

@@ -1,4 +1,8 @@
 # GAIA L1 Pass-Rate Fix Plan — 27/53 → 38–41/53 (detailed, researched)
+> **状态**:🔄 进行中 — GAIA L1 提升(按用户指示挂起,重跑需确认)
+
+---
+
 
 **Status:** PLANNED (awaiting user go/no-go) · **Date:** 2026-08-11
 **Baseline:** official type-aware quasi-exact **27/53 = 50.9%** (canonical regrade
@@ -398,19 +402,19 @@ reaches 55–70% on L1.
 ## 7.5 Vision + context management landed (2026-08-11 — COMPLETE, no benchmark re-run)
 
 User request: integrate local **qwen3-vl-2b (llama.cpp)** as a dedicated vision model (existing
-deterministic tools → fallback) and close [agent-context-management-spec.md](docs/agent-context-management-spec.md)
+deterministic tools → fallback) and close [agent-context-management-spec.md](../../../docs/agent-context-management-spec.md)
 gaps. All 10 approved plan phases implemented; verification below. No benchmark re-run.
 
 | Area | What | Where |
 |------|------|-------|
-| Vision | `describe_image` tool (path + question → base64 to vision `[[llm]]` via `visionModelId`; offline scripts as fallback) | [describe_image.rs](crates/app/everevo-agent/src/tools/builtins/describe_image.rs) |
-| Vision cfg | `context_window: Option<u32>`, `RoutingSettings.vision_model_id/compact_model_id`, `AppState.vision_llm/compact_llm` | [config.rs](crates/app/everevo-server/src/routes/config.rs) · [app_state.rs](crates/app/everevo-server/src/app_state.rs) |
-| Vision ops | llama-server 2-file launch + smoke script; startup check warning | [serve_vision_qwen.md](scripts/serve_vision_qwen.md) · [vision_smoke.py](scripts/vision_smoke.py) |
-| Context L1 | background rolling summary (soft 70%, non-blocking, DB-persisted, rule-1, budget chunking, extractive fallback) | [rolling_summary.rs](crates/app/everevo-agent/src/context/rolling_summary.rs) · [background.rs](crates/app/everevo-agent/src/context/background.rs) |
-| Context L2/L3 | `autocompact` folds existing summary; trim unchanged; `RollingSummaryStage` p75 | [trim.rs](crates/app/everevo-agent/src/loop_/trim.rs) · [context.rs](crates/kernel/everevo-core/src/context.rs) |
-| Persistence | `sessions.context_summary` + `summary_watermark` (migration 007) | [007_context_summary.sql](migrations/007_context_summary.sql) |
-| Deliverable 6 | >30K-char tool outputs → disk + 2KB preview; `tool_cache_read`; sandbox `data/sessions/**` write allowlist | [tool_cache_read.rs](crates/app/everevo-agent/src/tools/builtins/tool_cache_read.rs) · [rules.rs](crates/infra/everevo-sandbox/src/permission/rules.rs) |
-| Deliverable 8 | acceptance: 40-request watermark bounded + recallable; 30K backlog chunks at 8K window | [background.rs](crates/app/everevo-agent/src/context/background.rs) tests |
+| Vision | `describe_image` tool (path + question → base64 to vision `[[llm]]` via `visionModelId`; offline scripts as fallback) | [describe_image.rs](../../../crates/app/everevo-agent/src/tools/builtins/describe_image.rs) |
+| Vision cfg | `context_window: Option<u32>`, `RoutingSettings.vision_model_id/compact_model_id`, `AppState.vision_llm/compact_llm` | [config.rs](../../../crates/app/everevo-server/src/routes/config.rs) · [app_state.rs](../../../crates/app/everevo-server/src/app_state.rs) |
+| Vision ops | llama-server 2-file launch + smoke script; startup check warning | [serve_vision_qwen.md](../../ops/serve_vision_qwen.md) · [vision_smoke.py](../../../scripts/vision_smoke.py) |
+| Context L1 | background rolling summary (soft 70%, non-blocking, DB-persisted, rule-1, budget chunking, extractive fallback) | [rolling_summary.rs](../../../crates/app/everevo-agent/src/context/rolling_summary.rs) · [background.rs](../../../crates/app/everevo-agent/src/context/background.rs) |
+| Context L2/L3 | `autocompact` folds existing summary; trim unchanged; `RollingSummaryStage` p75 | [trim.rs](../../../crates/app/everevo-agent/src/loop_/trim.rs) · [context.rs](../../../crates/kernel/everevo-core/src/context.rs) |
+| Persistence | `sessions.context_summary` + `summary_watermark` (migration 007) | [007_context_summary.sql](../../../migrations/007_context_summary.sql) |
+| Deliverable 6 | >30K-char tool outputs → disk + 2KB preview; `tool_cache_read`; sandbox `data/sessions/**` write allowlist | [tool_cache_read.rs](../../../crates/app/everevo-agent/src/tools/builtins/tool_cache_read.rs) · [rules.rs](../../../crates/infra/everevo-sandbox/src/permission/rules.rs) |
+| Deliverable 8 | acceptance: 40-request watermark bounded + recallable; 30K backlog chunks at 8K window | [background.rs](../../../crates/app/everevo-agent/src/context/background.rs) tests |
 
 **Verification:** `cargo test -p everevo-agent --lib` **242 passed / 0 failed** (incl. 5 `describe_image`,
 9 rolling-summary/background, 5 paging, 4 `tool_cache_read`, 2 acceptance); `cargo test -p everevo-sandbox` 10 ✓;

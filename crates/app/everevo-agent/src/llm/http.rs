@@ -213,6 +213,18 @@ impl LlmProvider for HttpClient {
             ))
         }))
     }
+
+    /// Streaming transport override: HttpClient streams over SSE directly.
+    /// Delegates to the inherent `stream_chat` (kept so `run_subagent`, which
+    /// holds a concrete `Arc<HttpClient>`, resolves the same implementation).
+    async fn stream_chat(
+        &self,
+        messages: &[LlmMessage],
+        tools: &[ToolSchema],
+        cancel: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>, EverEvoError> {
+        HttpClient::stream_chat(self, messages, tools, cancel).await
+    }
 }
 
 impl HttpClient {

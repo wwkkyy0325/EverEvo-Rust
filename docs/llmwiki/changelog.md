@@ -4,6 +4,109 @@ All notable changes to EverEvo-Rust. Append-only, newest first.
 
 ---
 
+## 2026-08-12 — 仓库卫生清理:删除编译产物/缓存/测试残留,文档归位,docs/ 建顶层索引,.gitignore 补全
+
+穷尽盘点(多 agent 交叉引用 + 人工复核)后清理与代码无关的杂物。**未触碰 crates/、frontend/、migrations/、src-tauri/ 的进行中代码(视觉/上下文管理 WIP)。**
+
+**删除(tracked,`git rm`)**:`scripts/gaia-docker/everevo-server`(25.5MB Linux ELF 编译产物,可用 `scripts/build_linux_binary.sh` 重新生成)、`escape.txt`(根目录 7 字节 "random" 残留)、`frontend/tsconfig.tsbuildinfo`(TS 增量编译缓存)、`src-tauri/session/baidu-logo-test.png` + `baidu_homepage.html`(误提交的下载测试残留);另删 `scripts/__pycache__/`。
+
+**文档归位(scripts/ → docs/)**:`AGENT_BENCHMARK.md / BENCHMARK_DESIGN.md / BENCHMARK_PLAN.md` → `docs/benchmarks/`;`serve_vision_qwen.md` → `docs/ops/`。BENCHMARK_PLAN.md 内 2 个明文 API key 已脱敏。交叉引用更新:changelog 2 处、gaia-improve-passrate.md 1 处(并顺手修好其原本就坏的 `scripts/vision_smoke.py` 相对链接)、vision_smoke.py 1 处。
+
+**docs/ 顶层**:新建 `docs/README.md` 作为 docs/ 唯一顶层索引(llmwiki / benchmarks / ops / 根级 spec 的导航表 + 归档约定)。
+
+**.gitignore**:新增 `scripts/gaia-docker/everevo-server`、`*.tsbuildinfo`、`.venv/`、`.pytest_cache/`、`.mypy_cache/`、`.ruff_cache/`、`src-tauri/session/`;修正 5 个 `dir/*` → `dir/`(`__pycache__`、`sample-project`、`target-linux`、`data-pre-gaia`),`*.pyc` → `*.py[cod]`。
+
+**密钥卫生**:`run_gaia_l1.sh` 硬编码的 HF_TOKEN 改为从调用方环境读取(`: "${HF_TOKEN:?...}"`,未设置则立即报错退出);BENCHMARK_PLAN.md 内 2 个明文 API key 已脱敏。注意:三者在 git 历史 `17ddf06` 提交中仍存在——若为活跃密钥建议轮换。
+
+## 2026-08-12 — llmwiki 旧文档归档清理:归档 10 份过时文档 + 18 份已完成任务,统一状态横幅
+
+按用户决策「归档+状态横幅 / 已完成任务移入 tasks/archive/ / 统一头+状态横幅」对历史文档做结构性清理,解决旧文档逻辑不清、混在活动文档中的问题。正文语言未改动。
+
+**归档**(带 `⛔ 已过时 / ⚠️ 部分实现` 横幅,指向取代者):
+- `docs/llmwiki/archive/design/`:`agent-orchestration / code-search / config-telemetry / domain-knowledge-base / memory-architecture / persona-system` 6 份历史设计愿景 → 分别被 05/14/08+13/10/04/03 取代。
+- `docs/llmwiki/archive/`:`sandbox-complete-plan`(5 层愿景,实际 4 层)、`permission-agent-architecture`(部分实现)、`maintenance-strategy`、`testing-strategy`(并入 CLAUDE.md)。
+- `docs/llmwiki/tasks/archive/`:18 份已完成任务文档移入(含 architecture-docs-complete、subsystem-docs-09-14、split-large-files 等);保留 2 份活动任务(gaia-improve-passrate、terminal-bench-2.0)。
+
+**保留 + 状态横幅**:
+- `design.md`(✅ 仍有效):修正过期数字——工具数 22 →「49 个注册调用」、上下文管线 7 → 14 stages、Tool System 段落改为指向 06 的委托行、删除 8-phase 过期描述。
+- `architecture-audit.md` / `audit-2026-07-18.md`(📋 历史快照)、`playwright-mcp.md`(✅)、`thinking-architecture.md`(🚧 部分实现)。
+
+**交叉引用修复**:tasks/archive 内 5 处指向已移动文档的链接改到新路径;archive/design 横幅路径补一层(`../../architecture/`);ADR-0004 的 design/config-telemetry.md 引用改到 archive/design/。
+
+**导航更新**:index.md 文档地图加 archive/ + tasks/archive/ 目录、状态图例表、散落文档分类清单;冲突处理说明改指 archive/design/。
+
+## 2026-08-12 — llmwiki 子系统阶段收官:09-14 六份完整子系统文档,覆盖率 79 → 128/275
+
+按用户决策「只做 6 个完整子系统」补齐剩余 L0-L1 深潜文档;每条结论带真实 `file:line` 锚点,全部通过链接校验。
+
+**新增文档**(`docs/llmwiki/architecture/`,均含 L0 全景 sequenceDiagram + L1/L2 表 + L3 代码 + References):
+- `09-plugin-system.md`:微内核插件系统——**命名如实说明**:提交记录里「wasm 插件系统」是叙事名,实际是 Rust MCP 子进程 binary;版本化编译、VersionStore 文件系统版本、canary 灰度/回滚、60s 自动巡检、protection 自我保护三层。
+- `10-domain-docs.md`:Domain 领域文档——摄取两条路径、质心向量分类四规则、语义切块、keyword/vector/hybrid(RRF k=60)检索;**顺序如实**:代码实际 parser→chunker→classifier,与 mod.rs 注释不符,以代码为准。
+- `11-download-engine.md`:下载引擎——多镜像打分 failover、`.resume.json` 断点续传、Simple/Chunked 双策略、observer/broadcast 事件。
+- `12-webagent-internals.md`:WebAgent 深层——HTTP 快路径 vs CDP 浏览器重路径、stealth/指纹反爬、验证码检测/解决、限流/断路器/URL 净化三道防护。
+- `13-telemetry.md`:遥测系统——span 追踪/检索指标/回合遥测,fire-and-forget mpsc → 专用写线程逐条落库。
+- `14-code-search.md`:Code Search——SQLite FTS5 trigram 子串索引、正则符号扫描、mtime 水位增量、rg→grep→Select-String 三线兜底。
+
+**现状如实标注**(不美化):
+- 11:sha256 checksum 字段与 `verify_checksums=true` **声明但未接入** worker;`ResolvingMirror`/`MirrorSelected` 事件**从未发送**。
+- 12:`VisionCaptchaSolver`(OCR)有实现但 **server.rs 接线的是 `SimpleCaptchaSolver`**;rate_limiter 只做入口全局检查。
+- 13:写线程**逐条同步 INSERT、无攒批**(明确列为优化位)。
+- 14:`reindex_changed` 只插新/删已删,**已索引的修改文件不重扫**。
+
+**双向连接维护**:
+- `annotate_srcmap.py` COVERED 新增 49 条(09×13 / 10×10 / 11×9 / 12×7 / 13×6 / 14×4),`src-map.md` 总标注 79 → 128。
+- 手动交叉引用 4 条既有标注:`domain_stage.rs → 03 / 10`、`server.rs`/`fingerprint.rs`/`circuit.rs → 07 / 12`。
+- 修复 12 的两处 href 错误(缺 `browser/` `captcha/` `search/` `protect/` 子目录前缀)与 14 的 `code_search/builtins.rs`(实际在 `tools/builtins/code_search.rs`),anchor 全部重新逐行核对。
+
+**验证**:`check_coverage.py --links` 0 问题 ✓;覆盖率 128/275 (46.5%,基线 21/275 翻 6 倍);全量覆盖率检查退出码 0(275 个 .rs 全部登记,147 个骨架文件如实留「已登记未文档化」)。
+
+## 2026-08-12 — llmwiki 架构抽取补齐:01 §2-9 + 04~08 全绿,覆盖率 21 → 79/275
+
+按风格契约补齐剩余全部架构文档;每条结论都带真实 `file:line` 锚点,全部通过链接校验。
+
+**新增文档**(`docs/llmwiki/architecture/`):
+- `01-entry-pipelines.md` §2-9:补齐 8 条入口回环(子代理/重连/post-turn/dreaming/MCP 桥/A2A 网关/bootstrap 引导/workflow),与既有 §1 合并后 9 条入口全覆盖。
+- `04-memory.md`:事实 triple-write、DreamingScheduler 四阶段、KG、consolidator、召回路径。
+- `05-orchestration.md`:SessionCoordinator 数据流枢纽、ContentBlockStreamer AgentEvent→SSE、auto-continue、persist_and_send。
+- `06-tool-system.md`:工具注册 7 层装配、check_permission 权限分层次序、TieredSandbox 路径防御。
+- `07-bootstrap.md`:InitPipeline 6 阶段首启供给、MCP 客户端、A2A 网关、WebAgent、Workflow 引擎。
+- `08-config-and-state.md`:AppConfig→AppState 双层配置、resolve_special_providers 多 Provider 路由、环境开关。
+
+**双向连接维护**(`docs/llmwiki/scripts/`):
+- `annotate_srcmap.py` COVERED 扩到 ~66 条,`src-map.md` 新增 58 条「→ 章节」标注(总登记 275)。
+- 手动修正 2 条陈旧标注:`post_turn.rs → 01 §4`、`reconnect.rs → 01 §3`。
+
+**修复**:`07-bootstrap.md` 的 `extract/structured.rs:254-255` 行号越界(原抄自 server.rs grep 结果)——实为该文件 80 行,改正为 `[extract/structured.rs:7-31]`;`04-memory.md`/`05-orchestration.md` 2 处裸 `file.rs:NN` 补成 markdown 链接。
+
+**发现**:`linkify_refs.py` 对已含链接的文档**非幂等**(会把 `[x](y)` 再包一层成 `[[x](y)](y)`);约定 linkify 只用于「裸引用→链接」,已链接文档一律不跑,index.md 维护循环注记已更新。
+
+**验证**:`check_coverage.py --links` 0 问题 ✓;覆盖 79/275 (28.7%,基线 21/275 翻近 4 倍)。
+
+## 2026-08-12 — llmwiki 架构抽取:风格契约定稿 + 双向连接 + 覆盖检查工具链
+
+按用户逐条评审反馈定型了架构文档的风格契约,并搭好「文档↔源码」双向连接与覆盖性检查。
+
+**风格契约**(用户逐点批准):
+- 4 层抽象模型(L0 全景 / L1 中观 / L2 微观 / L3 最细),自浅入深。
+- 只用 mermaid 渲染图,`sequenceDiagram` 为样板;一图一义、≤12 节点、细节放图下表格。
+- 双轨引用 = 工程 `file:line` 可点击链接 + 学术 [n] 论文引用(GAIA/ReAct/RAG/HNSW 等 14 篇)。
+
+**文档现状**(`docs/llmwiki/architecture/`):
+- `00-overview.md`:总览 + 阅读协议 + crate 地图 + 13 条架构决策(带代码锚点与学术引用)。
+- `01-entry-pipelines.md` §1:主对话回环(sequenceDiagram + L1/L2/L3 分级表 + 开关表 + 失败回退表)。
+- 入口清单 9 条,§2-9(子代理/重连/post-turn/dreaming/MCP 桥/A2A/bootstrap/workflow)标「⬜ 待抽」。
+
+**双向连接 + 工具链**(`docs/llmwiki/scripts/`):
+- `gen_srcmap.py` 从真实文件树生成 `src-map.md`(275 个 .rs ↔ 文档章节登记表,幂等)。
+- `annotate_srcmap.py` 打「已文档化 → 章节」标注(21 条)。
+- `linkify_refs.py` 把 `file.rs:start-end` 转 VSCode 可点击相对链接。
+- `check_coverage.py` 覆盖性检查 + 链接校验(文件存在、行号越界)。
+- 源码→文档:core/agent/server 三个 `lib.rs` 头注释已加 llmwiki 回链。
+
+**修复**:`01-entry-pipelines.md` §1.4 `compactModelId` 锚点越界(原指 `app_state.rs:582-598`,该文件仅 445 行)——实为 `app_state/providers.rs:144-164` 的 `resolve_special_providers` 解析,已改正并通过链接校验。
+
+**验证**:`cargo check -p everevo-core -p everevo-agent -p everevo-server` 通过;链接校验 0 问题;覆盖基线 21/275 (7.6%),待 02-08 补齐后上升。
+
 ## 2026-08-12 — >900-line file semantic split chain COMPLETE (9 files, 0 behavior change)
 
 After run-4 (45/53) opened the launch-readiness gate, split the 9 oversized source files along
@@ -228,7 +331,7 @@ re-run pending explicit user confirmation (binding constraint).
 
 Scope confirmed by user (this session): integrate the local vision model as a **dedicated vision provider** with the existing deterministic tools (chess_fen.py / fractions_ocr.py) demoted to **fallback**, and close the context-management gaps in [agent-context-management-spec.md](docs/agent-context-management-spec.md). Plan approved in 10 phases; all landed. **No benchmark re-run** — binding constraint, requires explicit user confirmation.
 
-**Vision — `describe_image` tool.** New Rust tool `describe_image` ([describe_image.rs](crates/app/everevo-agent/src/tools/builtins/describe_image.rs)): `path` (required) + `question` (optional) → reads the image (≤6MB guard), sends an OpenAI multimodal message (base64 `image_url`) to the dedicated vision `[[llm]]` entry selected via `[routing] visionModelId` (e.g. qwen3-vl-2b served by llama.cpp with `--mmproj`). On no-vision-model / model-error / empty response it returns an informative pointer to the offline scripts `chess_fen.py` / `fractions_ocr.py` (fallback). `LlmProviderConfig` gained `context_window: Option<u32>`; `RoutingSettings` gained `vision_model_id` / `compact_model_id` (all serde-default, non-breaking); `AppState` resolves them into `vision_llm` / `compact_llm` on config reload. Unified config UI: `SettingsView` gains vision/compact model dropdowns + `context_window` input, with a "context ≤ 32K (llama-server -c 32768), 防显存溢出" note on the vision selector. `scripts/serve_vision_qwen.md` documents the two-file llama-server launch (`-m <llm.gguf> --mmproj <mmproj.gguf> -c 32768 --port 8080`); `scripts/vision_smoke.py` (venv python) smoke-tests the endpoint against the q17/q22 genuine GAIA images. GAIA harness `capability_hint()` now lists `describe_image` as the PRIMARY image path with scripts as fallback.
+**Vision — `describe_image` tool.** New Rust tool `describe_image` ([describe_image.rs](crates/app/everevo-agent/src/tools/builtins/describe_image.rs)): `path` (required) + `question` (optional) → reads the image (≤6MB guard), sends an OpenAI multimodal message (base64 `image_url`) to the dedicated vision `[[llm]]` entry selected via `[routing] visionModelId` (e.g. qwen3-vl-2b served by llama.cpp with `--mmproj`). On no-vision-model / model-error / empty response it returns an informative pointer to the offline scripts `chess_fen.py` / `fractions_ocr.py` (fallback). `LlmProviderConfig` gained `context_window: Option<u32>`; `RoutingSettings` gained `vision_model_id` / `compact_model_id` (all serde-default, non-breaking); `AppState` resolves them into `vision_llm` / `compact_llm` on config reload. Unified config UI: `SettingsView` gains vision/compact model dropdowns + `context_window` input, with a "context ≤ 32K (llama-server -c 32768), 防显存溢出" note on the vision selector. `docs/ops/serve_vision_qwen.md` documents the two-file llama-server launch (`-m <llm.gguf> --mmproj <mmproj.gguf> -c 32768 --port 8080`); `scripts/vision_smoke.py` (venv python) smoke-tests the endpoint against the q17/q22 genuine GAIA images. GAIA harness `capability_hint()` now lists `describe_image` as the PRIMARY image path with scripts as fallback.
 
 **Context management — three-layer, budget-aware, durable (spec §四).** Layer-1 per-turn **background rolling summary** ([context/rolling_summary.rs](crates/app/everevo-agent/src/context/rolling_summary.rs) + [context/background.rs](crates/app/everevo-agent/src/context/background.rs)): at turn boundaries past the 70% soft threshold, a non-blocking `tokio::spawn` task (guarded by an `in_flight` AtomicBool) summarizes only messages newer than a persisted watermark, merges verbatim onto the existing summary (rule 1 — never re-summarizes old summaries), and writes back to `sessions.context_summary` / `sessions.summary_watermark` (migration 007). Budget-aware chunking (D1): per-provider `context_window` sets the chunk budget (`window − 1536` tokens, min 512); when the model is unavailable or the window too small it falls back to a deterministic `[extractive]` head+tail+high-value-lines summary. Layer-2 one-shot `autocompact` retained as the hard-threshold fallback and enhanced to **fold** an existing `<conversation_summary>` (old summary verbatim prefix + post-watermark messages only). Layer-3 `trim_context` unchanged. `RollingSummaryStage` (priority 75) injects the durable summary before history. Compaction/rollup routing reuses the configured compact model, else the main model (decision 1); memory extraction/MetaAgent reuse the existing pipeline.
 
@@ -713,7 +816,7 @@ blocking 300s on a human confirmation that never arrives in an unattended contai
 - BFCL was incorrectly framed as an agent benchmark — it tests raw function calling, not the agent framework
 
 **Files created:**
-- `scripts/AGENT_BENCHMARK.md` — v3: definitive agent benchmark plan with 5 authoritative benchmarks
+- `docs/benchmarks/AGENT_BENCHMARK.md` — v3: definitive agent benchmark plan with 5 authoritative benchmarks
 - `docs/llmwiki/tasks/terminal-bench-2.0.md` — detailed step-by-step implementation plan
 - `scripts/everevo_harbor_agent.py` — Harbor BaseInstalledAgent adapter for EverEvo
 - `scripts/terminal_bench_config.yaml` — Harbor job config for Terminal-Bench 2.0

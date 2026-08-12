@@ -438,7 +438,7 @@ const CASCADE_LABELS = [
 ];
 
 function RoutingConfig() {
-  const { config, setMainModel, setMainEffort, setTier, setVisionModel, setCompactModel } = useRoutingConfig();
+  const { config, setMainModel, setMainEffort, setTier, setVisionModel, setCompactModel, setMetaAgentEnabled } = useRoutingConfig();
   const [providers, setProviders] = useState<Provider[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -578,6 +578,28 @@ function RoutingConfig() {
                 <option key={p.id} value={p.id}>{p.model || '(未命名)'}</option>
               ))}
             </select>
+          </div>
+        </div>
+
+        {/* Meta-agent toggle */}
+        <div>
+          <p className="text-xs text-muted-foreground font-medium mb-2">Meta-Agent 自诊断</p>
+          <p className="text-xs text-muted-foreground mb-2">
+            每 5 回合后台自我诊断卡点并注入建议。产品模式建议开启;基准测试
+            (EVEREVO_BENCHMARK) 默认关闭,可用 <code>EVEREVO_META_AGENT=1</code> 强制开启。
+          </p>
+          <div className="bg-secondary/50 border border-border rounded-xl p-3 flex gap-2 items-center">
+            <span className="text-xs text-foreground shrink-0 w-12">开关</span>
+            <button
+              onClick={() => setMetaAgentEnabled(!config.metaAgentEnabled)}
+              className={`flex-1 text-xs rounded-lg px-3 py-1.5 transition-colors border ${
+                config.metaAgentEnabled
+                  ? 'bg-primary/15 border-primary/40 text-primary'
+                  : 'bg-secondary border-border text-muted-foreground'
+              }`}
+            >
+              {config.metaAgentEnabled ? '已开启（每 5 回合自诊断）' : '已关闭'}
+            </button>
           </div>
         </div>
 

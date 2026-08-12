@@ -28,7 +28,7 @@ fn default_id() -> String {
     "primary".into()
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RoutingSettings {
     #[serde(default)]
     #[serde(rename = "mainModelId")]
@@ -48,6 +48,28 @@ pub struct RoutingSettings {
     pub compact_model_id: Option<String>,
     #[serde(default)]
     pub tiers: Vec<CascadeTier>,
+    /// Meta-agent self-diagnosis toggle. Product default ON; benchmark mode
+    /// (EVEREVO_BENCHMARK) defaults OFF unless `EVEREVO_META_AGENT=1` is set.
+    #[serde(default = "default_meta_agent_enabled")]
+    #[serde(rename = "metaAgentEnabled")]
+    pub meta_agent_enabled: bool,
+}
+
+fn default_meta_agent_enabled() -> bool {
+    true
+}
+
+impl Default for RoutingSettings {
+    fn default() -> Self {
+        Self {
+            main_model_id: None,
+            main_effort: None,
+            vision_model_id: None,
+            compact_model_id: None,
+            tiers: Vec::new(),
+            meta_agent_enabled: true,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -230,6 +252,7 @@ async fn get_routing(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
         "mainEffort": routing.main_effort.unwrap_or_else(|| "auto".to_string()),
         "visionModelId": routing.vision_model_id.unwrap_or_default(),
         "compactModelId": routing.compact_model_id.unwrap_or_default(),
+        "metaAgentEnabled": routing.meta_agent_enabled,
         "tiers": tiers,
     }))
 }
@@ -275,6 +298,18 @@ async fn put_routing(
         .get("compactModelId")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    // Preserve the current value when the incoming body omits it (old clients),
+    // so saving routing config never silently re-enables/disables meta-agent.
+    let meta_agent_enabled = body
+        .get("metaAgentEnabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or_else(|| {
+            settings
+                .routing
+                .as_ref()
+                .map(|r| r.meta_agent_enabled)
+                .unwrap_or(true)
+        });
 
     settings.routing = Some(RoutingSettings {
         tiers,
@@ -282,10 +317,12 @@ async fn put_routing(
         main_effort,
         vision_model_id,
         compact_model_id,
+        meta_agent_enabled,
     });
     match save_settings(&state, &settings).await {
         Ok(_) => {
             state.resolve_special_providers().await;
+            *state.meta_agent_enabled.write().await = meta_agent_enabled;
             Ok(Json(serde_json::json!({ "ok": true })))
         }
         Err(e) => Err(ApiError::internal(e)),
@@ -304,20 +341,26 @@ mod tests {
             vision_model_id: Some("vision".into()),
             compact_model_id: Some("compact".into()),
             tiers: vec![],
+            meta_agent_enabled: false,
         };
         let json = serde_json::to_string(&settings).unwrap();
         let parsed: RoutingSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.vision_model_id.as_deref(), Some("vision"));
         assert_eq!(parsed.compact_model_id.as_deref(), Some("compact"));
         assert_eq!(parsed.main_model_id.as_deref(), Some("deepseek"));
+        assert!(!parsed.meta_agent_enabled);
         // Exact JSON keys (camelCase) that the frontend PUT/GET round-trips.
         assert!(json.contains("\"visionModelId\":\"vision\""));
         assert!(json.contains("\"compactModelId\":\"compact\""));
+        assert!(json.contains("\"metaAgentEnabled\":false"));
 
-        // Absent fields default to None (non-breaking for old clients).
+        // Absent fields default to None / true (non-breaking for old clients).
         let parsed: RoutingSettings = serde_json::from_str("{\"mainModelId\":\"x\"}").unwrap();
         assert_eq!(parsed.vision_model_id, None);
         assert_eq!(parsed.compact_model_id, None);
+        assert!(parsed.meta_agent_enabled);
+        // Manual Default keeps product default ON.
+        assert!(RoutingSettings::default().meta_agent_enabled);
     }
 
     #[test]

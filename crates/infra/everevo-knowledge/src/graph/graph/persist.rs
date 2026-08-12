@@ -8,8 +8,8 @@ use oxigraph::sparql::QueryResults;
 
 use everevo_core::EverEvoError;
 
-use super::KnowledgeGraph;
 use super::super::types::{Entity, EntityType};
+use super::KnowledgeGraph;
 
 // ── Namespace ───────────────────────────────────────────────────────────────
 

@@ -39,8 +39,17 @@ pub(crate) fn budget_line(turns_left: Option<usize>, wall_left_secs: Option<u64>
 }
 
 /// Prompt for the forced terminal commit (benchmark mode).
+///
+/// Must force a VALUE, not narration: the run-4 Q3/Q46 failures committed
+/// planning text ("Python is available... build the simulation") here because
+/// the old prompt allowed the model to keep planning instead of extracting.
+/// The rewrite forbids new plans/tools/code and demands extraction from the
+/// reasoning already in the conversation, making an uncertain value acceptable.
 pub(crate) fn forced_final_prompt() -> &'static str {
-    "⏰ Turn budget exhausted. Do NOT call any tools. Based on everything you \
-     have already gathered, output exactly one line: Final answer: <value>. \
-     Nothing else."
+    "⏰ Turn budget exhausted. Do NOT call any tools, do NOT start new research, \
+     do NOT write plans, code, or explanations. Read back the reasoning you have \
+     ALREADY produced above — it contains either a computed answer or a strong \
+     partial result. Extract the single best value from it and output exactly \
+     one line: Final answer: <value>. An uncertain value beats an empty answer. \
+     Nothing else — no prose before or after the line."
 }

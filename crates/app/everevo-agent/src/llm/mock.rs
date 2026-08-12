@@ -50,6 +50,14 @@ impl MockLlmProvider {
         self
     }
 
+    /// Queue a full streaming response as a sequence of `StreamEvent`s. When
+    /// `chat_stream` is called it consumes one such sequence before falling
+    /// back to `chat`.
+    pub fn with_stream(self, events: Vec<StreamEvent>) -> Self {
+        self.stream_events.try_lock().unwrap().push(events);
+        self
+    }
+
     pub fn call_log(&self) -> Vec<Vec<LlmMessage>> {
         self.call_log.try_lock().unwrap().clone()
     }

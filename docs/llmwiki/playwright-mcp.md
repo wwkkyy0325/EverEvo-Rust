@@ -1,4 +1,8 @@
 # Playwright MCP — Browser Automation + Vision
+> **状态**:✅ 仍有效 — Playwright MCP 配置手册(opt-in;config_center.rs 注释示例仍如此接线)
+
+---
+
 
 EverEvo 通过 MCP 基础设施接入微软官方 [Playwright MCP](https://playwright.dev/mcp/introduction)，
 让 agent 获得真实浏览器能力：导航、点击、填表、执行 JS、accessibility snapshot、**截图识图**。

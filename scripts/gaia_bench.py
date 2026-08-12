@@ -263,6 +263,12 @@ def start_server():
     time.sleep(1)
 
     env = os.environ.copy()
+    # HF credentials are for the ORCHESTRATOR's dataset download ONLY — the
+    # sandbox shell inherits the server's env verbatim (no env_clear in the
+    # provider), so a leaked token would let the agent pull the GAIA answer key
+    # itself. Scrub them from the server env (anti-contamination constraint).
+    for _k in ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HF_ENDPOINT"):
+        env.pop(_k, None)
     env["EVEREVO_DATA_DIR"] = str(WS_ROOT / "data")
     # Unattended benchmark: no human to approve shell commands. Under the
     # default semi_auto, dangerous-pattern / external-path commands (the `at `

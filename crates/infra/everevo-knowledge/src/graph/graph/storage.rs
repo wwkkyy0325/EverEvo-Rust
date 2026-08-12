@@ -1,8 +1,8 @@
 // ── In-memory primary storage (HashMap entities + Vec relations) ────────────
 
-use super::KnowledgeGraph;
 use super::super::resolver::{EntityResolver, ResolveStats};
 use super::super::types::{Entity, EntityType, Relation, RelationStatus};
+use super::KnowledgeGraph;
 
 impl KnowledgeGraph {
     // ── Entity CRUD (HashMap primary) ─────────────────────────────────

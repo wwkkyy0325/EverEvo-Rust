@@ -12,6 +12,14 @@
 //! | `knowledge` | Knowledge layer (graph, domain, RAG, wiki) |
 //! | `sandbox` | Thin sandbox re-exports from everevo-sandbox |
 //! | `subagent_context` | Sub-agent context assembly |
+//!
+//! ## Architecture docs (llmwiki)
+//!
+//! - [00-overview.md](../../../../docs/llmwiki/architecture/00-overview.md) — §5 决策 13 (agent loop)
+//! - [01-entry-pipelines.md](../../../../docs/llmwiki/architecture/01-entry-pipelines.md) — §1 D/E 阶段、§2 子代理、§5 dreaming
+//! - [02-agent-loop.md](../../../../docs/llmwiki/architecture/02-agent-loop.md) — ReAct 回合、收敛、压缩三层
+//! - [03-context-pipeline.md](../../../../docs/llmwiki/architecture/03-context-pipeline.md) — 14-stage 上下文管线
+//! - [04-memory.md](../../../../docs/llmwiki/architecture/04-memory.md) — 事实、做梦、consolidator、召回
 
 pub mod code_search;
 pub mod context;

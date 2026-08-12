@@ -78,6 +78,10 @@ pub struct AppState {
     /// Compaction provider — used for rolling-summary / autocompact. None →
     /// the main execution model is reused ("有哪个用哪个").
     pub compact_llm: RwLock<Option<ResolvedProvider>>,
+    /// Meta-agent self-diagnosis toggle — routing config `metaAgentEnabled`
+    /// (product default ON). `EVEREVO_META_AGENT` env wins; benchmark mode
+    /// defaults OFF. See [`meta_agent_effective`].
+    pub meta_agent_enabled: RwLock<bool>,
     pub bootstrap: Arc<Bootstrap>,
     pub downloader: Arc<Downloader>,
     /// Shared todo store — TodoWrite tool reads/writes per-session task lists.
@@ -348,12 +352,22 @@ impl AppState {
                 }
             };
 
+        // Meta-agent toggle from routing config (default ON; benchmark/env handled
+        // at request time in `meta_agent_effective`).
+        let meta_agent_enabled = std::fs::read_to_string(config.data_dir.join("config.toml"))
+            .ok()
+            .and_then(|s| toml::from_str::<crate::routes::config::AppSettings>(&s).ok())
+            .and_then(|s| s.routing)
+            .map(|r| r.meta_agent_enabled)
+            .unwrap_or(true);
+
         let state = Arc::new(Self {
             config,
             db,
             llm: RwLock::new(llm),
             vision_llm: RwLock::new(None),
             compact_llm: RwLock::new(None),
+            meta_agent_enabled: RwLock::new(meta_agent_enabled),
             bootstrap,
             downloader,
             init_pipeline,
@@ -398,6 +412,22 @@ impl AppState {
         state.resolve_special_providers().await;
         Ok(state)
     }
+}
+
+/// Effective meta-agent switch for a request. Precedence:
+/// 1. `EVEREVO_META_AGENT=0/1` env — explicit override, wins always.
+/// 2. Benchmark mode (EVEREVO_BENCHMARK=1) — defaults OFF (unproven overhead,
+///    extra tokens, and injected `[META-AGENT HINT]` interference under
+///    convergence pressure).
+/// 3. Routing config `metaAgentEnabled` — product default ON.
+pub async fn meta_agent_effective(state: &AppState) -> bool {
+    if let Ok(v) = std::env::var("EVEREVO_META_AGENT") {
+        return v != "0";
+    }
+    if std::env::var("EVEREVO_BENCHMARK").is_ok() {
+        return false;
+    }
+    *state.meta_agent_enabled.read().await
 }
 
 /// Load persisted workspace from data/config/workspace.json (Claude Code alignment).

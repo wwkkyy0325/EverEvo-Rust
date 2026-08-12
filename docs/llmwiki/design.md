@@ -1,8 +1,14 @@
 # EverEvo-Rust Design Document
+> **状态**:✅ 仍有效(现状速览单页)— 数字已更新对齐 architecture/ 01-14
+
+---
+
 
 ## Current State (2026-08)
 
-**14 crates + 2 binaries, 796 tests (764 root workspace + 32 plugins)**, 22+ tools running on a content-block SSE streaming architecture. Desktop AI agent with sandboxed tool execution, MCP server + A2A protocol integration, long-term memory (facts + diary + knowledge graph), sub-agent orchestration with git worktree isolation, pluggable context pipeline with LLM autocompact, and embedded ONNX embeddings with HNSW vector store.
+**14 crates + 2 binaries, 796 tests (764 root workspace + 32 plugins)**, tool registry with **49 个注册调用** running on a content-block SSE streaming architecture. Desktop AI agent with sandboxed tool execution, MCP server + A2A protocol integration, long-term memory (facts + diary + knowledge graph), sub-agent orchestration with git worktree isolation, pluggable context pipeline (**14 个 stage**) with LLM autocompact, and embedded ONNX embeddings with HNSW vector store.
+
+> **精确数字与每一层的现状说明以 [architecture/00-overview.md](architecture/00-overview.md) 01-14 为准**:stage 数见 03,工具注册见 06,记忆见 04,遥测见 13。本文是单页速览。
 
 > **File organization (2026-08-12):** the 9 largest source files were split along semantic
 > module-cohesion boundaries (never by line count) into sibling submodules; public paths are
@@ -15,8 +21,8 @@
 Frontend (React/Vite/Zustand)  ← HTTP/SSE →  Backend (Rust/Axum)
                                                  │
   Chat UI + TodoPanel          Content-block     Agent Loop (run / run_subagent)
-  SubAgentPanel + MemoryPanel  SSE (start/       Tool Registry (22 builtins + MCP)
-  SettingsView + CharacterConfig delta/stop/     Context Pipeline (7 stages)
+  SubAgentPanel + MemoryPanel  SSE (start/       Tool Registry (49 注册,见 06)
+  SettingsView + CharacterConfig delta/stop/     Context Pipeline (14 stages,见 03)
   BootstrapView                tool_result)      ContentBlockStreamer
                                                  Orchestration (session/tools/response)
                                                  SQLite + HNSW + Oxigraph
@@ -26,7 +32,7 @@ Frontend (React/Vite/Zustand)  ← HTTP/SSE →  Backend (Rust/Axum)
 
 ```
 everevo-core         Shared types, traits, errors, config, context pipeline, telemetry
-everevo-agent        Agent loop, 22 tools + MCP adapter, LLM client, memory, stages, skills
+everevo-agent        Agent loop, 内置工具集 + MCP adapter, LLM client, memory, stages, skills
 everevo-server       Axum HTTP, SSE chat, 14 route modules, orchestration layer
 everevo-db           SQLite via SQLx, migrations, foreign_keys enabled
 everevo-sandbox      Tiered sandbox (4 permission levels), process isolation
@@ -68,31 +74,14 @@ Stream helpers (orchestration/stream.rs):
   thinking_start/delta, text_start/delta, tool_start, stop_event, message_start
 ```
 
-## Context Pipeline (7 stages)
+## Context Pipeline (14 stages)
 
-```
-stages/
-├── system_prompt.rs     Priority 0 — static instructions + tool descriptions
-├── agent_character.rs   Priority 0 — the AGENT's own voice/style
-├── persona.rs           Priority 1 — user communication style + thinking paradigm
-├── best_practices.rs    Priority 2 — verification, planning, code quality rules
-├── skill.rs             Priority 2 — matched skill instructions (selective injection)
-├── memory.rs            Priority 3 — RRF-ranked memory facts + context
-└── domain_stage.rs      Priority 4 — domain knowledge chunks
-```
-
-Plus two built-in stages in `everevo-core`:
-- `TaskStateStage` (Priority 0) — LLM-facing state overview
-- `SessionMetadataStage` (Priority 0) — runtime environment info
+`ContextStage` trait + priority 排序的 stage 队列;核心管线在 `everevo-core/src/context`,阶段实现在 `everevo-agent/src/stages`。完整 stage 清单、优先级与注入内容见 [03-context-pipeline.md](architecture/03-context-pipeline.md)。
 
 ## Tool System
 
 ```
-Built-in tools (22): shell, download, bootstrap, memory, TodoWrite,
-                     EnterPlanMode, ExitPlanMode, Skill, Verify, Task,
-                     CancelTask, Workflow (parallel_agents), web_fetch,
-                     web_search, compact, team, code_search, code_map,
-                     list_dir, read_file, write_file, cluster, workflow_run
+工具 = 「可实现的 Tool trait + 可组合的注册表 + 全量审计的沙箱壳」;完整工具清单、hooks、注册顺序与四级权限见 [06-tool-system.md](architecture/06-tool-system.md)。
 
 Hook system: ToolHook trait (PreToolUse/PostToolUse)
              AuditHook — default audit trail for all tool calls
@@ -105,7 +94,7 @@ Sub-agents:   stype_guidance() — type-specific system prompts
               depth limit: 3 (configurable via subagent_max_depth)
 
 Registration: Single entry point at everevo-server/src/orchestration/tools.rs
-              (8 phases: base → MCP → file-ops → sub-agent → team → workflow)
+              (每阶段 HashMap::insert 覆写:MCP plugin → in-process fallback → stateful)
 ```
 
 ## Error Handling

@@ -2,6 +2,15 @@
 //!
 //! Architectural **sink** — all crates depend on it. Telemetry module adds
 //! sqlx for the background writer; types stay I/O-free.
+//!
+//! ## Architecture docs (llmwiki)
+//!
+//! - [00-overview.md](../../../../docs/llmwiki/architecture/00-overview.md) — §3 ContextStage pipeline, §5 决策 1/6/8-12
+//!   (context pipeline contract, memory paradigm, vector store)
+//! - [03-context-pipeline.md](../../../../docs/llmwiki/architecture/03-context-pipeline.md) — context/stages.rs, ContextBuildContext
+//! - [04-memory.md](../../../../docs/llmwiki/architecture/04-memory.md) — 记忆范式、向量存储契约
+//! - [06-tool-system.md](../../../../docs/llmwiki/architecture/06-tool-system.md) — Tool trait (tool.rs)
+//! - [08-config-and-state.md](../../../../docs/llmwiki/architecture/08-config-and-state.md) — AppConfig (config.rs)
 
 pub mod config;
 pub mod config_center;

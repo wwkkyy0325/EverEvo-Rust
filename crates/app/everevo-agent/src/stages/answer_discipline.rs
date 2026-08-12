@@ -43,6 +43,14 @@ answer is counted wrong:
 - **Numeric answer:** output the bare number as digits — no units (no m³, kg, \
 mph), no `$`, no `%`, no thousands separators, no words (\"one hundred\" → `100`). \
 Do not round to an approximate form unless the question explicitly asks for it.
+- **Unit/scale conversion (HARD RULE):** the bare number must be expressed in \
+the units the QUESTION asks for, even if your source uses different units. If \
+the question asks \"how many km\" and your source says 17000 m, the answer is \
+`17`, not `17000`. Convert length (m↔km), mass (g↔kg), time, currency \
+(thousands), per-cent vs per-thousand, and every other scale the question \
+states. Re-read the question's own unit AFTER you have the raw number and \
+convert before committing — a number in the wrong unit is counted wrong even \
+when it is numerically faithful to the source.
 - **List answer:** output the item NAMES verbatim, comma-separated, never \
 shortened, renamed, or rephrased, and never a different count. Item names are \
 ATOMIC — do not strip qualifier adjectives/quantifiers (\"fresh basil\", \
@@ -59,6 +67,25 @@ source (lists, authors, labels, codes), preserve their EXACT written form. Do \
 not rephrase, rename, abbreviate, or reorder them. When sorting is required, \
 sort by the full written string — never by a shortened form. This is the rule \
 that keeps \"fresh basil\" as \"fresh basil\", never \"basil\".
+
+### Titles / headings — strip production scaffolding
+When the question asks for a title, name, or location heading (a castle, a \
+building, an episode/scene title, a ship, a place), output ONLY the bare \
+name — never the full scene/screenplay heading with its production \
+scaffolding. A line like \"INT. THE CASTLE - DAY\" is a SCENE HEADING, not a \
+name: the name is the `THE CASTLE` part, so strip `INT./EXT.` and the \
+`- DAY/NIGHT` time marker. Likewise drop episode codes, part numbers, and \
+studio markers unless the question explicitly asks for them.
+
+### Stated constraints only
+Apply EXACTLY the criteria the question states — no more, no less. When \
+counting or selecting items, include every item that meets the stated \
+criteria and exclude only items that fail them. NEVER impose an unstated \
+category exclusion (e.g. deciding a herb is not a \"food item\" when the \
+question never excludes herbs, or that a subtitle/season doesn't count). If \
+the question does not say to exclude a category, the category's items count. \
+When two answers differ only in whether an UNSTATED assumption was applied, \
+the answer that applies ONLY the stated criteria is correct.
 
 ### Constraint enumeration
 When a quantifier or constraint admits more than one reading (\"at least\", \
@@ -131,6 +158,24 @@ If no tool result contained it, you are hallucinating — do NOT commit it; \
 change strategy (fetch the page directly, different engine, `download`) until \
 a retrieved source contains the candidate term.
 
+### Historical-period names
+When a question concerns a historical figure, event, or place, answer with the \
+name that was CURRENT at the time — the name a contemporary source would use — \
+not a modern successor name. A town renamed in 1792, a merged county, or a \
+nation that no longer exists must be answered by its name in the era the \
+question asks about. If your retrieved source for that era says the place \
+was known as X, the answer is X, even when the modern settlement is now \
+called Y. Verify the name's era against the source; a modern alias in your \
+memory is not evidence of the historical name.
+HISTORICAL BIRTHPLACES (HARD RULE): when the question asks for the birthplace of \
+a historical figure (e.g. a U.S. president), answer with the name in use at the \
+time of birth — do NOT convert a historical name to its modern successor \
+municipality. Example: the 18th-century birthplace Braintree, Massachusetts is \
+Braintree, NOT \"Quincy\", even though modern Quincy absorbed it. The question's \
+wording \"cities\" or present tense does NOT license modernizing the name; the \
+\"city\" the question means is the historical municipality of birth. If your era \
+source says X, the answer is X.
+
 ### Unique-item identification (\"the one that differs\", \"unique flag\")
 When the question asks WHICH item in a set has a distinguishing property (the \
 article whose flag is unique from the others, the entry that differs from the \
@@ -142,6 +187,13 @@ country/group level and then guess:
 its flag/country. The \"unique\" flag belongs to the ONE item that also carries \
 the other stated property (the unknown-language article). Answer with that \
 item's country.
+- When the records are per-country entries (e.g. a directory of country flag \
+articles), the mapping is record→country: read each record's OWN language \
+field and join it to the flag shown in that SAME record. The target country \
+is the one whose OWN record carries the distinguishing language value. Never \
+infer one country's language from a different record, never pick a country \
+merely because its flag happens to appear in the source, and never answer a \
+country whose record you did not individually parse.
 - A flag/country merely present in the source is NOT the answer by itself; the \
 answer is the country of the item that has the stated property, read off that \
 same item.
@@ -176,7 +228,19 @@ un-read slot from memory. Query by the MISSING KEY, never by your guessed \
 value (\"who wears number N for <team> in <year>\" — a query naming your \
 guessed player can never validate the guess). Before the final answer, every \
 named slot must trace to a source row (number→name); if any slot has no \
-source row, keep retrieving or say you cannot answer — do not guess.";
+source row, keep retrieving or say you cannot answer — do not guess.
+
+### Benchmark-dataset contamination (HARD RULE)
+Never access, read, download, search for, or query the benchmark dataset itself \
+(e.g. the GAIA dataset on HuggingFace) or any file, cache, or page that contains \
+its ground-truth answers. These questions come from a public evaluation set; \
+reading the answer key is cheating and is FORBIDDEN even though the data is \
+publicly accessible and even if you believe the \"intended answer\" is \"public\". \
+Research ONLY the question's actual subject matter — the article, website, \
+person, dataset, or event it names — via the normal retrieval tools. If the \
+subject is unreachable and your only route to an answer would be the answer key, \
+report the source as unreachable and say you cannot determine the answer rather \
+than committing a value from the dataset.";
         Some(ContextFragment {
             label: "Answer Discipline".into(),
             messages: vec![LlmMessage::user(content)],

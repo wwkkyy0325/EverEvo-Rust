@@ -31,6 +31,27 @@ pub trait LlmProvider: Send + Sync {
         Ok(vec![StreamEvent::Text(resp.content.unwrap_or_default())])
     }
 
+    /// Stream a response as a channel of events. Default impl wraps
+    /// [`LlmProvider::chat_stream`] into a channel; providers with a native
+    /// streaming transport override this (e.g. `HttpClient`). The `cancel`
+    /// token lets the caller abort a long-running stream.
+    async fn stream_chat(
+        &self,
+        messages: &[LlmMessage],
+        tools: &[ToolSchema],
+        cancel: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>, EverEvoError> {
+        let events = self.chat_stream(messages, tools).await?;
+        if let Some(token) = cancel {
+            token.cancel();
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(events.len().max(1));
+        for ev in events {
+            let _ = tx.send(ev).await;
+        }
+        Ok(rx)
+    }
+
     /// Server-side (provider-executed) tool the API supports natively, e.g.
     /// `web_search_20250305`. Returns `Some(schema)` to declare the tool to
     /// the model; the provider executes it within the turn (the loop must NOT

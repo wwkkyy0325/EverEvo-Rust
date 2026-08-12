@@ -1,4 +1,8 @@
 # Terminal-Bench 2.0 — EverEvo Agent 基准测试
+> **状态**:🔄 进行中 — Terminal Bench 2.0
+
+---
+
 
 ## 目标
 

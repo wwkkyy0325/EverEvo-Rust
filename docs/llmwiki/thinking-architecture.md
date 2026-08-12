@@ -1,4 +1,8 @@
 # Thinking / Reasoning Architecture
+> **状态**:🚧 部分实现 — deepseek 原生 thinking 已实现;Layer 2 prompt-draft 未实现
+
+---
+
 
 ## Two Mechanisms, One UI
 

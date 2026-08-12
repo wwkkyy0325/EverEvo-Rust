@@ -1,4 +1,9 @@
 # Architecture Audit — 2026-08-06
+> **状态**:📋 历史快照(2026-08-06 基线)— 部分建议已执行(AppState 已拆分);现状见 architecture/ 00-14
+> **保留原因**:审计是历史证据,不改写。
+
+---
+
 
 ## 1. Crate Dependency & Layering
 

@@ -60,8 +60,8 @@ impl KnowledgeGraph {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::types::{EntityType, RelationStatus};
+    use super::*;
     use tempfile::TempDir;
 
     fn e(id: &str, label: &str, t: EntityType) -> Entity {

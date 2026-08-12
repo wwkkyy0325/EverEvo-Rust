@@ -72,7 +72,7 @@ def main() -> int:
         return 0
     if not probe():
         print("Vision server not reachable at", ENDPOINT)
-        print("Start it first — see scripts/serve_vision_qwen.md")
+        print("Start it first — see docs/ops/serve_vision_qwen.md")
         print("(llama-server -m <llm.gguf> --mmproj <mmproj.gguf> -c 32768 -ngl N "
               "--port 8080 --host 127.0.0.1)")
         return 2

@@ -1,4 +1,14 @@
 //! EverEvo Axum server — app builder, shared state, and route wiring.
+//!
+//! ## Architecture docs (llmwiki)
+//!
+//! - [00-overview.md](../../../../docs/llmwiki/architecture/00-overview.md) — §4 入口管线 / §5 决策 1/2/4
+//! - [01-entry-pipelines.md](../../../../docs/llmwiki/architecture/01-entry-pipelines.md) — §1 一次用户消息的完整旅程
+//!   (SSE 内容块、回放、特殊 provider 路由)
+//! - [05-orchestration.md](../../../../docs/llmwiki/architecture/05-orchestration.md) — SessionCoordinator、ContentBlockStreamer、auto-continue
+//! - [06-tool-system.md](../../../../docs/llmwiki/architecture/06-tool-system.md) — assemble 装配、权限分层
+//! - [07-bootstrap.md](../../../../docs/llmwiki/architecture/07-bootstrap.md) — 首启供给、MCP、A2A、workflow
+//! - [08-config-and-state.md](../../../../docs/llmwiki/architecture/08-config-and-state.md) — AppState、多 Provider 路由
 
 pub mod app_state;
 pub mod main_impl;

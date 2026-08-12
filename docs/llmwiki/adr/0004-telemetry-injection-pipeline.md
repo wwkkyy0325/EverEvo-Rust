@@ -59,7 +59,7 @@ Wiring (this is the fix, not just the abstraction):
 ## Consequences
 
 **Easier:** telemetry record producers are now added as `TelemetryStage` implementations registered
-in `default_telemetry_pipeline()` (design doc `docs/llmwiki/design/config-telemetry.md` §3.1 lists the
+in `default_telemetry_pipeline()` (design doc `docs/llmwiki/archive/design/config-telemetry.md` §3.1 lists the
 remaining planned sites — llm.rs spans, sandbox, domain/vector/kg, server main). One
 `TelemetryPipeline::emit()` call replaces each scattered record construction.
 

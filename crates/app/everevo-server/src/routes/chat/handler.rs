@@ -592,30 +592,39 @@ async fn handle_chat(
             ),
         }
     };
-    // Meta-agent background work reuses the compaction model when configured,
-    // else the main model (existing pipeline, unchanged behavior otherwise).
-    let meta_llm = {
-        let c = state.compact_llm.read().await;
-        c.as_ref()
-            .map(|r| Arc::clone(&r.client))
-            .unwrap_or_else(|| Arc::clone(&client))
+    // Meta-agent self-diagnosis is switchable (routing `metaAgentEnabled`,
+    // `EVEREVO_META_AGENT` env, benchmark default OFF). Disabled → the loop
+    // skips trigger + background `meta_diagnose` entirely. Computed once so the
+    // autocontinue restart below wires the same state.
+    let meta_agent = if crate::app_state::meta_agent_effective(&state).await {
+        let meta_llm = {
+            let c = state.compact_llm.read().await;
+            c.as_ref()
+                .map(|r| Arc::clone(&r.client))
+                .unwrap_or_else(|| Arc::clone(&client))
+        };
+        Some(Arc::new(std::sync::Mutex::new(
+            everevo_agent::memory::MetaAgentState::new(
+                Some(meta_llm),
+                Some(state.fact_manager.clone()),
+            ),
+        )))
+    } else {
+        None
     };
-    let meta_agent = Arc::new(std::sync::Mutex::new(
-        everevo_agent::memory::MetaAgentState::new(
-            Some(meta_llm),
-            Some(state.fact_manager.clone()),
-        ),
-    ));
     let mut agent = everevo_agent::AgentLoop::main_session(
         subagent_rx,
         coord.pending.clone(),
         coord.cancel.clone(),
         coord.compact_focus.clone(),
         Arc::clone(&proactivity),
-    )
-    .with_meta_agent(Arc::clone(&meta_agent))
-    .with_hook_feedback(assembled.hook_feedback.clone())
-    .with_compact_llm(compact_arc.clone());
+    );
+    if let Some(ma) = &meta_agent {
+        agent = agent.with_meta_agent(Arc::clone(ma));
+    }
+    agent = agent
+        .with_hook_feedback(assembled.hook_feedback.clone())
+        .with_compact_llm(compact_arc.clone());
     // Layer-1 background rolling-summary maintenance (spec D3): runs at soft
     // threshold turn boundaries without blocking the main loop.
     agent = agent.with_background_maintenance(compact_arc.as_ref().map(|llm| {
@@ -812,8 +821,10 @@ async fn handle_chat(
                 .with_cancel_token(coord.cancel.clone())
                 .with_compact_focus(coord.compact_focus.clone())
                 .with_proactivity(Arc::clone(&proactivity))
-                .with_meta_agent(Arc::clone(&meta_agent))
                 .with_hook_feedback(assembled.hook_feedback.clone());
+            if let Some(ma) = &meta_agent {
+                agent2 = agent2.with_meta_agent(Arc::clone(ma));
+            }
             if let Some(tid) = trace_id {
                 agent2 = agent2.with_telemetry(state.telemetry_pipeline.clone(), tid);
             }

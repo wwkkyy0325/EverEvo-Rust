@@ -26,9 +26,11 @@ Thumbs.db
 node_modules/
 frontend/dist/
 frontend/.vite/
+*.tsbuildinfo
 
 # ── Tauri generated ──
 src-tauri/gen/
+src-tauri/session/
 
 # ── Environment ──
 .env
@@ -38,9 +40,18 @@ src-tauri/gen/
 # ── Misc ──
 *.log
 tmp/
-sample-project/*
+sample-project/
 *.bak
-target-linux/*
-data-pre-gaia/*
-__pycache__/*
-*.pyc
+target-linux/
+data-pre-gaia/
+
+# ── Python (benchmark harnesses) ──
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+
+# ── Compiled build artifacts ──
+scripts/gaia-docker/everevo-server
