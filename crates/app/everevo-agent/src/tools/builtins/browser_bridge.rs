@@ -528,6 +528,24 @@ fn search_result_scraper_js(limit: usize) -> String {
 
 // ── Fallback wrapper — used by web_search when direct HTTP fails ──────────
 
+/// Percent-encode a query for a search-engine URL. RFC-3986 unreserved
+/// characters pass through; everything else is encoded as `%XX` per UTF-8 byte
+/// (so CJK queries survive — see the audit note in [`search_via_browser`]).
+fn percent_encode_query(query: &str) -> String {
+    let mut out = String::new();
+    for c in query.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' {
+            out.push(c);
+        } else {
+            let mut buf = [0u8; 4];
+            for b in c.encode_utf8(&mut buf).bytes() {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+    }
+    out
+}
+
 /// Try to extract search results via CDP browser bridge.
 ///
 /// Returns `Ok(results)` on success, `Err` if browser launch or CDP fails
@@ -539,17 +557,10 @@ pub async fn search_via_browser(
     // Build the search URL — prefer Bing (mainland-China-friendly)
     let engine = std::env::var("EVEREVO_SEARCH_BROWSER_URL")
         .unwrap_or_else(|_| "https://cn.bing.com/search?q=".to_string());
-    // URL-encode the query string (simple inline implementation)
-    let encoded_query = query
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' {
-                c.to_string()
-            } else {
-                format!("%{:02X}", c as u8)
-            }
-        })
-        .collect::<String>();
+    // URL-encode the query string, percent-encoding the FULL UTF-8 bytes of
+    // every non-ASCII char (audit LOW, 2026-08-13: `c as u8` truncated each
+    // CJK char to a single byte, mangling Chinese queries into garbage URLs).
+    let encoded_query = percent_encode_query(query);
     let search_url = format!("{}{}", engine, encoded_query);
 
     let bridge = BrowserBridge::launch().await?;
@@ -587,5 +598,26 @@ mod tests {
         let js = search_result_scraper_js(10);
         assert!(js.contains("b_algo"), "must handle Bing results");
         assert!(js.contains("duckduckgo.com"), "must handle DDG results");
+    }
+
+    #[test]
+    fn test_percent_encode_query_keeps_ascii() {
+        assert_eq!(percent_encode_query("rust error"), "rust%20error");
+        assert_eq!(percent_encode_query("a-b_c.d~e"), "a-b_c.d~e");
+        assert_eq!(percent_encode_query(""), "");
+    }
+
+    #[test]
+    fn test_percent_encode_query_encodes_full_cjk_utf8() {
+        // Audit LOW (2026-08-13): `c as u8` truncated each han char to one byte,
+        // so a Chinese query produced a mangled URL.
+        // 中 = U+4E2D → UTF-8 E4 B8 AD; 国 = U+56FD → E5 9B BD.
+        assert_eq!(percent_encode_query("中国"), "%E4%B8%AD%E5%9B%BD");
+        // 法 U+6CD5→E6 B3 95 · 国 U+56FD→E5 9B BD · space → %20
+        // 面 U+9762→E9 9D A2 · 积 U+79EF→E7 A7 AF — exact, not single-byte-truncated.
+        assert_eq!(
+            percent_encode_query("法国 面积"),
+            "%E6%B3%95%E5%9B%BD%20%E9%9D%A2%E7%A7%AF"
+        );
     }
 }

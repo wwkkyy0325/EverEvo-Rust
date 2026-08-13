@@ -39,12 +39,15 @@ pub trait LlmProvider: Send + Sync {
         &self,
         messages: &[LlmMessage],
         tools: &[ToolSchema],
-        cancel: Option<tokio_util::sync::CancellationToken>,
+        _cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>, EverEvoError> {
+        // NOTE: the caller's `cancel` token is a SESSION-level abort signal shared
+        // across turns — the provider must NOT cancel it when a stream completes
+        // (a real bug fixed 2026-08-13: the default impl cancelled the caller's
+        // token after every stream, killing the whole session on the next turn).
+        // Providers that need to abort a long stream react to the caller cancelling
+        // it; they never cancel it themselves.
         let events = self.chat_stream(messages, tools).await?;
-        if let Some(token) = cancel {
-            token.cancel();
-        }
         let (tx, rx) = tokio::sync::mpsc::channel(events.len().max(1));
         for ev in events {
             let _ = tx.send(ev).await;

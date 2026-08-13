@@ -202,6 +202,19 @@ pub(crate) fn mask_observations(messages: &mut [LlmMessage]) -> usize {
         {
             continue;
         }
+        // Multi-tool results (tool_call_id "id1|id2") must NEVER be masked into
+        // a non-JSON header: the anthropic body builder parses multi-tool
+        // content as JSON to rebuild per-tool tool_result blocks, and a plain
+        // header string breaks that parse — zero tool_results are emitted and
+        // the preceding tool_use ids are orphaned (DeepSeek HTTP 400 "tool_use
+        // ids were found without tool_result blocks"). Skip them entirely.
+        if messages[idx]
+            .tool_call_id
+            .as_deref()
+            .is_some_and(|id| id.contains('|'))
+        {
+            continue;
+        }
         messages[idx].content = format!(
             "[tool result from \"{tool_name}\" masked; {original_len} bytes elided. \
              Re-run the tool if you need this output again.]"

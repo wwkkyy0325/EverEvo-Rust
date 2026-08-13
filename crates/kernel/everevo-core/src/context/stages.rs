@@ -1,4 +1,4 @@
-use super::data::{ContextBuildContext, ContextFragment};
+use super::budget::{ContextBuildContext, ContextFragment};
 use super::ContextStage;
 use crate::llm::LlmMessage;
 
@@ -62,8 +62,14 @@ impl ContextStage for RollingSummaryStage {
 }
 
 /// Injects current-session conversation history with a sliding-window cap.
+///
+/// When a per-model `ContextBudget` is set (`ctx.budget.window > 0`), the
+/// window is token-budget based — newest-first accumulation until
+/// `history_budget` is exhausted. Otherwise it falls back to a message-count
+/// cap (`max_messages`, kept for backward compatibility / sub-agents).
 pub struct ConversationHistoryStage {
     /// Maximum number of past messages to include (oldest are dropped first).
+    /// Used only when no token budget is configured.
     pub max_messages: usize,
 }
 
@@ -84,8 +90,11 @@ impl ContextStage for ConversationHistoryStage {
         if ctx.history.is_empty() {
             return None;
         }
-        // Apply sliding window: keep the most recent N messages
-        let window = if ctx.history.len() > self.max_messages {
+        // Apply sliding window: token-budget newest-first when a budget is set,
+        // otherwise the legacy message-count window.
+        let window = if ctx.budget.window > 0 {
+            ctx.budget.history_window(&ctx.history)
+        } else if ctx.history.len() > self.max_messages {
             &ctx.history[ctx.history.len() - self.max_messages..]
         } else {
             &ctx.history
@@ -299,10 +308,10 @@ pub fn shell_specific_guide(shell_name: &str) -> &'static str {
             "\
 ## Shell: Git Bash (Unix-like on Windows)\n\
 - Commands: Unix-style — use `ls`, `cat`, `grep`, `rm`, `cp`, `mv`\n\
-- Paths: use FORWARD slashes ONLY — `F:/Users/lcx/Desktop/file.txt`\n\
+- Paths: use FORWARD slashes ONLY — `C:/Users/you/Desktop/file.txt`\n\
 - NEVER use backslashes in paths — `\\` is an escape character in bash!\n\
-- Wrong: `F:\\Users\\Desktop\\file.txt` → broken\n\
-- Correct: `F:/Users/lcx/Desktop/file.txt` or `/f/Users/lcx/Desktop/file.txt`\n\
+- Wrong: `C:\\Users\\you\\Desktop\\file.txt` → broken\n\
+- Correct: `C:/Users/you/Desktop/file.txt` or `/c/Users/you/Desktop/file.txt`\n\
 - File content: use `cat file.txt` NOT `type file.txt`\n\
 - Directory listing: use `ls -la` NOT `dir`\n\
 - Python: use `python` (not `python3`)"

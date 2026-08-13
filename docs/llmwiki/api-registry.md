@@ -32,6 +32,11 @@
 | `LlmProvider::native_web_search_tool()` | Method | **Stable** | 2026-08-11 (new — default `None`; providers declare a server-executed search tool) | — |
 | `StreamEvent` | Enum | **Stable** | 2026-08-11 (added `ServerToolUse { name }` + `Done.stop_reason: Option<String>` — server-side tool signal + provider stop_reason, non-breaking) | — |
 | `ContextBuildContext.summary` | Field | **Stable** | 2026-08-11 (new — `Option<String>` durable rolling-summary slot consumed by `RollingSummaryStage`) | — |
+| `ContextBuildContext.budget` | Field | **Stable** | 2026-08-12 (new — `ContextBudget`; per-provider window adaptation) | 0005 |
+| `ContextSnapshot.{available_tokens,safety_reserved,output_reserved}` | Field | **Stable** | 2026-08-12 (new — budget breakdown surfaced on the assembled snapshot) | 0005 |
+| `ContextBudget` | Struct | **Stable** | 2026-08-12 (new — `resolve(Option<u32>)` with 128k floor (None only), `stage(name)`, `history_window()` newest-first token window) | 0005 |
+| `DEFAULT_CONTEXT_WINDOW` | Const | **Stable** | 2026-08-12 (new — 128_000; floor when provider window is `None`) | 0005 |
+| `LlmProviderConfig.context_window` (core types) | Field | **Stable** | 2026-08-12 (new — `Option<u32>`, `#[serde(default)]`; env plumbing `*_CONTEXT_WINDOW`) | 0005 |
 | `RollingSummaryStage` | Struct | **Stable** | 2026-08-11 (new — priority 75; injects `<conversation_summary>` user message before history; empty summary → no-op) | — |
 | `TelemetryStage` trait | Trait | **Stable** | 2026-08-10 (new — registered emission pipeline, mirrors `ContextStage`) | 0004 |
 | `TelemetryPipeline` | Struct | **Stable** | 2026-08-10 (new — priority-ordered stages + sink) | 0004 |
@@ -61,9 +66,25 @@
 | `memory` tool `scope` param | Tool | **Stable** | 2026-08-10 (new — `"session"` default / `"global"` promotion) |
 | `FactManager::read_index_lean()` | Method | **Removed** | 2026-08-10 (orphaned — only caller replaced by session-filtered index) |
 | `HttpClient::stream_chat()` | Method | **Stable** | 2026-07-26 (added `_cancel` param) |
+| `loop_::state::{LoopState, LoopEvent, transition, is_terminal}` | Enum/Fn | **Stable** | 2026-08-12 (new — explicit agent-loop FSM, transition table T1-T20; see `docs/llmwiki/agent-states.md`) |
+| `SessionState` | Enum | **Stable** | 2026-08-12 (revived — `Running`/`WaitingUser`/`Completed`/`Failed` now persisted to session metadata) |
+| `orchestration::set_session_state(db, id, state)` | Fn | **Stable** | 2026-08-12 (new — persists session lifecycle state) |
+| `classify_terminal_state(resp)` | Fn | **Stable** | 2026-08-12 (new — harness per-question `ok/timed_out/error` classifier) |
+| `subagent_roles::{AgentRole, AgentTier}` | Enum | **Stable** | 2026-08-13 (new — soft role vocabulary + tier metadata; `parse`/`system_prompt`/`tier`) |
+| `SubAgentContext.max_context_tokens` | Field | **Stable** | 2026-08-13 (inherited from parent window; default 80000) |
+| `assemble_subagent_context(..., parent_max_context_tokens)` | Fn | **Stable** | 2026-08-13 (soft param added — sub-agents inherit the parent context budget) |
+| `stages::util::clamp_verify_fragment` | Fn | **Stable** | 2026-08-13 (new — generous budget cap for hard verification fragments) |
+| `problem_model::{ProblemModel, ProblemNode, ProblemEdge, NodeKind, EpiStatus, EdgeKind}` | Struct/Enum | **Stable** | 2026-08-13 (new — session-scoped structural problem model / causal draft) |
+| `problem_model` tool | Tool | **Stable** | 2026-08-13 (new — init/add_node/add_edge/update_status/list/finalize; main-loop only) |
+| `ProblemModelingStage` | Struct | **Stable** | 2026-08-13 (new — Hard-only causal-draft modeling, priority 3) |
+| `ContextStage::tool_visible()` / `description()` | Trait method | **Stable** | 2026-08-13 (new — defaults false/""; marks tool-callable stages) |
+| `stages::stage_catalog()` / `compose_stages()` | Fn | **Stable** | 2026-08-13 (new — tool-callable pipeline catalog + SELF-DISCOVER-lite compose) |
+| `pipeline` tool | Tool | **Stable** | 2026-08-13 (new — list_stages/run_stage/run_pipeline/compose; main-loop only) |
 | `AgentCharacterStage` / `AgentCharacter` | Struct | **Stable** | 2026-08-05 (new — agent's own voice; priority 0) |
-| `AnswerDisciplineStage` | Struct | **Stable** | 2026-08-11 (new — output-fidelity: final-answer marker, verbatim list, constraint/candidate checks; priority 2) |
-| `EvidenceChecklistStage` | Struct | **Stable** | 2026-08-11 (new — ECLoop-style pre-commit evidence checklist + deterministic verifier gate; priority 2) |
+| `AnswerDisciplineStage` | Struct | **Stable** | 2026-08-12 (two-tier: full on Hard, short format-contract on Simple — adaptive difficulty gating) |
+| `EvidenceChecklistStage` | Struct | **Stable** | 2026-08-12 (gated to Hard questions; independent-reviewer persona + mandatory deterministic verifier + cluster-verify escalation) |
+| `stages::difficulty::{classify, hard_score, Difficulty}` | Fn/Enum | **Stable** | 2026-08-12 (new — deterministic Simple/Hard classifier; conservative) |
+| `VerifyCandidateStage` | Struct | **Stable** | 2026-08-12 (gated to Hard questions; independent-reviewer persona) |
 | `build_character_block(profile_path)` | Fn | **Stable** | 2026-08-05 (new — renders character + sources) |
 | `synthesize_character(path, llm)` / `SynthesisReport` | Fn | **Stable** | 2026-08-05 (new — LLM distills fragments → traits) |
 | `load_character(path)` | Fn | **Stable** | 2026-08-05 (new — load/auto-create profile) |
@@ -103,6 +124,11 @@
 | `LlmProviderConfig.context_window` | Field | **Stable** | 2026-08-11 (new — optional token window; drives budget-aware compaction chunking) |
 | `RoutingSettings.vision_model_id` / `compact_model_id` | Field | **Stable** | 2026-08-11 (new — route vision/compaction to separate `[[llm]]` entries; `compact_model_id` unset → main model) |
 | `AppState.vision_llm` / `compact_llm` | Field | **Stable** | 2026-08-11 (new — `Option<ResolvedProvider>` resolved from routing on reload) |
+| `AppState.ask_user` | Field | **Stable** | 2026-08-12 (new — `Arc<RwLock<HashMap<Uuid, PendingAsk>>>`, parked asks keyed by session) | 0005 |
+| `AppState.main_llm` / `resolve_main_provider()` | Field/Method | **Stable** | 2026-08-12 (new — main provider `Option<ResolvedProvider>` from `[routing] mainModelId`, fallback `"primary"`; drives `ContextBudget::resolve`) | 0005 |
+| `AskUserTool` (`ask_user`) | Tool | **Stable** | 2026-08-12 (new — main loop only; infinite block, cancel/disconnect terminate; auto short-circuit under benchmark/fully_auto) | 0005 |
+| `POST /api/sessions/{id}/ask` | JSON | **Stable** | 2026-08-12 (new — body `{reply}`; fires the parked oneshot; 400 empty / 404 no pending) | 0005 |
+| `awaiting_user` SSE event | SSE | **Stable** | 2026-08-12 (new — `{session_id, question}`; forwarded from `ask_user` tool parking) | 0005 |
 
 ## everevo-db (Persistence)
 
@@ -123,7 +149,9 @@
 | `ChatState` (Zustand) | Store | **Stable** | 2026-07-26 (added `todos`, `subagentTasks`) |
 | `ChatBubble` | Component | **Stable** | 2026-07-26 (added `blocks` rendering) |
 | `useRoutingConfig` | Hook | **Stable** | 2026-08-11 (added `visionModelId`/`compactModelId`) |
-| `SettingsView` | Component | **Stable** | 2026-08-11 (added vision/compact model dropdowns + `context_window` input; vision selector notes "context ≤ 32K") |
+| `SettingsView` | Component | **Stable** | 2026-08-11 (added vision/compact model dropdowns + `context_window` input; vision selector notes "context ≤ 32K"); 2026-08-12 (routing model selects show `context_window`, e.g. `model · 128K`) |
+| `askQueue` / `resolveAsk` (Zustand) | Store | **Stable** | 2026-08-12 (new — pending `ask_user` questions; `awaiting_user` SSE push; `resolveAsk` POSTs `/api/sessions/{id}/ask` then shifts queue) | 0005 |
+| `AskUserDialog` | Component | **Stable** | 2026-08-12 (new — free-text reply modal, Enter submits / Shift+Enter newline) | 0005 |
 
 ---
 

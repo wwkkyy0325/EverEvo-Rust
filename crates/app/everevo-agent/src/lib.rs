@@ -10,7 +10,6 @@
 //! | `stages` | Context pipeline stages (persona, skills, best practices, domain, memory) |
 //! | `memory` | Persistent memory system (facts, diary, dreaming) |
 //! | `knowledge` | Knowledge layer (graph, domain, RAG, wiki) |
-//! | `sandbox` | Thin sandbox re-exports from everevo-sandbox |
 //! | `subagent_context` | Sub-agent context assembly |
 //!
 //! ## Architecture docs (llmwiki)
@@ -28,11 +27,11 @@ pub mod llmwiki;
 pub mod loop_;
 pub mod memory;
 pub mod rag;
-pub mod sandbox;
 pub mod skill;
 pub mod stages;
 pub mod subagent_context;
 pub mod subagent_pool;
+pub mod subagent_roles;
 pub mod task_type;
 pub mod tools;
 

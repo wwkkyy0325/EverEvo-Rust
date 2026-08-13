@@ -18,8 +18,8 @@ export HTTP_PROXY="http://127.0.0.1:7890"
 export HTTPS_PROXY="http://127.0.0.1:7890"
 export EVEREVO_BENCHMARK=1
 export EVEREVO_META_AGENT=0
-export HF_HOME="C:/Users/lcx/gaia-run5-hf"
-export HF_DATASETS_CACHE="C:/Users/lcx/gaia-run5-hf/datasets"
+export HF_HOME="${HF_HOME:-$HOME/gaia-run5-hf}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$HOME/gaia-run5-hf/datasets}"
 taskkill //F //IM everevo-server.exe 2>/dev/null || true
 sleep 3
-data/bench/venv/Scripts/python.exe f:/workspace-new/wwkkyy0325/EverEvo-Rust/scripts/gaia_bench.py --level level1
+data/bench/venv/Scripts/python.exe "$(dirname "$0")/gaia_bench.py" --level level1

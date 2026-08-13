@@ -41,10 +41,9 @@ pub type SharedBacklog = Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
 pub type SharedPending = Arc<std::sync::atomic::AtomicUsize>;
 
 mod spawn;
-mod types;
 
 use spawn::*;
-pub use types::*;
+pub use spawn::{SubAgentHandle, SubAgentStatus};
 
 // ── TaskTool ──────────────────────────────────────────────────────────────
 

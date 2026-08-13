@@ -15,7 +15,7 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use everevo_core::context::ContextBuildContext;
+use everevo_core::context::{ContextBudget, ContextBuildContext};
 use everevo_core::types::ChatRequest;
 use everevo_db::models::MessageRow;
 use futures::FutureExt;
@@ -35,6 +35,7 @@ use super::reconnect::handle_reconnect;
 use super::slash_commands::{
     handle_character_command, handle_plan_command, handle_workspace_command,
 };
+use super::wiring::apply_session_agent_wiring;
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new().route("/api/chat", post(handler))
@@ -47,17 +48,36 @@ async fn handler(
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(256);
 
     tokio::spawn(async move {
+        let session_id = req.session_id;
+        let state_for_err = Arc::clone(&state);
         match AssertUnwindSafe(handle_chat(state, req, &tx))
             .catch_unwind()
             .await
         {
             Ok(Ok(())) => {} // normal completion
             Ok(Err(e)) => {
+                // Session lifecycle: agent run terminated with an error.
+                if let Some(sid) = session_id {
+                    orchestration::set_session_state(
+                        &state_for_err.db,
+                        sid,
+                        everevo_core::types::SessionState::Failed,
+                    )
+                    .await;
+                }
                 let _ = tx.send(Ok(Event::default().event("error").data(e))).await;
             }
             Err(panic) => {
                 let msg = panic_message(&panic);
                 tracing::error!(%msg, "Chat handler panicked — recovered by catch_unwind");
+                if let Some(sid) = session_id {
+                    orchestration::set_session_state(
+                        &state_for_err.db,
+                        sid,
+                        everevo_core::types::SessionState::Failed,
+                    )
+                    .await;
+                }
                 let _ = tx
                     .send(Ok(Event::default()
                         .event("error")
@@ -343,13 +363,28 @@ async fn handle_chat(
         }
     };
 
+    // Per-model context budget: resolved from the main provider's
+    // `context_window` (128k floor when unset) — the main session finally tracks
+    // the model actually in use instead of the 100k/80k hardcoded values.
+    let context_budget = ContextBudget::resolve(
+        state
+            .main_llm
+            .read()
+            .await
+            .as_ref()
+            .and_then(|r| r.context_window),
+    );
+    // Capture before the budget is moved into the context (used again for the
+    // AgentLoop ceiling below).
+    let context_window_tokens = context_budget.window;
     let ctx = ContextBuildContext {
         user_message: effective_message.clone(),
         session_id: Some(session_id),
         session_title: None,
         history,
         history_tokens: 0,
-        max_context_tokens: state.config.max_context_tokens,
+        max_context_tokens: context_window_tokens,
+        budget: context_budget,
         shell_name: Some(shell_name.clone()),
         permission_level: Some(permission_level.clone()),
         trusted_paths,
@@ -441,6 +476,7 @@ async fn handle_chat(
         &["shell".into(), "memory".into()],
         Some(todo_summary.clone()),
         skill_list,
+        Some(context_window_tokens),
     )
     .await;
     // Inherit parent session's permission level for sub-agents.
@@ -498,21 +534,18 @@ async fn handle_chat(
         snapshots_state.record_context_snapshot(snapshot).await;
     });
 
-    // ── 4. Persist user message ──────────────────────────────────────
-    let user_msg = MessageRow::new(session_id, "user", req.message.clone(), None, None, None);
-    state
-        .db
-        .add_message(&user_msg)
+    // ── 4. Persist user message (single write path: DB + dreaming) ──
+    // P2 write convergence — the fan-out lives in SessionContent::persist_user.
+    // DB failure is NON-FATAL: a write error must not kill the chat session
+    // (error-transition-table "Session / DB" row; audit MEDIUM, 2026-08-13 —
+    // this was previously propagated with `?`, contradicting the table's
+    // best-effort claim and failing the turn on a storage hiccup).
+    if let Err(e) = crate::session_content::SessionContent::new(&state, session_id)
+        .persist_user(&req.message)
         .await
-        .map_err(|e| format!("Failed to save user message: {e}"))?;
-
-    // Feed raw message into the dreaming engine's buffer
-    state.dreaming_engine.push_message(
-        "user",
-        &req.message,
-        &user_msg.id.to_string(),
-        &session_id.to_string(),
-    );
+    {
+        tracing::warn!(%session_id, error = %e, "Failed to persist user message (non-fatal)");
+    }
 
     // Bump session updated_at
     let _ = state
@@ -540,6 +573,14 @@ async fn handle_chat(
         .write()
         .await
         .insert(session_id, coord.cancel.clone());
+
+    // Session lifecycle: agent run started.
+    crate::orchestration::set_session_state(
+        &state.db,
+        session_id,
+        everevo_core::types::SessionState::Running,
+    )
+    .await;
 
     let tx_disconnect = tx.clone();
     let cancel_on_disconnect = coord.cancel.clone();
@@ -619,12 +660,18 @@ async fn handle_chat(
         coord.compact_focus.clone(),
         Arc::clone(&proactivity),
     );
-    if let Some(ma) = &meta_agent {
-        agent = agent.with_meta_agent(Arc::clone(ma));
-    }
-    agent = agent
-        .with_hook_feedback(assembled.hook_feedback.clone())
-        .with_compact_llm(compact_arc.clone());
+    // Shared session wiring (proactivity/context-budget/hook-feedback/meta-agent/
+    // telemetry/benchmark-turn-cap) — identical for the auto-continue restart.
+    agent = apply_session_agent_wiring(
+        agent,
+        &proactivity,
+        &meta_agent,
+        &assembled.hook_feedback,
+        context_window_tokens,
+        trace_id,
+        state.telemetry_pipeline.clone(),
+    );
+    agent = agent.with_compact_llm(compact_arc.clone());
     // Layer-1 background rolling-summary maintenance (spec D3): runs at soft
     // threshold turn boundaries without blocking the main loop.
     agent = agent.with_background_maintenance(compact_arc.as_ref().map(|llm| {
@@ -647,17 +694,6 @@ async fn handle_chat(
             .join(session_id.to_string())
             .join("tool_cache"),
     ));
-    if let Some(tid) = trace_id {
-        agent = agent.with_telemetry(state.telemetry_pipeline.clone(), tid);
-    }
-    // Benchmark mode: cap the ReAct loop so a question that cannot be verified
-    // (blocked web / junk search results from the host network) is still forced
-    // to commit to a final answer instead of churning tools until the
-    // wall-clock cap. The loop injects a "provide your final answer now"
-    // reminder two turns before the limit.
-    if std::env::var("EVEREVO_BENCHMARK").is_ok() {
-        agent = agent.with_max_turns(20);
-    }
     let mut agent_rx = agent.run(client, tools, messages, None).await;
 
     let assistant_id = Uuid::new_v4();
@@ -730,165 +766,72 @@ async fn handle_chat(
                 // wait here. The /api/sandbox/confirm endpoint will
                 // resolve it when the user clicks.
             }
+            // ── Ask-user notifications (ask_user tool → frontend) ──
+            Some(ask) = receivers.ask_user_rx.recv() => {
+                tracing::info!(
+                    session_id = %ask.session_id,
+                    question = %ask.question,
+                    "Sending awaiting_user to frontend"
+                );
+                // Session lifecycle: agent blocked waiting for the user.
+                crate::orchestration::set_session_state(
+                    &state.db,
+                    ask.session_id,
+                    everevo_core::types::SessionState::WaitingUser,
+                )
+                .await;
+                let payload = serde_json::json!({
+                    "session_id": ask.session_id.to_string(),
+                    "question": ask.question,
+                });
+                let _ = tx.send(Ok(Event::default()
+                    .event("awaiting_user")
+                    .data(payload.to_string())
+                )).await;
+                // Persist the question as an assistant message so it survives a
+                // page refresh and the agent can see its own ask in history.
+                // The reply is appended by POST /api/sessions/{id}/ask.
+                let question = ask.question.clone();
+                if let Err(e) = state
+                    .db
+                    .add_message(&MessageRow::new(
+                        ask.session_id,
+                        "assistant",
+                        question,
+                        None,
+                        None,
+                        None,
+                    ))
+                    .await
+                {
+                    tracing::warn!(session_id = %ask.session_id, error = %e, "Failed to persist ask_user question");
+                }
+                // The tool is blocked on its oneshot — the /api/sessions/{id}/ask
+                // endpoint resolves it when the user submits a reply.
+            }
         }
     }
 
     // ── 7.5 Auto-continue: sub-agent results arrive → restart agent loop ──
-    // Guard against infinite restarts: max 5 auto-continue cycles, and
-    // break if pending_subagents hasn't decreased between cycles.
-    if agent_yielded_for_subagents {
-        let mut drained = 0usize;
-        let mut auto_cycles = 0u32;
-        const MAX_AUTO_CYCLES: u32 = 5;
-        let mut last_pending = pending_for_autocontinue.load(std::sync::atomic::Ordering::SeqCst);
-
-        loop {
-            auto_cycles += 1;
-            if auto_cycles > MAX_AUTO_CYCLES {
-                tracing::warn!(
-                    cycles = auto_cycles,
-                    "Auto-continue limit reached — forcing final synthesis"
-                );
-                break;
-            }
-
-            let pending = pending_for_autocontinue.load(std::sync::atomic::Ordering::SeqCst);
-
-            // ── Extract new results (drop lock before any await) ──
-            let new_results: Vec<(String, String, String)> = {
-                let backlog = coord.backlog.lock().unwrap_or_else(|e| e.into_inner());
-                if drained < backlog.len() {
-                    backlog[drained..].to_vec()
-                } else {
-                    Vec::new()
-                }
-            };
-
-            if pending == 0 && new_results.is_empty() {
-                tracing::info!("All sub-agents completed — final synthesis");
-                // Inject verification nudge so the LLM can call Verify tool
-                messages_for_autocontinue.push(everevo_core::llm::LlmMessage::user(
-                    "All sub-agent tasks have completed. Review the results above. \
-                     If any task output needs verification, use the Verify tool \
-                     to check correctness before providing your final answer.",
-                ));
-                break;
-            }
-
-            // If pending count hasn't changed and no new results, the sub-agents
-            // might be stuck — force final synthesis instead of looping forever.
-            // We require at least one sleep cycle before declaring stall to avoid
-            // a race where pending was just set but results haven't arrived yet
-            // (common with fast parallel_agents/team dispatch).
-            if new_results.is_empty() {
-                if pending >= last_pending && auto_cycles > 1 {
-                    tracing::warn!(
-                        pending,
-                        cycles = auto_cycles,
-                        "Sub-agents stalled — forcing final synthesis"
-                    );
-                    break;
-                }
-                last_pending = pending;
-                // No new results — sleep and retry
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                continue;
-            }
-            last_pending = pending;
-
-            drained = {
-                let backlog = coord.backlog.lock().unwrap_or_else(|e| e.into_inner());
-                backlog.len()
-            };
-
-            // ── Inject results and send SSE events ──
-            for (task_id, desc, result) in &new_results {
-                let short: String = result.chars().take(2000).collect();
-                let _ = tx
-                    .send(Ok(Event::default().event("subagent_result").data(
-                        serde_json::json!({"id": task_id, "description": desc, "result": short})
-                            .to_string(),
-                    )))
-                    .await;
-                messages_for_autocontinue.push(everevo_core::llm::LlmMessage::user(format!(
-                    "[SubAgent Result]\n{result}"
-                )));
-            }
-
-            // ── Restart AgentLoop with updated messages ──
-            let mut agent2 = everevo_agent::AgentLoop::new()
-                .with_pending_subagents(Arc::clone(&pending_for_autocontinue))
-                .with_cancel_token(coord.cancel.clone())
-                .with_compact_focus(coord.compact_focus.clone())
-                .with_proactivity(Arc::clone(&proactivity))
-                .with_hook_feedback(assembled.hook_feedback.clone());
-            if let Some(ma) = &meta_agent {
-                agent2 = agent2.with_meta_agent(Arc::clone(ma));
-            }
-            if let Some(tid) = trace_id {
-                agent2 = agent2.with_telemetry(state.telemetry_pipeline.clone(), tid);
-            }
-            if std::env::var("EVEREVO_BENCHMARK").is_ok() {
-                agent2 = agent2.with_max_turns(20);
-            }
-            let resumed_msgs = messages_for_autocontinue.clone();
-            let mut agent_rx2 = agent2
-                .run(
-                    Arc::clone(&client_for_autocontinue),
-                    Arc::clone(&tools_for_autocontinue),
-                    resumed_msgs,
-                    None,
-                )
-                .await;
-
-            // ── Stream events from the resumed run (content-block format) ──
-            let mut ac_streamer = ContentBlockStreamer::new(session_id);
-            ac_streamer.block_index = s.block_index;
-            loop {
-                tokio::select! {
-                    event = agent_rx2.recv() => {
-                        match event {
-                            Some(ev) => {
-                                let is_terminal = matches!(ev,
-                                    everevo_agent::AgentEvent::Done { .. } |
-                                    everevo_agent::AgentEvent::Error { .. }
-                                );
-                                match ac_streamer.handle_event(ev, tx).await {
-                                    crate::orchestration::StreamerAction::Continue => {
-                                        if is_terminal { break; }
-                                    }
-                                    crate::orchestration::StreamerAction::Done => break,
-                                    crate::orchestration::StreamerAction::Error { .. } => break,
-                                }
-                            }
-                            None => break,
-                        }
-                    }
-                    Some(notif) = receivers.confirm_rx.recv() => {
-                        let payload = serde_json::json!({
-                            "session_id": notif.session_id.to_string(),
-                            "command": notif.command,
-                            "reason": notif.reason,
-                        });
-                        let _ = tx.send(Ok(Event::default()
-                            .event("confirmation_required")
-                            .data(payload.to_string())
-                        )).await;
-                    }
-                }
-            }
-            // Sync streamer state back
-            s.block_index = ac_streamer.block_index;
-            s.thinking_open = ac_streamer.thinking_open;
-            s.text_block_idx = ac_streamer.text_block_idx;
-            s.full_response = ac_streamer.full_response;
-
-            // Check if all sub-agents are done
-            if pending_for_autocontinue.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-                break;
-            }
-        }
-    }
+    super::auto_continue::run_auto_continue(
+        agent_yielded_for_subagents,
+        &mut coord,
+        &mut receivers,
+        tx,
+        &mut s,
+        &pending_for_autocontinue,
+        &mut messages_for_autocontinue,
+        client_for_autocontinue,
+        tools_for_autocontinue,
+        &state,
+        session_id,
+        &proactivity,
+        &meta_agent,
+        &assembled.hook_feedback,
+        context_window_tokens,
+        trace_id,
+    )
+    .await;
 
     // ── 8-11. Persist + close blocks + cleanup ───────────────────────
     let (total_in, total_out) = client_for_tokens.token_usage();
@@ -905,6 +848,14 @@ async fn handle_chat(
         s.block_index,
         total_in,
         total_out,
+    )
+    .await;
+
+    // Session lifecycle: agent run completed successfully.
+    orchestration::set_session_state(
+        &state.db,
+        session_id,
+        everevo_core::types::SessionState::Completed,
     )
     .await;
 

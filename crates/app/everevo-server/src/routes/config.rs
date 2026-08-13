@@ -157,6 +157,8 @@ async fn put_config(
             guard.retain(|id, _| new_map.contains_key(id));
             drop(guard);
             state.resolve_special_providers().await;
+            state.resolve_main_provider().await;
+            state.resolve_web_search_provider().await;
 
             if !new_map.is_empty() {
                 state.llm_notify.notify_one();
@@ -207,6 +209,8 @@ async fn reload_llm(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
     guard.retain(|id, _| new_map.contains_key(id));
     drop(guard);
     state.resolve_special_providers().await;
+    state.resolve_main_provider().await;
+    state.resolve_web_search_provider().await;
 
     // Wake the init pipeline if it's waiting for LLM config
     if !providers.is_empty() {
@@ -322,6 +326,8 @@ async fn put_routing(
     match save_settings(&state, &settings).await {
         Ok(_) => {
             state.resolve_special_providers().await;
+            state.resolve_main_provider().await;
+            state.resolve_web_search_provider().await;
             *state.meta_agent_enabled.write().await = meta_agent_enabled;
             Ok(Json(serde_json::json!({ "ok": true })))
         }

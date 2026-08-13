@@ -7,7 +7,13 @@ pub(crate) fn truncate_for_retro(msg: &str) -> String {
     if msg.len() <= MAX {
         msg.to_string()
     } else {
-        format!("{}…", &msg[..MAX])
+        // Byte-slicing `&msg[..MAX]` panics ("byte index is not a char
+        // boundary") when a multi-byte UTF-8 char (Chinese, emoji) straddles
+        // the 160-byte boundary — a real crash that killed the full GAIA run
+        // mid-flight (server panic → every later question 502). Take chars
+        // instead, which is always boundary-safe.
+        let truncated: String = msg.chars().take(MAX).collect();
+        format!("{truncated}…")
     }
 }
 
@@ -77,4 +83,66 @@ pub(crate) fn build_retrospective(
         out.push_str("\n- 优化点：本轮无结构性故障。");
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: `&msg[..160]` byte-slicing panicked ("byte index is not a
+    // char boundary") on multi-byte UTF-8, crashing the server and killing the
+    // whole GAIA run mid-flight. Char-safe truncation must not panic.
+    #[test]
+    fn truncate_for_retro_handles_multibyte_utf8() {
+        let msg = "错误消息".repeat(60); // 180+ chars, 6 bytes each
+        let out = truncate_for_retro(&msg);
+        assert!(out.ends_with('…'), "should be truncated with ellipsis");
+        assert!(out.chars().count() <= 161, "at most 160 chars + ellipsis");
+    }
+
+    #[test]
+    fn truncate_for_retro_short_msg_unchanged() {
+        let out = truncate_for_retro("short");
+        assert_eq!(out, "short");
+    }
+}
+
+/// Emit the per-turn `TurnComplete` event + telemetry record. Extracted from
+/// driver.rs during the 2026-08-13 physical restructure.
+pub(crate) async fn emit_turn_complete(
+    tx: &tokio::sync::mpsc::Sender<super::event::AgentEvent>,
+    telemetry: Option<&std::sync::Arc<everevo_core::TelemetryPipeline>>,
+    trace_id: Option<uuid::Uuid>,
+    turn: usize,
+    tool_calls_len: usize,
+    tool_calls_success: i32,
+    turn_start: std::time::Instant,
+) {
+    use everevo_core::TelemetryEmitContext;
+
+    let _ = tx.send(super::event::AgentEvent::TurnComplete).await;
+
+    if let Some(telemetry) = telemetry {
+        let turn_error = (tool_calls_success as usize) < tool_calls_len;
+        let (error_type, error_message) = if turn_error {
+            let failed = tool_calls_len as i32 - tool_calls_success;
+            (
+                Some("tool_error".to_string()),
+                Some(format!("{failed} of {tool_calls_len} tool calls failed",)),
+            )
+        } else {
+            (None, None)
+        };
+        telemetry.emit(&TelemetryEmitContext {
+            trace_id,
+            turn_number: Some(turn as i32),
+            tool_calls_total: Some(tool_calls_len as i32),
+            tool_calls_success: Some(tool_calls_success),
+            task_completed: Some(false),
+            turn_latency_ms: Some(turn_start.elapsed().as_millis() as i64),
+            error_type,
+            error_message,
+            ..Default::default()
+        });
+    }
 }

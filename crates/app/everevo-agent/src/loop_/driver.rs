@@ -1,50 +1,85 @@
 //! The ReAct loop driver — `run_loop` plus its near-identical tool-result
 //! deduplication helper.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
-use uuid::Uuid;
 
-use everevo_core::llm::{LlmMessage, LlmProvider, LlmRole, StreamEvent, ToolSchema};
+use everevo_core::llm::{LlmMessage, LlmProvider, LlmRole, ToolSchema};
 use everevo_core::tool::ToolRegistry;
-use everevo_core::types::ToolCall;
 use everevo_core::EverEvoError;
-use everevo_core::{TelemetryEmitContext, TelemetryPipeline};
 
-use super::convergence::{budget_line, convergence_stage, forced_final_prompt, Convergence};
+use super::classify::{classify_tool, ToolKind};
+use super::convergence::{
+    budget_line, convergence_stage, forced_final_prompt, verified_deadline_prompt,
+    verified_wrapup_prompt, Convergence, POST_VERIFY_STALL_TURNS,
+};
+use super::dedup::deduplicate_tool_results;
 use super::hooks::execute_with_hooks;
-use super::proactivity::{hash_args, hash_str, ProactivityState};
+use super::proactivity::hash_args;
 use super::retrospective::{build_retrospective, truncate_for_retro};
+use super::state::{is_terminal, transition, LoopEvent, LoopState};
 use super::trim;
 use super::AgentEvent;
 
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+use crate::stages::{classify, Difficulty};
+
+/// Re-prompt injected when a HARD question tries to commit without any
+/// verification having run. The loop enforces this (research: verification
+/// concentrates its value on hard questions — Leni arXiv 2607.17044).
+const VERIFY_BEFORE_COMMIT_PROMPT: &str = "\
+You are about to commit a final answer to a COMPLEX question, but no \
+verification has been run yet. Before you emit `Final answer:`, you MUST run \
+a verification step:
+1. Run `python verify_candidate.py verify --answer <candidate> --expected \
+<derived value>` (with --unit/--compute/--expect-list/--entity as \
+applicable). If it reports violations, repair the candidate (at most 2 \
+repairs). If it passes, you may commit.
+2. If the deterministic check still disagrees, run `cluster verify` with \
+skeptical reviewer perspectives (e.g. \"numeric reviewer\", \
+\"source-verbatim reviewer\") on the candidate, and commit only if it \
+survives.
+Do not emit `Final answer:` until at least one verification step has run.";
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    // `state` is recorded at every decision point for traceability; terminal
+    // transitions return immediately and the loop top re-enters Observe, so
+    // several assignments are never read by the compiler. That is by design.
+    unused_assignments
+)]
 pub(crate) async fn run_loop(
     llm: &dyn LlmProvider,
     tools: &ToolRegistry,
     tool_schemas: &[ToolSchema],
     messages: &mut Vec<LlmMessage>,
-    max_turns: usize,
-    wall_clock_deadline: Option<std::time::Instant>,
-    max_tool_result_chars: usize,
-    max_context_chars: usize,
-    confirmation: Option<&(dyn Fn(&str, &serde_json::Value) -> bool + Send + Sync)>,
-    telemetry: Option<&Arc<TelemetryPipeline>>,
-    trace_id: Option<Uuid>,
-    mut subagent_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
-    pending_subagents: &std::sync::atomic::AtomicUsize,
+    config: super::config::RunConfig,
     tx: &mpsc::Sender<AgentEvent>,
-    cancel: Option<&tokio_util::sync::CancellationToken>,
-    compact_focus: &Option<Arc<std::sync::Mutex<Option<String>>>>,
-    proactivity: &Option<Arc<std::sync::Mutex<ProactivityState>>>,
-    meta_agent_state: &Option<Arc<std::sync::Mutex<crate::memory::meta_agent::MetaAgentState>>>,
-    hook_feedback_slot: &Option<Arc<std::sync::Mutex<Option<String>>>>,
-    compact_llm: Option<&dyn LlmProvider>,
-    background: Option<&Arc<crate::context::BackgroundMaintenance>>,
-    tool_cache_dir: Option<&Path>,
 ) -> Result<(), EverEvoError> {
+    // Destructure the owned config into the same-named locals the loop body
+    // already references — the body is unchanged; entry points now configure
+    // once via RunConfig instead of re-assembling ~20 positional params
+    // (unified-entry refactor, architecture-restructure-plan.md P0).
+    let max_turns = config.max_turns;
+    let wall_clock_deadline = config.wall_clock_deadline;
+    let max_tool_result_chars = config.max_tool_result_chars;
+    let max_context_chars = config.max_context_chars;
+    let confirmation = config.confirmation.as_deref();
+    let telemetry = config.telemetry.as_ref();
+    let trace_id = config.trace_id;
+    let mut subagent_rx = config.subagent_rx;
+    let pending_subagents = &config.pending_subagents;
+    let cancel = config.cancel.as_ref();
+    let compact_focus = &config.compact_focus;
+    let proactivity = &config.proactivity;
+    let meta_agent_state = &config.meta_agent_state;
+    let hook_feedback_slot = &config.hook_feedback_slot;
+    let compact_llm = config.compact_llm.as_deref();
+    let background = config.background.as_ref();
+    let tool_cache_dir = config.tool_cache_dir.as_deref();
+    let verify_gate = config.verify_gate;
+
     let mut turn = 0;
     // Bound the native-server-search truncation-continue retries across turns.
     let mut truncation_continues = 0;
@@ -55,8 +90,62 @@ pub(crate) async fn run_loop(
     let mut total_tool_success = 0i32;
     let mut failure_messages: Vec<String> = Vec::new();
 
-    while max_turns == 0 || turn < max_turns {
+    // ── Adaptive verification: per-question difficulty + enforcement ──
+    // Classified ONCE from the current request's message (the last user
+    // message of the freshly-assembled context — before any tool results are
+    // appended). Simple questions skip the verification commit gate entirely;
+    // hard questions must run a verification step before committing.
+    let difficulty = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == LlmRole::User)
+        .map(|m| classify(&m.content))
+        .unwrap_or(Difficulty::Hard);
+    // A question already carries a verification step (e.g. a resumed
+    // auto-continue run) if any past assistant tool call was a verifier.
+    let mut verified = messages.iter().any(|m| match &m.tool_calls {
+        Some(calls) => calls
+            .iter()
+            .any(|tc| classify_tool(&tc.name, &tc.arguments) == ToolKind::Verifier),
+        None => false,
+    });
+    // Whether the agent finalized a structural problem model (causal draft) on
+    // a hard question — informational for the commit-gate re-prompt.
+    let mut model_drafted = messages.iter().any(|m| match &m.tool_calls {
+        Some(calls) => calls
+            .iter()
+            .any(|tc| classify_tool(&tc.name, &tc.arguments) == ToolKind::ProblemModelFinalize),
+        None => false,
+    });
+    let mut verify_reprompts = 0u32;
+    // Turns spent on NON-verification tool calls after a verification step ran.
+    // Tracks the "verified candidate exists but the agent keeps exploring"
+    // stall (the dominant GAIA timeout mode) so the runtime can nudge a commit.
+    let mut post_verify_turns = 0usize;
+    let mut post_verify_nudged = false;
+
+    // ── Explicit loop state machine (see loop_/state.rs + agent-states.md) ──
+    let mut state = LoopState::Init;
+    state = transition(state, LoopEvent::Ready).0; // T1 Init → Observe
+
+    while !is_terminal(state) && (max_turns == 0 || turn < max_turns) {
         turn += 1;
+
+        // T16 cancellation check (gap fix): a cancel between turns must stop
+        // the loop rather than waiting for the next in-flight LLM/tool call
+        // to notice. Previously only run_subagent checked between calls.
+        if cancel.is_some_and(|c| c.is_cancelled()) {
+            state = transition(state, LoopEvent::Cancel).0;
+            let _ = tx
+                .send(AgentEvent::Error {
+                    message: "Cancelled".into(),
+                })
+                .await;
+            return Ok(());
+        }
+        // Each loop iteration re-enters the Observe state (T10/T11/T12 feed
+        // back here from Act / Verify / normal continuation).
+        state = LoopState::Observe;
 
         // ── Notify hooks of new turn (resets per-turn state) ──────
         for hook in &tools.hooks {
@@ -121,133 +210,49 @@ pub(crate) async fn run_loop(
 
         tracing::info!(turn, msg_count = messages.len(), "Agent turn start");
 
-        // ── 1. Call LLM with context overflow recovery ─────────────
-        // Claude Code error recovery waterfall:
-        //   1. Force emergency compaction → retry
-        //   2. Force aggressive trim → retry
-        //   3. Give up → propagate error to user
-        let token_rx = match llm
-            .stream_chat(messages, tool_schemas, cancel.cloned())
-            .await
+        // ── 1. Call LLM with context overflow recovery (llm_call.rs) ──
+        state = transition(state, LoopEvent::Ready).0; // T2 Observe → Solve
+        let token_rx = match super::llm_call::call_llm_with_overflow_recovery(
+            llm,
+            messages,
+            tool_schemas,
+            cancel,
+            max_context_chars,
+        )
+        .await
         {
             Ok(rx) => rx,
-            Err(e) => {
-                let err_str = e.to_string();
-                let is_overflow = err_str.contains("context_length_exceeded")
-                    || err_str.contains("prompt too long")
-                    || err_str.contains("413")
-                    || err_str.contains("too many tokens")
-                    || err_str.contains("maximum context length");
-
-                if is_overflow {
-                    tracing::warn!(
-                        error = %err_str,
-                        msg_count = messages.len(),
-                        "Context overflow detected — attempting emergency compaction"
-                    );
-                    // Waterfall step 1: aggressive trim (no API call needed)
-                    let before = messages.len();
-                    trim::trim_context(messages, max_context_chars / 2); // halve the budget
-                    let after = messages.len();
-                    tracing::info!(before, after, trimmed = before - after, "Emergency trim");
-
-                    // Retry
-                    llm.stream_chat(messages, tool_schemas, cancel.cloned())
-                        .await
-                        .map_err(|e2| {
-                            let e2_str = e2.to_string();
-                            tracing::error!(error = %e2_str, "Context overflow persists after emergency trim");
-                            EverEvoError::Agent(format!(
-                                "Context is too long even after emergency compaction. \
-                                 Try using /compact or starting a new session. Detail: {e2_str}"
-                            ))
-                        })?
-                } else {
-                    return Err(e);
-                }
+            Err(le) => {
+                state = transition(
+                    state,
+                    if le.overflow {
+                        LoopEvent::Overflow // T4 → Error
+                    } else {
+                        LoopEvent::StreamFailure // T3 → Error
+                    },
+                )
+                .0;
+                return Err(le.error);
             }
         };
 
-        let mut current_text = String::new();
-        let mut current_thinking = String::new();
-        let mut tool_calls: Vec<ToolCall> = Vec::new();
-        let mut pending_tool: Option<(String, String, String)> = None;
-        let mut saw_server_tool = false;
-        let mut last_stop_reason: Option<String> = None;
-
         let mut token_rx = token_rx;
-        loop {
-            // Stall guard — mirror the sub-agent loop's 120s per-event timeout so
-            // a hung LLM stream can't block the main loop indefinitely.
-            let event =
-                tokio::time::timeout(std::time::Duration::from_secs(120), token_rx.recv()).await;
-            let event = match event {
-                Ok(Some(e)) => e,
-                Ok(None) => break, // channel closed
-                Err(_elapsed) => {
-                    let msg = "LLM stream stalled (no events for 120s)".to_string();
-                    let _ = tx
-                        .send(AgentEvent::Error {
-                            message: msg.clone(),
-                        })
-                        .await;
-                    return Err(EverEvoError::Agent(msg));
-                }
-            };
-            match event {
-                StreamEvent::Thinking(t) => {
-                    current_thinking.push_str(&t);
-                    let _ = tx.send(AgentEvent::Thinking(t)).await;
-                }
-                StreamEvent::Text(t) => {
-                    current_text.push_str(&t);
-                    let _ = tx.send(AgentEvent::TextDelta(t)).await;
-                }
-                StreamEvent::ToolCallStart { id, name } => {
-                    pending_tool = Some((id, name, String::new()));
-                }
-                StreamEvent::ToolCallArg { id, arg_delta } => {
-                    if let Some((ref pending_id, _, ref mut args)) = pending_tool {
-                        if pending_id == &id {
-                            args.push_str(&arg_delta);
-                        }
-                    }
-                }
-                StreamEvent::ServerToolUse { .. } => {
-                    // Provider-executed tool (native web search) — the provider
-                    // runs it within this turn; nothing to dispatch.
-                    saw_server_tool = true;
-                }
-                StreamEvent::Done { stop_reason, .. } => {
-                    last_stop_reason = stop_reason;
-                    if let Some((id, name, args_str)) = pending_tool.take() {
-                        let arguments: serde_json::Value =
-                            serde_json::from_str(&args_str).unwrap_or(serde_json::Value::Null);
-                        let _ = tx
-                            .send(AgentEvent::ToolCallStart {
-                                id: id.clone(),
-                                name: name.clone(),
-                                arguments: arguments.clone(),
-                            })
-                            .await;
-                        tool_calls.push(ToolCall {
-                            id,
-                            name,
-                            arguments,
-                        });
-                    }
-                    break;
-                }
-                StreamEvent::Error(msg) => {
-                    let _ = tx
-                        .send(AgentEvent::Error {
-                            message: msg.clone(),
-                        })
-                        .await;
-                    return Err(EverEvoError::LlmProvider(msg));
-                }
+        // ── 2. Drain the token stream (token_stream.rs) ──
+        let stream_accum = match super::token_stream::process_token_stream(&mut token_rx, tx).await
+        {
+            Ok(accum) => accum,
+            Err(e) => {
+                state = transition(state, LoopEvent::StreamFailure).0; // T3 → Error
+                return Err(e);
             }
-        }
+        };
+        let super::token_stream::StreamAccum {
+            current_text,
+            current_thinking,
+            tool_calls,
+            saw_server_tool,
+            last_stop_reason,
+        } = stream_accum;
 
         // Native server-side search truncated (stop_reason=max_tokens): continue
         // the turn with the partial context instead of emitting a premature Done.
@@ -276,6 +281,7 @@ pub(crate) async fn run_loop(
                 truncation_continues,
                 "Native server-side search truncated (max_tokens) — continuing turn"
             );
+            state = transition(state, LoopEvent::Truncated).0; // T19 Solve self-loop
             continue;
         }
 
@@ -288,6 +294,7 @@ pub(crate) async fn run_loop(
                         messages.push(LlmMessage::user(format!("[SubAgent Result]\n{result}")));
                     }
                 }
+                state = transition(state, LoopEvent::SubAgentsPending).0; // T6 → WaitSubAgents
                 tracing::info!(pending, "LLM says Done but sub-agents running — yielding");
                 if !current_text.is_empty() {
                     let _ = tx.send(AgentEvent::TextDelta(current_text.clone())).await;
@@ -307,6 +314,7 @@ pub(crate) async fn run_loop(
             // empty answer, and the model's own reasoning is preserved as the
             // seed. No sub-agent yield, no early return with empty text.
             if current_text.is_empty() && !current_thinking.is_empty() {
+                state = transition(state, LoopEvent::ThinkingOnly).0; // T7 → Converge
                 tracing::warn!(
                     turn,
                     thinking_chars = current_thinking.len(),
@@ -334,12 +342,53 @@ pub(crate) async fn run_loop(
                     total_tool_success,
                     &failure_messages,
                 );
+                state = transition(state, LoopEvent::Ready).0; // T14 Converge → Done
                 let _ = tx.send(AgentEvent::Retrospective { summary }).await;
                 let _ = tx.send(AgentEvent::Done { final_text }).await;
                 return Ok(());
             }
 
+            // ── Verification commit gate (hard questions only) ──────
+            // If a hard question commits without ANY verification step and
+            // turns/time remain, re-prompt once to force verification. Capped
+            // (2 re-prompts) so a stuck model still commits best-effort
+            // rather than looping forever. Simple questions never gate.
+            if difficulty == Difficulty::Hard && !verified && verify_reprompts < 2 && verify_gate {
+                let budget_ok = match wall_clock_deadline {
+                    Some(deadline) => {
+                        deadline
+                            .saturating_duration_since(std::time::Instant::now())
+                            .as_secs()
+                            > 30
+                    }
+                    None => turn < max_turns.saturating_sub(1),
+                };
+                if budget_ok {
+                    verify_reprompts += 1;
+                    state = transition(state, LoopEvent::UnverifiedHard).0; // T8 → Verify
+                    tracing::info!(
+                        turn,
+                        reprompt = verify_reprompts,
+                        model_drafted,
+                        "Hard question committed unverified — re-prompting for verification"
+                    );
+                    messages.push(LlmMessage::user(VERIFY_BEFORE_COMMIT_PROMPT));
+                    // If the agent never built a structural problem model either,
+                    // suggest it for complex/compound questions (informational —
+                    // modeling is encouraged, not enforced).
+                    if !model_drafted {
+                        messages.push(LlmMessage::user(
+                            "For a COMPLEX question, consider building a structural problem \
+                             model first via `problem_model` (sub-questions + epistemic \
+                             status + causal/evidence edges), then answer from it.",
+                        ));
+                    }
+                    continue;
+                }
+            }
+
             // No pending sub-agents → truly done.
+            state = transition(state, LoopEvent::DoneSignal).0; // T9 → Done
             let final_text = current_text.clone();
             let summary = build_retrospective(
                 turn as i32,
@@ -353,6 +402,7 @@ pub(crate) async fn run_loop(
         }
 
         // ── 2. Build assistant message with tool calls ──────────────
+        state = transition(state, LoopEvent::ToolCalls).0; // T5 Solve → Act
         let thinking = if current_thinking.is_empty() {
             None
         } else {
@@ -376,8 +426,19 @@ pub(crate) async fn run_loop(
         let mut tool_result_pairs: Vec<(String, String, Vec<everevo_core::ImageData>)> = Vec::new();
         let mut tool_calls_success = 0i32;
 
+        let mut turn_had_verify = false;
         for tc in &tool_calls {
             total_tool_calls += 1;
+            // Any verification step (deterministic sandbox verifier or
+            // adversarial cluster verify) satisfies the hard-question gate.
+            if classify_tool(&tc.name, &tc.arguments) == ToolKind::Verifier {
+                verified = true;
+                turn_had_verify = true;
+            }
+            // A finalized problem model (causal draft) is a modeling signal.
+            if classify_tool(&tc.name, &tc.arguments) == ToolKind::ProblemModelFinalize {
+                model_drafted = true;
+            }
             let tool = tools.get(&tc.name);
             if let Some(confirm_fn) = confirmation {
                 if !confirm_fn(&tc.name, &tc.arguments) {
@@ -398,31 +459,37 @@ pub(crate) async fn run_loop(
 
             let result = match tool {
                 Some(tool) => {
-                    // Per-tool timeout: 300s for shell/build, 120s default.
-                    // Prevents hung tools from blocking the agent loop indefinitely.
-                    let timeout_secs = if tc.name == "shell" || tc.name.contains("build") {
-                        300u64
-                    } else {
-                        120u64
-                    };
                     let exec_fut = execute_with_hooks(
                         tool.as_ref(),
                         &tc.name,
                         &tc.arguments,
-                        None,
+                        cancel,
                         &tools.hooks,
                     );
-                    let result = match tokio::time::timeout(
-                        std::time::Duration::from_secs(timeout_secs),
-                        exec_fut,
-                    )
-                    .await
-                    {
-                        Ok(r) => r,
-                        Err(_elapsed) => Err(EverEvoError::Tool {
-                            tool: tc.name.clone(),
-                            message: format!("Timed out after {timeout_secs}s"),
-                        }),
+                    // ask_user is exempt from the per-tool timeout: it blocks
+                    // until the user replies (Claude Code style) and is only
+                    // terminated by a reply, SSE disconnect, or /interrupt.
+                    // Everything else: 300s for shell/build, 120s default.
+                    let result = if tc.name == "ask_user" {
+                        exec_fut.await
+                    } else {
+                        let timeout_secs = if tc.name == "shell" || tc.name.contains("build") {
+                            300u64
+                        } else {
+                            120u64
+                        };
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(timeout_secs),
+                            exec_fut,
+                        )
+                        .await
+                        {
+                            Ok(r) => r,
+                            Err(_elapsed) => Err(EverEvoError::Tool {
+                                tool: tc.name.clone(),
+                                message: format!("Timed out after {timeout_secs}s"),
+                            }),
+                        }
                     };
                     // Report hook blocks via SSE
                     if let Err(ref e) = result {
@@ -447,10 +514,20 @@ pub(crate) async fn run_loop(
                     }
                     result
                 }
-                None => Err(EverEvoError::Tool {
-                    tool: tc.name.to_string(),
-                    message: "Unknown tool".into(),
-                }),
+                None => {
+                    // Helpful, recoverable error: list available tools so the
+                    // agent can pick a valid one instead of repeating the call.
+                    let mut available = tools.names();
+                    available.sort_unstable();
+                    Err(EverEvoError::Tool {
+                        tool: tc.name.to_string(),
+                        message: format!(
+                            "Unknown tool `{}`. Available: {}",
+                            tc.name,
+                            available.join(", ")
+                        ),
+                    })
+                }
             };
 
             match result {
@@ -521,6 +598,15 @@ pub(crate) async fn run_loop(
                     tool_result_pairs.push((tc.id.clone(), err_msg, Vec::new()));
                 }
             }
+        }
+
+        // ── 3.25 Post-verified stall counter ───────────────────────
+        // A verification step already ran and this turn's tool calls were NOT
+        // another verification → the agent may be re-exploring after owning a
+        // verified candidate. Count it so the convergence region can nudge a
+        // commit (anti-verification-spiral; see POST_VERIFY_STALL_TURNS).
+        if verified && !tool_calls.is_empty() && !turn_had_verify {
+            post_verify_turns += 1;
         }
 
         // ── 3.5 Deduplicate near-identical tool results ─────────────
@@ -628,7 +714,9 @@ pub(crate) async fn run_loop(
                     ps.level as u32
                 })
                 .unwrap_or(0);
-            if ms.should_trigger(escalation) && ms.has_llm() {
+            // Adaptive: only trigger the autonomous meta-diagnosis on hard
+            // questions — simple sessions pay no self-diagnosis overhead.
+            if difficulty == Difficulty::Hard && ms.should_trigger(escalation) && ms.has_llm() {
                 ms.mark_triggered();
                 // Fire-and-forget: spawn meta-diagnosis in background
                 if let Some(ref llm) = ms.llm {
@@ -674,60 +762,78 @@ pub(crate) async fn run_loop(
             }
         }
 
-        // ── 5. Emit turn complete ───────────────────────────────────
-        let _ = tx.send(AgentEvent::TurnComplete).await;
-
-        if let Some(telemetry) = telemetry {
-            let turn_error = (tool_calls_success as usize) < tool_calls.len();
-            let (error_type, error_message) = if turn_error {
-                let failed = tool_calls.len() as i32 - tool_calls_success;
-                (
-                    Some("tool_error".to_string()),
-                    Some(format!(
-                        "{failed} of {} tool calls failed",
-                        tool_calls.len()
-                    )),
-                )
-            } else {
-                (None, None)
-            };
-            telemetry.emit(&TelemetryEmitContext {
-                trace_id,
-                turn_number: Some(turn as i32),
-                tool_calls_total: Some(tool_calls.len() as i32),
-                tool_calls_success: Some(tool_calls_success),
-                task_completed: Some(false),
-                turn_latency_ms: Some(turn_start.elapsed().as_millis() as i64),
-                error_type,
-                error_message,
-                ..Default::default()
-            });
-        }
+        // ── 5. Emit turn complete (retrospective.rs) ─────────────────
+        super::retrospective::emit_turn_complete(
+            tx,
+            telemetry,
+            trace_id,
+            turn,
+            tool_calls.len(),
+            tool_calls_success,
+            turn_start,
+        )
+        .await;
 
         // ── 6. Check if we should inject a reminder ─────────────────
         if let Some(deadline) = wall_clock_deadline {
             // Benchmark mode: escalating convergence nudges + a per-turn budget
             // line so the model feels both turn and wall-clock pressure.
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let wall_frac = (remaining.as_secs_f64() / 300.0).clamp(0.0, 1.0);
+            // Normalize against the ACTUAL deadline length (mirrors mod.rs's
+            // EVEREVO_BENCHMARK_WALLCLOCK) so the nudges fire proportionally —
+            // a hardcoded /300 makes them relative to only the last 300s and
+            // fires them too early on a long (1800s) run.
+            let wall_total: f64 = std::env::var("EVEREVO_BENCHMARK_WALLCLOCK")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|n| *n > 0.0)
+                .unwrap_or(300.0);
+            let wall_frac = (remaining.as_secs_f64() / wall_total).clamp(0.0, 1.0);
+            // Convergence escalation and the verification spiral are FORMAL FSM
+            // states, routed through transition() so the state machine is the
+            // single source of truth for the agent's behavior (agent-states.md
+            // T21-T26). Verified-aware prompts name the value the model already
+            // owns instead of generic wall-clock pressure.
+            let verified_aware = post_verify_turns > 0;
             match convergence_stage(turn, max_turns, wall_frac) {
                 Convergence::Commit => {
-                    messages.push(LlmMessage::user(
+                    state = transition(state, LoopEvent::BudgetCommit).0; // T25 → Escalating
+                    let prompt = if verified_aware {
+                        verified_deadline_prompt().to_string()
+                    } else {
                         "⏰ Deadline: STOP exploring. Do NOT start new research, do NOT write \
                          plans or code. Your very next response MUST end with a single \
                          `Final answer:` line containing ONLY the value — best-effort beats \
                          no answer, and an uncertain value extracted from what you already \
-                         found beats narration.",
-                    ));
+                         found beats narration."
+                            .to_string()
+                    };
+                    messages.push(LlmMessage::user(prompt));
                 }
                 Convergence::Converge => {
-                    messages.push(LlmMessage::user(
-                        "⏰ Time check: start converging. Commit to the answer you believe \
-                         best from what you already gathered, stop new exploration, and \
-                         prepare a single `Final answer:` line.",
-                    ));
+                    state = transition(state, LoopEvent::BudgetConverge).0; // T23 → Escalating
+                    let prompt = if verified_aware {
+                        verified_wrapup_prompt(post_verify_turns)
+                    } else {
+                        "⏰ Time check: CONVERGE NOW. After at most 2 more tool calls, you MUST \
+                         stop exploring and commit the single best value you have on a \
+                         `Final answer:` line. Do not start new research threads; if a \
+                         candidate is close, verify or commit it — an uncertain verified \
+                         value beats an empty timeout."
+                            .to_string()
+                    };
+                    messages.push(LlmMessage::user(prompt));
                 }
-                Convergence::None => {}
+                Convergence::None => {
+                    // No wall-clock escalation yet → proactive anti-verification-spiral
+                    // nudge (once, T21 → Stalled): a verified candidate exists but the
+                    // agent keeps making non-verification tool calls.
+                    if !post_verify_nudged && post_verify_turns >= POST_VERIFY_STALL_TURNS {
+                        state = transition(state, LoopEvent::VerifiedStalled).0; // T21 → Stalled
+                        post_verify_nudged = true;
+                        messages.push(LlmMessage::user(verified_wrapup_prompt(post_verify_turns)));
+                    }
+                }
             }
             let turns_left = if max_turns > 0 {
                 Some(max_turns.saturating_sub(turn))
@@ -738,6 +844,16 @@ pub(crate) async fn run_loop(
                 turns_left,
                 Some(remaining.as_secs()),
             )));
+            // Wall-clock nearly exhausted — the harness kills the request at
+            // ~300s, so break out and let the forced terminal commit below run
+            // a no-tool extraction call instead of leaving an empty prediction.
+            // Slow local models (e.g. Qwen3.5-2B) spend 15-25s per turn, never
+            // reach max_turns within the deadline, and ignore the convergence
+            // nudges above — this is the only path that guarantees a value.
+            if max_turns > 0 && remaining.as_secs() <= 30 {
+                state = transition(state, LoopEvent::WallClockLow).0; // T18 → TerminalCommit
+                break;
+            }
         } else if max_turns > 0 && turn >= max_turns - 2 && turn < max_turns {
             messages.push(LlmMessage::user(
                 "You have only a few turns remaining. Please provide your final answer now.",
@@ -747,17 +863,20 @@ pub(crate) async fn run_loop(
 
     if max_turns > 0 {
         if wall_clock_deadline.is_some() {
-            // Benchmark forced terminal commit: one last no-tool LLM call for
-            // ONLY the final answer, seeded from the full conversation (which
-            // holds the model's own prior committed text), then emit Done so the
-            // harness scorer / re-prompt sees a final_text instead of an error.
+            // T18 forced terminal commit: one last no-tool LLM call for ONLY the
+            // final answer, seeded from the full conversation (which holds the
+            // model's own prior committed text), then emit Done so the harness
+            // scorer / re-prompt sees a final_text instead of an error.
+            state = transition(state, LoopEvent::WallClockLow).0; // → TerminalCommit
             messages.push(LlmMessage::user(forced_final_prompt()));
             let final_text = match llm.chat(messages, &[]).await {
                 Ok(resp) => resp.content.unwrap_or_default(),
                 Err(_) => String::new(),
             };
+            state = transition(state, LoopEvent::Ready).0; // TerminalCommit → Done
             let _ = tx.send(AgentEvent::Done { final_text }).await;
         } else {
+            state = transition(state, LoopEvent::TurnsExhausted).0; // T17 → Error
             let _ = tx
                 .send(AgentEvent::Error {
                     message: format!(
@@ -769,49 +888,4 @@ pub(crate) async fn run_loop(
     }
 
     Ok(())
-}
-
-// ── Tool Result Deduplication ──────────────────────────────────────────────
-
-/// When N tool results in the same turn are near-identical (e.g. 3 sub-agents
-/// all reporting the same path inconsistency bug), keep the first 2 and replace
-/// the rest with a collapsed summary. This prevents flooding the LLM context
-/// with duplicate observations that cause repetition loops in the thinking output.
-fn deduplicate_tool_results(results: &mut [(String, String, Vec<everevo_core::ImageData>)]) {
-    if results.len() < 3 {
-        return;
-    }
-
-    // Phase 1: fingerprint each result
-    let fingerprints: Vec<u64> = results
-        .iter()
-        .map(|(_, content, _)| {
-            let prefix: String = content.chars().take(200).collect();
-            hash_str(&prefix)
-        })
-        .collect();
-
-    // Phase 2: find groups with high similarity
-    let mut seen: std::collections::HashMap<u64, Vec<usize>> = std::collections::HashMap::new();
-    for (i, &fp) in fingerprints.iter().enumerate() {
-        seen.entry(fp).or_default().push(i);
-    }
-
-    // Phase 3: collapse groups with >2 members
-    for indices in seen.values() {
-        if indices.len() <= 2 {
-            continue;
-        }
-        let keep_id = results[indices[0]].0.clone();
-        let dup_count = indices.len() - 2;
-        for &idx in &indices[2..] {
-            results[idx] = (
-                results[idx].0.clone(),
-                format!(
-                    "(duplicate of {keep_id} — {dup_count} similar results collapsed to save context)"
-                ),
-                Vec::new(),
-            );
-        }
-    }
 }

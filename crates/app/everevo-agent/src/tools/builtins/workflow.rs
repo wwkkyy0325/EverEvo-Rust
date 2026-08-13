@@ -159,15 +159,17 @@ impl Tool for WorkflowTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _cancel: Option<&CancellationToken>,
+        cancel: Option<&CancellationToken>,
     ) -> Result<ToolOutput, EverEvoError> {
         let tasks: Vec<WorkflowTask> = serde_json::from_value(params["tasks"].clone())
             .map_err(|e| EverEvoError::InvalidInput(format!("Invalid tasks: {e}")))?;
 
         if tasks.is_empty() {
+            // Audit LOW (2026-08-13): an empty/missing `tasks` previously reported
+            // SUCCESS while doing no work — the agent couldn't tell it had a no-op.
             return Ok(ToolOutput {
-                content: "No tasks provided.".into(),
-                is_error: false,
+                content: "No tasks provided — pass a non-empty `tasks` array ".to_string(),
+                is_error: true,
                 ..Default::default()
             });
         }
@@ -209,12 +211,13 @@ impl Tool for WorkflowTool {
                     base_prompt.clone()
                 };
 
-                let cancel = tokio_util::sync::CancellationToken::new();
+                let cancel = cancel.map(|c| c.child_token()).unwrap_or_default();
                 let llm_c = Arc::clone(llm);
                 let tools_c = Arc::clone(tools);
                 let sandbox_c = Arc::clone(sandbox);
 
-                let content = run_workflow_agent(&prompt, llm_c, tools_c, &sandbox_c, cancel).await;
+                let content =
+                    run_workflow_agent_bounded(&prompt, llm_c, tools_c, &sandbox_c, cancel).await;
                 let summary = format!("## {}\n\n{content}", task.description);
                 results.push(summary.clone());
                 self.results
@@ -249,7 +252,10 @@ impl Tool for WorkflowTool {
             let desc = task.description.clone();
             let prompt = task.prompt.clone();
             let started = chrono::Utc::now();
-            let cancel = tokio_util::sync::CancellationToken::new();
+            // Child of the caller's token: session cancellation reaches the task,
+            // and the per-task wall-clock timeout (run_workflow_agent_bounded)
+            // also fires on this same token.
+            let cancel = cancel.map(|c| c.child_token()).unwrap_or_default();
 
             self.statuses
                 .lock()
@@ -291,7 +297,8 @@ impl Tool for WorkflowTool {
 
             tokio::spawn(async move {
                 let _permit = permit; // hold semaphore permit until task completes
-                let content = run_workflow_agent(&prompt, llm_c, tools_c, &sandbox_c, cancel).await;
+                let content =
+                    run_workflow_agent_bounded(&prompt, llm_c, tools_c, &sandbox_c, cancel).await;
                 let summary = format!("## {desc}\n\n{content}");
                 // Feed into subagent_rx so the main loop injects [SubAgent Result]
                 if let Some(ref tx) = result_tx {
@@ -362,4 +369,33 @@ async fn run_workflow_agent(
 
     let agent = crate::AgentLoop::sub_agent(3);
     agent.run_subagent(llm, tools, messages, cancel).await
+}
+
+/// Per-task wall-clock cap for `parallel_agents` (audit LOW, 2026-08-13: tasks
+/// had no timeout, so a hung sub-agent could hold a semaphore permit forever
+/// and stall the whole tool). Mirrors the SubAgentPool default (300s).
+const WORKFLOW_AGENT_TIMEOUT_SECS: u64 = 300;
+
+/// Run one workflow agent task under the caller's cancel token AND a hard
+/// wall-clock timeout; on expiry, cancels the orphaned run and returns a
+/// visible "Timeout" string so the caller's synthesis is honest.
+async fn run_workflow_agent_bounded(
+    prompt: &str,
+    llm: Arc<crate::llm::HttpClient>,
+    tools: Arc<everevo_core::tool::ToolRegistry>,
+    sandbox_root: &std::path::Path,
+    cancel: CancellationToken,
+) -> String {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(WORKFLOW_AGENT_TIMEOUT_SECS),
+        run_workflow_agent(prompt, llm, tools, sandbox_root, cancel.clone()),
+    )
+    .await
+    {
+        Ok(content) => content,
+        Err(_) => {
+            cancel.cancel(); // best-effort stop the orphaned sub-agent
+            format!("Timeout after {WORKFLOW_AGENT_TIMEOUT_SECS}s")
+        }
+    }
 }

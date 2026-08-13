@@ -24,19 +24,19 @@
 //! [7] Latest User Message   ← the new input
 //! ```
 
-mod data;
+mod budget;
 mod stages;
 
-pub use data::{
-    estimate_tokens, ContextBuildContext, ContextFragment, ContextSnapshot, StageSnapshot,
-    CONTEXT_PREVIEW_MAX_CHARS,
+pub use budget::{
+    estimate_tokens, ContextBudget, ContextBuildContext, ContextFragment, ContextSnapshot,
+    StageSnapshot, CONTEXT_PREVIEW_MAX_CHARS, DEFAULT_CONTEXT_WINDOW,
 };
 pub use stages::{
     shell_specific_guide, ConversationHistoryStage, LatestMessageStage, RollingSummaryStage,
     SessionMetadataStage, SystemPromptStage, TaskStateStage,
 };
 
-use self::data::truncate_content;
+use self::budget::truncate_content;
 use crate::llm::LlmMessage;
 
 // ── Context Stage Trait ─────────────────────────────────────────────────
@@ -58,6 +58,17 @@ pub trait ContextStage: Send + Sync {
     /// Return `None` if the stage has nothing to contribute — it is simply
     /// skipped with a debug-level log.
     fn build(&self, ctx: &ContextBuildContext) -> Option<ContextFragment>;
+
+    /// Whether this stage is exposed to the agent via the `pipeline` tool
+    /// (tool-callable pipeline — "选择性复用管线部分"). Default false.
+    fn tool_visible(&self) -> bool {
+        false
+    }
+
+    /// One-line description for the `pipeline` tool's `list_stages`.
+    fn description(&self) -> &str {
+        ""
+    }
 }
 
 // ── Pipeline ────────────────────────────────────────────────────────────
@@ -117,9 +128,23 @@ impl ContextPipeline {
                     total_tokens += tokens;
                     let preview = truncate_content(&combined, CONTEXT_PREVIEW_MAX_CHARS);
 
-                    // Auto-flag: oversized stage (>40% of budget)
+                    // Auto-flag: oversized stage. When a per-model budget is set,
+                    // flag when a stage exceeds its own cap; otherwise fall back
+                    // to the legacy >40% of total-budget heuristic.
                     let budget_pct = (tokens as f64) / (max_budget as f64) * 100.0;
-                    let status = if budget_pct > 40.0 {
+                    let stage_cap = if ctx.budget.window > 0 {
+                        ctx.budget.stage(stage.name())
+                    } else {
+                        0
+                    };
+                    let status = if stage_cap > 0 && tokens > stage_cap {
+                        flags.push(format!(
+                            "Stage '{}' exceeds its budget (~{} tokens, got ~{tokens})",
+                            stage.name(),
+                            stage_cap
+                        ));
+                        "oversized"
+                    } else if budget_pct > 40.0 {
                         flags.push(format!(
                             "Stage '{}' uses {:.0}% of context budget (~{} tokens)",
                             stage.name(),
@@ -200,6 +225,9 @@ impl ContextPipeline {
             stages,
             total_estimated_tokens: total_tokens,
             max_context_tokens: max_budget,
+            available_tokens: ctx.budget.available,
+            safety_reserved: ctx.budget.safety_margin,
+            output_reserved: ctx.budget.output_reserve,
             budget_used_pct,
             flags,
         };
@@ -294,9 +322,12 @@ spans conversations.\n\
 - **Anti-fixation**: If the same command fails repeatedly, pause and diagnose the \
 root cause (`which`, `echo $VAR`, read the error), web_search the error, and \
 switch approach (SSH→HTTPS, different library). Retrying with minor tweaks \
-rarely helps — when a loop forms, stop and reconsider instead.\n\
-- **\"我做了X\" = report, not request**: User stating completion → VERIFY, don't redo.\n\
-- **\"继续\" = resume oldest PENDING TodoWrite task**, not most recent topic.\n\
+rarely helps — when a loop forms, stop and reconsider instead.\
+- **Vision / tool failure (image questions)**: if `describe_image` fails or \
+times out twice, do NOT enter manual pixel/ASCII forensics — use the offline \
+script (chess_fen.py / fractions_ocr.py) when one applies, otherwise commit a \
+best-effort reading and mark it [UNVERIFIED]. A best-effort value beats an \
+empty timeout.\n\
 - **SSH→HTTPS**: Use `git clone https://...` and `gh` CLI. Never `git@github.com:`.\n\
 - **Git auth**: Uses your global git config and SSH/HTTPS settings. \
   `gh` CLI uses stored OAuth. No extra credential setup needed.\n\
@@ -306,8 +337,12 @@ rarely helps — when a loop forms, stop and reconsider instead.\n\
 Better than looping.\n\
 - **Authoritative verification**: Time-sensitive or factual claims (dates, versions, \
 APIs, current events, commands) — verify against authoritative web sources \
-(`web_search`/`web_fetch`) before claiming done. Don't rely on memory or assumptions.\n\
-- Verify before claiming done. Fix code, never weaken tests. Match existing style.";
+(`web_search`/`web_fetch`) before claiming done. Don't rely on memory or assumptions.";
+
+// NOTE: the "我做了X = report not request" and "继续 = resume oldest PENDING"
+// rules, and the verify-before-commit / never-weaken-tests / match-existing-
+// style rules, live in ONE layer each (TaskStateStage / BestPracticesStage)
+// to avoid the drift-bomb anti-pattern (one convention per layer).
 
 // ── Tests ─────────────────────────────────────────────────────────────────
 

@@ -29,6 +29,19 @@ use everevo_core::context::{ContextBuildContext, ContextFragment, ContextStage};
 use everevo_core::llm::{LlmMessage, LlmProvider};
 use serde::{Deserialize, Serialize};
 
+use super::verification::gate::clamp_content_by_tokens;
+
+/// Hard ceiling for the rendered character block, in tokens (audit MEDIUM,
+/// 2026-08-13: `voice_samples` + `sources/*.md` were injected verbatim with no
+/// cap — a large imported corpus could starve every context assembly).
+///
+/// Structured fields (traits / tone / values / style) render FIRST and the
+/// default profile is well under 300 tokens, so 4096 is generous for real
+/// characters while bounding worst-case growth. The clamp is prefix-preserving:
+/// truncation cuts the tail of the free-form sample corpus, not the voice
+/// guidance.
+const CHARACTER_BLOCK_MAX_TOKENS: usize = 4_096;
+
 // ── Agent Character Profile ──────────────────────────────────────────────
 
 /// The agent's own character / speaking style. Loaded from
@@ -239,7 +252,12 @@ pub fn build_character_block(profile_path: &Path) -> Option<String> {
         .parent()
         .map(|p| load_sources(&p.join("sources")))
         .unwrap_or_default();
-    Some(render_character(&profile, &sources))
+    let mut block = render_character(&profile, &sources);
+    // Bound the free-form verbatim corpus (`voice_samples` + sources/). The
+    // prefix-preserving clamp keeps the structured voice guidance and drops the
+    // tail of any oversized imported corpus.
+    clamp_content_by_tokens(&mut block, CHARACTER_BLOCK_MAX_TOKENS);
+    Some(block)
 }
 
 // ── LLM Distillation ──────────────────────────────────────────────────────
@@ -538,6 +556,32 @@ mod tests {
         assert!(block.starts_with("## Character & Voice"));
         assert!(block.contains("EverEvo"));
         assert!(path.exists());
+    }
+
+    #[test]
+    fn test_build_character_block_caps_oversized_sources() {
+        // Audit MEDIUM (2026-08-13): free-form sources were injected verbatim.
+        // A huge corpus must be truncated to CHARACTER_BLOCK_MAX_TOKENS while
+        // the structured voice guidance (rendered first) is preserved.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("character.json");
+        std::fs::write(
+            &path,
+            r#"{"name":"Evo","identity":"a bot","traits":["terse"],"tone":"dry","style_guidelines":["Be brief."],"values":["brevity"],"voice_samples":""}"#,
+        )
+        .unwrap();
+        let sources = dir.path().join("sources");
+        std::fs::create_dir_all(&sources).unwrap();
+        // ~50k chars of corpus — far over the 4096-token cap.
+        std::fs::write(sources.join("big.md"), "fragment-body\n".repeat(4_000)).unwrap();
+
+        let block = build_character_block(&path).unwrap();
+        assert!(block.contains("**Traits:** terse")); // structured guidance kept
+        assert!(block.contains("truncated to fit context budget"));
+        // ~68k chars of raw corpus → clamped well below it (the clamp's
+        // truncation marker may add a few tokens past the cap, so assert a
+        // generous behavioral bound rather than exact token math).
+        assert!(block.chars().count() < 20_000);
     }
 
     #[test]

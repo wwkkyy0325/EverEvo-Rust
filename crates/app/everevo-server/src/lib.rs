@@ -15,7 +15,8 @@ pub mod main_impl;
 pub mod middleware;
 pub mod orchestration;
 pub mod routes;
-pub mod sandbox_tool;
+pub mod session_content;
+pub mod session_store;
 pub mod startup_check;
 
 use std::sync::Arc;

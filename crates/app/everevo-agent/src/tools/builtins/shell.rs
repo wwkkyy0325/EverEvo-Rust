@@ -40,7 +40,8 @@ impl Tool for ShellTool {
             "properties": {
                 "command": { "type": "string", "description": "The shell command to execute" },
                 "timeout_secs": { "type": "integer", "description": "Timeout in seconds (default: 30, max: 300)", "default": 30 },
-                "working_dir": { "type": "string", "description": "Working directory (default: sandbox temp dir)" }
+                "working_dir": { "type": "string", "description": "Working directory (default: sandbox temp dir)" },
+                "confirmed": { "type": "boolean", "description": "Set to true ONLY after the user has explicitly approved this exact command (e.g. a destructive git op or a ConfirmRequired gate). Bypasses the confirmation gate; the sandbox then executes without pausing." }
             },
             "required": ["command"]
         })
@@ -68,16 +69,29 @@ impl Tool for ShellTool {
             .as_str()
             .ok_or_else(|| EverEvoError::InvalidInput("command is required".into()))?;
 
-        let mut timeout_secs = params["timeout_secs"].as_u64().unwrap_or(30).min(300);
+        // Audit LOW (2026-08-13): `.min(300)` only capped the upper bound — a
+        // `timeout_secs: 0` passed through, the sandbox fired a zero-duration
+        // timeout that killed the child on first poll ("Timeout after 0s"), and
+        // the one-shot compute retry (0*3) also died instantly. Floor at 1s.
+        let mut timeout_secs = params["timeout_secs"].as_u64().unwrap_or(30).clamp(1, 300);
         let working_dir = params["working_dir"].as_str().map(std::path::PathBuf::from);
+        // Audit MEDIUM (2026-08-13): the gate text promised `confirmed: true`
+        // but the parameter was never read — a re-invoke after user approval hit
+        // the same gate forever (dead-end). Read it and plumb it into the
+        // ExecutionConfig the sandbox already understands.
+        let confirmed = params["confirmed"].as_bool().unwrap_or(false);
 
-        let mut config = ExecutionConfig::new(command).with_timeout(timeout_secs);
+        let mut config = ExecutionConfig::new(command)
+            .with_timeout(timeout_secs)
+            .with_confirmed(confirmed);
         if let Some(dir) = working_dir {
             config = config.with_working_dir(dir);
         }
 
         // ── Git commit/push guard: always confirm destructive git operations ──
-        if is_git_destructive(command) {
+        // Bypassed only when the user has explicitly approved this exact command
+        // (`confirmed: true` on the re-invoke after the confirmation prompt).
+        if !confirmed && is_git_destructive(command) {
             return Ok(ToolOutput {
                 content: format!(
                     "⚠️ 此 Git 操作需要你的确认。\n\n命令: {command}\n\
@@ -228,11 +242,69 @@ fn is_git_destructive(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Records whether `execute` was reached.
+    #[derive(Default)]
+    struct CountingSandbox {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl SandboxProvider for CountingSandbox {
+        async fn execute(
+            &self,
+            _config: &ExecutionConfig,
+        ) -> Result<everevo_core::sandbox::ExecutionResult, EverEvoError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(everevo_core::sandbox::ExecutionResult {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+                duration_ms: 0,
+                killed_by_timeout: false,
+                needs_confirmation: false,
+                confirmation_reason: String::new(),
+            })
+        }
+    }
 
     #[test]
     fn test_git_commit_flagged() {
         assert!(is_git_destructive("git commit -m 'test'"));
         assert!(is_git_destructive("git commit --amend"));
+    }
+
+    #[tokio::test]
+    async fn test_destructive_git_requires_confirmed() {
+        // Audit MEDIUM (2026-08-13): the gate promised `confirmed: true` but
+        // never read it — the confirm prompt looped forever. Without the flag
+        // the sandbox must NOT run; with it, the sandbox runs once.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sandbox: Arc<dyn SandboxProvider> = Arc::new(CountingSandbox {
+            calls: Arc::clone(&calls),
+        });
+        let tool = ShellTool::new(sandbox);
+
+        // Without confirmed: git guard fires, sandbox untouched.
+        let r = tool
+            .execute(serde_json::json!({"command": "git push origin main"}), None)
+            .await
+            .unwrap();
+        assert!(r.content.contains("Git 操作需要你的确认"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // With confirmed:true the guard is bypassed and the sandbox runs.
+        let r = tool
+            .execute(
+                serde_json::json!({"command": "git push origin main", "confirmed": true}),
+                None,
+            )
+            .await
+            .unwrap();
+        // Not the confirmation gate — the sandbox returned an empty result.
+        assert!(!r.content.contains("需要你的确认"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -282,8 +282,14 @@ fn truncate_signature(sig: &str, max_chars: usize) -> String {
     if sig.len() <= max_chars {
         return sig.to_string();
     }
-    // Try to break at a natural boundary: `{`, `;`, `,`, or space
-    let slice = &sig[..max_chars];
+    // Try to break at a natural boundary: `{`, `;`, `,`, or space.
+    // Walk back to a char boundary first — `&sig[..max_chars]` panics when a
+    // multi-byte UTF-8 char straddles the byte index (server-crash risk).
+    let mut end = max_chars;
+    while end > 0 && !sig.is_char_boundary(end) {
+        end -= 1;
+    }
+    let slice = &sig[..end];
     for &break_char in &['{', ';', ',', ' '] {
         if let Some(pos) = slice.rfind(break_char) {
             if pos > max_chars / 2 {

@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use crate::app_state::AppState;
 use everevo_core::ApiError;
+use everevo_db::models::MessageRow;
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -23,6 +24,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/sandbox/sessions/{id}/audit", get(get_audit))
         .route("/api/sandbox/sessions/{id}/permission", put(set_permission))
         .route("/api/sandbox/sessions/{id}/confirm", post(confirm_command))
+        .route("/api/sessions/{id}/ask", post(answer_ask))
         .route("/api/sandbox/dreaming", get(dreaming_status))
         .route("/api/sandbox/dreaming/trigger", post(dreaming_trigger))
         .route("/api/agent/tasks", get(list_subagent_tasks))
@@ -49,6 +51,11 @@ struct PermissionRequest {
 #[derive(Deserialize)]
 struct ConfirmRequest {
     approved: bool,
+}
+
+#[derive(Deserialize)]
+struct AskRequest {
+    reply: String,
 }
 
 async fn status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -195,6 +202,16 @@ async fn set_permission(
                         "Auto-approved pending confirmation on FullyAuto switch"
                     );
                 }
+                // Also unblock any pending ask_user question so the agent
+                // doesn't deadlock waiting for a reply that will never come.
+                let pending_ask = state.ask_user.write().await.remove(&session_id);
+                if let Some(p) = pending_ask {
+                    let _ = p.reply_tx.send(
+                        "User switched to fully-auto mode. Use best judgment and proceed."
+                            .to_string(),
+                    );
+                    tracing::info!(%session_id, "Auto-resolved pending ask on FullyAuto switch");
+                }
             }
 
             Ok(Json(serde_json::json!({
@@ -250,6 +267,54 @@ async fn confirm_command(
         None => Err(ApiError::not_found(
             "No pending confirmation for this session",
         )),
+    }
+}
+
+/// Resolve a pending ask_user question — called when the user submits a reply
+/// in the frontend ask dialog.
+///
+/// This fires the oneshot sender that the blocked AskUserTool is awaiting,
+/// unblocking the agent loop with the user's free-text answer.
+async fn answer_ask(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<Uuid>,
+    Json(body): Json<AskRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let reply = body.reply.trim().to_string();
+    if reply.is_empty() {
+        return Err(ApiError::bad_request("Reply cannot be empty"));
+    }
+    let pending = state.ask_user.write().await.remove(&session_id);
+
+    match pending {
+        Some(p) => {
+            // Persist the reply as a user message so it's visible after refresh
+            // and the agent sees its own ask + the user's answer in history.
+            if let Err(e) = state
+                .db
+                .add_message(&MessageRow::new(
+                    session_id,
+                    "user",
+                    reply.clone(),
+                    None,
+                    None,
+                    None,
+                ))
+                .await
+            {
+                tracing::warn!(%session_id, error = %e, "Failed to persist ask_user reply");
+            }
+            let _ = p.reply_tx.send(reply.clone());
+            tracing::info!(%session_id, question = %p.question, "User replied to ask_user");
+            Ok(Json(serde_json::json!({
+                "data": {
+                    "session_id": session_id.to_string(),
+                    "question": p.question,
+                    "reply": reply,
+                }
+            })))
+        }
+        None => Err(ApiError::not_found("No pending question for this session")),
     }
 }
 

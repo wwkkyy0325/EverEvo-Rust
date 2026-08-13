@@ -187,9 +187,21 @@ impl Tool for TodoWriteTool {
         params: serde_json::Value,
         _cancel: Option<&CancellationToken>,
     ) -> Result<ToolOutput, EverEvoError> {
-        // Parse todos from input
-        let todos: Vec<TodoItem> = serde_json::from_value(params["todos"].clone())
-            .map_err(|e| EverEvoError::InvalidInput(format!("Invalid todos: {e}")))?;
+        // Parse todos from input. Audit LOW (2026-08-13): a missing/wrong-typed
+        // `todos` surfaced a raw serde error ("invalid type: null, expected a
+        // sequence") with no remediation hint — give the agent the shape it needs.
+        let todos: Vec<TodoItem> = match params.get("todos").and_then(|t| t.as_array()) {
+            Some(arr) => serde_json::from_value(serde_json::Value::Array(arr.clone()))
+                .map_err(|e| EverEvoError::InvalidInput(format!("Invalid todos: {e}")))?,
+            None => {
+                return Err(EverEvoError::InvalidInput(
+                    "todos is required and must be an array of items like \
+                     {\"description\": \"...\", \"status\": \"pending\"} — provide the full \
+                     list each call (write the whole list, not a delta)"
+                        .into(),
+                ))
+            }
+        };
 
         // scope: "session" (default) writes to this session's list;
         //        "global" writes to the shared cross-conversation list.

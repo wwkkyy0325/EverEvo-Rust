@@ -14,7 +14,7 @@ use everevo_agent::memory::wiki::WikiGenerator;
 use everevo_agent::memory::DreamingEngine;
 use everevo_agent::rag::RagPipeline;
 use everevo_agent::skill::SkillRegistry;
-use everevo_agent::tools::builtins::{SubAgentHandle, SubAgentStatus};
+use everevo_agent::tools::builtins::{PlanModeState, SubAgentHandle, SubAgentStatus};
 use everevo_bootstrap::pipeline::InitPipeline;
 use everevo_bootstrap::Bootstrap;
 use everevo_core::context::ContextSnapshot;
@@ -51,21 +51,13 @@ pub enum InitPhase {
     Ready,
 }
 
-/// A pending confirmation that blocks a shell tool until the user responds.
-pub struct PendingConfirmation {
-    pub command: String,
-    pub reason: String,
-    /// Send `true` to approve, `false` to deny.
-    pub response_tx: tokio::sync::oneshot::Sender<bool>,
-}
-
-/// Notification sent to the SSE stream when a tool needs user confirmation.
-#[derive(Debug, Clone)]
-pub struct ConfirmationNotification {
-    pub session_id: uuid::Uuid,
-    pub command: String,
-    pub reason: String,
-}
+/// Session-scoped notification/pending types moved to the kernel (P1.1
+/// tool-ownership refactor): both the agent tools and the server's SSE stream
+/// use them, so they live in `everevo_core::session` and are re-exported here
+/// to keep `crate::app_state::{AskNotification, ...}` imports working.
+pub use everevo_core::session::{
+    AskNotification, ConfirmationNotification, PendingAsk, PendingConfirmation,
+};
 
 pub struct AppState {
     pub config: AppConfig,
@@ -78,6 +70,14 @@ pub struct AppState {
     /// Compaction provider — used for rolling-summary / autocompact. None →
     /// the main execution model is reused ("有哪个用哪个").
     pub compact_llm: RwLock<Option<ResolvedProvider>>,
+    /// Main execution provider — drives the context-window budget for the
+    /// primary chat session. None → `ContextBudget::resolve(None)` (128k floor).
+    pub main_llm: RwLock<Option<ResolvedProvider>>,
+    /// Web-search delegate provider (first Anthropic-format entry, e.g. DeepSeek).
+    /// When set, `web_search_local` runs a native server-side web search through
+    /// this provider instead of the plugin's cn.bing/Sogou chain (which returns
+    /// empty results under anti-bot/GFW). None → plugin fallback behavior.
+    pub web_search_llm: RwLock<Option<ResolvedProvider>>,
     /// Meta-agent self-diagnosis toggle — routing config `metaAgentEnabled`
     /// (product default ON). `EVEREVO_META_AGENT` env wins; benchmark mode
     /// defaults OFF. See [`meta_agent_effective`].
@@ -97,6 +97,13 @@ pub struct AppState {
     /// Pending confirmations awaiting user response, keyed by session UUID.
     /// Shared between the chat route (tool blocks here) and the confirm endpoint.
     pub confirmations: Arc<RwLock<HashMap<uuid::Uuid, PendingConfirmation>>>,
+    /// Pending free-text questions from the `ask_user` tool, keyed by session UUID.
+    /// Separate map so an ask and a shell confirmation never overwrite each other's
+    /// oneshot sender. Resolved by `POST /api/sessions/{id}/ask`.
+    pub ask_user: Arc<RwLock<HashMap<uuid::Uuid, PendingAsk>>>,
+    /// Per-session problem models (structural causal drafts for hard questions),
+    /// keyed by session UUID. Volatile working memory — not persisted.
+    pub problem_models: Arc<RwLock<HashMap<uuid::Uuid, everevo_core::problem_model::ProblemModel>>>,
     /// Fact manager — facts/ directory, MEMORY.md index.
     pub fact_manager: Arc<FactManager>,
     /// Diary manager — diary/ directory, LIGHT phase output.
@@ -145,8 +152,10 @@ pub struct AppState {
     /// Per-session plan mode state. None = normal mode.
     /// When a session is in plan mode, the value stores the pre-plan
     /// permission level for restoration on exit.
-    /// Arc-wrapped so it can be shared with plan mode tools.
-    pub plan_mode_sessions: Arc<RwLock<HashMap<uuid::Uuid, String>>>,
+    /// Single owner: `PlanModeState` (agent type) is shared by the in-process
+    /// EnterPlanMode/ExitPlanMode tools and the chat route's write-tool filter
+    /// (plan-mode merge, 2026-08-13). Arc-wrapped so it can be shared.
+    pub plan_mode_sessions: PlanModeState,
     /// Context injection observability — per-session ring buffers of recent
     /// context snapshots (max 5 entries per session).
     pub context_snapshots: RwLock<HashMap<uuid::Uuid, Vec<ContextSnapshot>>>,
@@ -367,6 +376,8 @@ impl AppState {
             llm: RwLock::new(llm),
             vision_llm: RwLock::new(None),
             compact_llm: RwLock::new(None),
+            main_llm: RwLock::new(None),
+            web_search_llm: RwLock::new(None),
             meta_agent_enabled: RwLock::new(meta_agent_enabled),
             bootstrap,
             downloader,
@@ -377,6 +388,8 @@ impl AppState {
             llm_notify: Notify::new(),
             sandboxes: RwLock::new(HashMap::new()),
             confirmations: Arc::new(RwLock::new(HashMap::new())),
+            ask_user: Arc::new(RwLock::new(HashMap::new())),
+            problem_models: Arc::new(RwLock::new(HashMap::new())),
             fact_manager,
             diary_manager,
             scheduler,
@@ -410,6 +423,10 @@ impl AppState {
         Self::spawn_mcp_health_checker(&state);
         // Resolve vision/compact special providers from routing config
         state.resolve_special_providers().await;
+        // Resolve the main provider — drives the per-model context-window budget.
+        state.resolve_main_provider().await;
+        // Resolve the web-search delegate provider (native server-side web search).
+        state.resolve_web_search_provider().await;
         Ok(state)
     }
 }

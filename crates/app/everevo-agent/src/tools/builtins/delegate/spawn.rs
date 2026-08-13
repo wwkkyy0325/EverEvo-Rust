@@ -10,38 +10,15 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::subagent_context::SubAgentContext;
+use crate::subagent_roles::AgentRole;
 
 /// Type-specific guidance injected into the sub-agent system prompt.
+///
+/// Unified through [`AgentRole`] — the legacy `stype` strings map onto the
+/// canonical role prompts so all sub-agent paths share one constraint
+/// vocabulary (see `subagent_roles.rs`).
 pub(crate) fn stype_guidance(stype: &str) -> String {
-    match stype {
-        "reviewer" => "\n\n## Role: Code Reviewer\n\
-            You are a critical code reviewer. Focus on:\n\
-            - Correctness bugs and edge cases\n\
-            - Security vulnerabilities\n\
-            - Performance issues\n\
-            - Adherence to project conventions\n\
-            - Test coverage gaps\n\
-            Be thorough and adversarial — find every issue.\n"
-            .into(),
-        "research" | "code-explorer" => "\n\n## Role: Researcher\n\
-            You are a thorough researcher. Focus on:\n\
-            - Exploring all relevant files and patterns\n\
-            - Finding connections across modules\n\
-            - Documenting your findings with file paths and line numbers\n\
-            - Providing a structured, comprehensive report\n\
-            Leave no stone unturned.\n"
-            .into(),
-        "file" => "\n\n## Role: File Operations\n\
-            You are a precise file operator. Focus on:\n\
-            - Making the requested file changes exactly as specified\n\
-            - Verifying each change with tests or checks\n\
-            - Leaving no unintended side effects\n\
-            - Reporting what was changed and why.\n"
-            .into(),
-        _ => "\n\n## Role: General Assistant\n\
-            Complete the assigned task thoroughly and return a structured result.\n"
-            .into(),
-    }
+    format!("\n\n{}", AgentRole::parse(stype).system_prompt())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -79,7 +56,8 @@ pub(crate) async fn spawn_single(
 
     let start = std::time::Instant::now();
     let sa_id = Uuid::new_v4();
-    let agent_loop = crate::AgentLoop::sub_agent(max_turns);
+    let agent_loop = crate::AgentLoop::sub_agent(max_turns)
+        .with_context_budget(sub_ctx.max_context_tokens.saturating_mul(4));
     let final_text = agent_loop
         .run_subagent(llm, Arc::new(sub_tools), messages, cancel)
         .await;
@@ -141,4 +119,23 @@ pub(crate) async fn spawn_single(
         serde_json::to_string_pretty(&meta).unwrap_or_default(),
         final_text
     )
+}
+
+/// Handle to a running sub-agent — enables monitoring and cancellation.
+#[derive(Clone)]
+pub struct SubAgentHandle {
+    pub id: Uuid,
+    pub description: String,
+    pub started_at: chrono::DateTime<Utc>,
+    pub cancel: CancellationToken,
+}
+
+/// Snapshot of sub-agent status for API reporting.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SubAgentStatus {
+    pub id: Uuid,
+    pub description: String,
+    pub started_at: String,
+    pub status: String, // "running" | "completed" | "failed" | "timeout" | "cancelled"
+    pub elapsed_ms: u64,
 }

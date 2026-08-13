@@ -19,7 +19,7 @@ everevo-downloader = { path = "../../infra/everevo-downloader" }
 everevo-sandbox = { path = "../../infra/everevo-sandbox" }
 everevo-knowledge = { path = "../../infra/everevo-knowledge" }
 everevo-vector = { path = "../../infra/everevo-vector" }
-everevo-mcp = { path = "../../kernel/everevo-mcp" }
+everevo-mcp = { path = "../../infra/everevo-mcp" }
 everevo-workflow = { path = "../everevo-workflow" }
 everevo-a2a = { path = "../everevo-a2a" }
 everevo-kernel = { path = "../../kernel/everevo-kernel" }

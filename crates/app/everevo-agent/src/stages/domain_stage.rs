@@ -25,6 +25,8 @@ use everevo_core::context::{ContextBuildContext, ContextFragment, ContextStage};
 use everevo_core::llm::LlmMessage;
 use everevo_knowledge::domain::DomainManager;
 
+use crate::stages::clamp_content_by_tokens;
+
 /// Injects relevant domain knowledge chunks into the agent's context.
 ///
 /// Priority 4 — after memory (3), before session metadata (5).
@@ -187,9 +189,11 @@ impl ContextStage for DomainKnowledgeStage {
 
         lines.push("Use the domain search tool or POST /api/domains/search to find more specific documents.".into());
 
+        let mut content = lines.join("\n");
+        clamp_content_by_tokens(&mut content, ctx.budget.stage("domain_knowledge"));
         Some(ContextFragment {
             label: "Domain Knowledge".into(),
-            messages: vec![LlmMessage::user(lines.join("\n"))],
+            messages: vec![LlmMessage::user(&content)],
         })
     }
 }

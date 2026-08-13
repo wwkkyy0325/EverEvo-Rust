@@ -27,6 +27,7 @@ use uuid::Uuid;
 
 use crate::memory::facts::{fact_visible_to, FactManager};
 use crate::rag::RagPipeline;
+use crate::stages::clamp_content_by_tokens;
 use everevo_knowledge::graph::KnowledgeGraph;
 
 /// Injects relevant memory facts + knowledge graph context into the LLM context pipeline.
@@ -301,10 +302,11 @@ impl ContextStage for MemoryStage {
                             .take(5)
                             .map(|f| format!("- {} — {}", f.name, f.description))
                             .collect();
-                        let content = format!(
+                        let mut content = format!(
                             "## Memory (T1 — frequently used)\n{}\n",
                             t1_lines.join("\n")
                         );
+                        clamp_content_by_tokens(&mut content, ctx.budget.stage("memory"));
                         return Some(ContextFragment {
                             label: "Memory T1".into(),
                             messages: vec![LlmMessage::user(&content)],
@@ -346,11 +348,12 @@ impl ContextStage for MemoryStage {
             } else {
                 String::new()
             };
-            let content = format!(
+            let mut content = format!(
                 "## Persistent Memory\n\
                  The following facts have been saved from previous sessions:\n\n\
                  {index}{kg_meta}"
             );
+            clamp_content_by_tokens(&mut content, ctx.budget.stage("memory"));
             return Some(ContextFragment {
                 label: "Memory Index".into(),
                 messages: vec![LlmMessage::user(&content)],
@@ -477,6 +480,7 @@ impl ContextStage for MemoryStage {
             }
         }
 
+        clamp_content_by_tokens(&mut content, ctx.budget.stage("memory"));
         Some(ContextFragment {
             label: "Relevant Memory".into(),
             messages: vec![LlmMessage::user(&content)],

@@ -124,13 +124,9 @@ impl A2aAgentExecutor for EverEvoExecutor {
         let llm_messages = Self::to_llm_messages(message);
 
         // Run the agent loop — same as workflow/scheduler sub-agent
+        let llm: Arc<dyn everevo_core::LlmProvider> = self.llm.clone();
         let result = everevo_agent::AgentLoop::sub_agent(self.max_turns)
-            .run_subagent(
-                Arc::clone(&self.llm),
-                Arc::clone(&self.tools),
-                llm_messages,
-                cancel,
-            )
+            .run_subagent(llm, Arc::clone(&self.tools), llm_messages, cancel)
             .await;
 
         // Detect errors from the agent run. run_subagent() returns a plain string,

@@ -68,6 +68,8 @@ export interface AuditRecord {
 
 export interface ConfirmRequest { sessionId: string; command: string; reason: string; }
 
+export interface AskRequest { sessionId: string; question: string; }
+
 export interface MessageItem {
   id: string;
   role: 'user' | 'assistant' | 'system' | 'tool';
@@ -126,6 +128,7 @@ interface ChatState {
   showAudit: boolean;
 
   confirmQueue: ConfirmRequest[];
+  askQueue: AskRequest[];
   auditRecords: AuditRecord[]; auditTotal: number;
 
   // ── Actions ──
@@ -142,6 +145,8 @@ interface ChatState {
   setPermissionLevel: (level: string) => Promise<void>;
   loadAudit: (sessionId: string) => Promise<void>;
   confirmCommand: (approved: boolean) => Promise<void>;
+  /** Submit a free-text reply to the pending ask_user question (front of queue). */
+  resolveAsk: (reply: string) => Promise<void>;
   abortStream: () => void;
   /** Load tool list + server health in one call. */
   loadHealth: () => Promise<void>;
@@ -206,7 +211,7 @@ export const useStore = create<ChatState>((set, get) => ({
 
   streaming: false, draftId: null, abortController: null,
   todos: [], subagentTasks: [], showMemory: false, showAudit: false,
-  confirmQueue: [], workspacePath: null,
+  confirmQueue: [], askQueue: [], workspacePath: null,
   planMode: false, planTask: null,
 
   // ── Session list ──────────────────────────────────────────────────
@@ -309,6 +314,13 @@ export const useStore = create<ChatState>((set, get) => ({
     const req = queue[0];
     try { await fetch(`/api/sandbox/sessions/${req.sessionId}/confirm`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ approved }) }); } catch { /* ignore */ }
     set({ confirmQueue: queue.slice(1) });
+  },
+
+  resolveAsk: async (reply: string) => {
+    const queue = get().askQueue; if (queue.length === 0) return;
+    const req = queue[0];
+    try { await fetch(`/api/sessions/${req.sessionId}/ask`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reply }) }); } catch { /* ignore */ }
+    set({ askQueue: queue.slice(1) });
   },
 
   setPermissionLevel: async (level: string) => {
@@ -449,6 +461,16 @@ export const useStore = create<ChatState>((set, get) => ({
               const cr = JSON.parse(data);
               const newReq = { sessionId: cr.session_id as string, command: cr.command as string, reason: cr.reason as string };
               set((s) => ({ confirmQueue: [...s.confirmQueue, newReq] }));
+            } catch { /* ignore */ }
+            continue;
+          }
+
+          // ── awaiting_user (ask_user tool — free-text reply dialog) ─
+          if (currentEvent === 'awaiting_user') {
+            try {
+              const au = JSON.parse(data);
+              const newAsk = { sessionId: au.session_id as string, question: au.question as string };
+              set((s) => ({ askQueue: [...s.askQueue, newAsk] }));
             } catch { /* ignore */ }
             continue;
           }

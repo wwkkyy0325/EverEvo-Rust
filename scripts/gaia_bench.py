@@ -52,6 +52,13 @@ SERVER_PROC = None
 # final answer (valid, no substring leniency); "legacy" = old exact-or-bidirectional
 # substring on the full accumulated text (reproduces the 41/53 pre-fix result).
 SCORING_MODE = "official"
+# GAIA split to run: "validation" (has ground truth, scores locally) or "test"
+# (no ground truth — the only split the official leaderboard accepts; writes a
+# submission_*.jsonl). Rebound from the --split CLI arg.
+SPLIT = "validation"
+# Self-consistency: run each question N times and vote (default 1 = single run).
+# Rebound from the --attempts CLI arg.
+ATTEMPTS = 1
 
 # ---------------------------------------------------------------------------
 # Sample GAIA-style questions (no HuggingFace required)
@@ -152,25 +159,38 @@ def load_gaia_dataset(use_sample: bool = False, level: str = "level1"):
 
     try:
         from datasets import load_dataset
+        from huggingface_hub import snapshot_download
         import tempfile, shutil
 
         hf_token = os.environ.get("HF_TOKEN")
-        if not hf_token:
-            log("HF_TOKEN not set — falling back to sample questions")
-            return SAMPLE_QUESTIONS
+        config = "2023_all" if level == "all" else f"2023_{level}"
 
-        log(f"Loading real GAIA from HuggingFace ({level})...")
-        if level == "all":
-            ds = load_dataset("gaia-benchmark/GAIA", "2023_all",
-                              split="validation", token=hf_token)
+        if hf_token:
+            log(f"Loading real GAIA from HuggingFace ({level}, split={SPLIT})...")
+            ds = load_dataset("gaia-benchmark/GAIA", config,
+                              split=SPLIT, token=hf_token)
+            # Download file attachments
+            repo_path = snapshot_download("gaia-benchmark/GAIA", repo_type="dataset",
+                                           token=hf_token, max_workers=4)
         else:
-            ds = load_dataset(f"gaia-benchmark/GAIA", f"2023_{level}",
-                              split="validation", token=hf_token)
-
-        # Download file attachments
-        from huggingface_hub import snapshot_download
-        repo_path = snapshot_download("gaia-benchmark/GAIA", repo_type="dataset",
-                                       token=hf_token, max_workers=4)
+            # HF_TOKEN not set (e.g. fresh shell): GAIA is gated, but the
+            # question table is almost certainly already in the local HF cache
+            # from a prior run. Load it offline instead of silently falling back
+            # to the 0-question sample set. The token only gates the initial
+            # download; cached reads work without it.
+            log("HF_TOKEN not set — loading GAIA from local HF cache (offline)...")
+            os.environ["HF_DATASETS_OFFLINE"] = "1"
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            ds = load_dataset("gaia-benchmark/GAIA", config, split=SPLIT)
+            # Attachment files are NOT in the dataset cache (gated repo). Try to
+            # download the snapshot; if offline/tokenless it 401s — non-fatal,
+            # because per-question copies usually already exist under
+            # data/bench/attachments/<task_id>/ from a prior run.
+            repo_path = None
+            try:
+                repo_path = snapshot_download("gaia-benchmark/GAIA", repo_type="dataset")
+            except Exception as e:
+                log(f"Attachments snapshot unavailable (offline) — using local copies: {e}")
 
         questions = []
         skipped_files = 0
@@ -179,16 +199,24 @@ def load_gaia_dataset(use_sample: bool = False, level: str = "level1"):
                 "task_id": row["task_id"],
                 "Question": row["Question"],
                 "Level": row["Level"],
-                "Final answer": str(row["Final answer"]).strip(),
+                # Test split has no "Final answer" — keep "" (run_one_question
+                # skips scoring when GT is missing).
+                "Final answer": str(row.get("Final answer") or "").strip(),
                 "file_name": row.get("file_name") or "",
                 "file_path": row.get("file_path") or "",
             }
             # If there's a file attachment, note it in the prompt
             if q["file_path"]:
-                # file_path is repo-root-relative (e.g. "2023/validation/<uuid>.pdf").
-                # Join against repo_path — prepending "2023/validation" again would
-                # double-prefix the path and make the file unresolvable.
-                local_file = Path(repo_path) / q["file_path"]
+                # Phase-1d isolation dir. The attachment may already be copied
+                # here from a prior run (offline/tokenless reloads); prefer that
+                # local copy over the (possibly unavailable) fresh snapshot.
+                att_dir = WS_ROOT / "data" / "bench" / "attachments" / str(q["task_id"])
+                local_file = att_dir / q["file_name"]
+                if not local_file.exists() and repo_path is not None:
+                    # file_path is repo-root-relative
+                    # (e.g. "2023/validation/<uuid>.pdf"). Join against repo_path
+                    # — prepending "2023/validation" again would double-prefix.
+                    local_file = Path(repo_path) / q["file_path"]
                 if local_file.exists():
                     ext = local_file.suffix.lower()
                     if ext in ('.pdf', '.xlsx', '.xls', '.docx', '.pptx', '.ppt',
@@ -200,7 +228,6 @@ def load_gaia_dataset(use_sample: bool = False, level: str = "level1"):
                         # file and forbid everything else. Closes the [G] class
                         # (the model once read an unrelated local .pptx because
                         # the host tree held many files).
-                        att_dir = WS_ROOT / "data" / "bench" / "attachments" / str(q["task_id"])
                         att_dir.mkdir(parents=True, exist_ok=True)
                         target = att_dir / q["file_name"]
                         attached = str(local_file)
@@ -921,6 +948,19 @@ def read_server_env():
 # ---------------------------------------------------------------------------
 # One-question runner (shared by sequential and worker-pool paths)
 # ---------------------------------------------------------------------------
+def classify_terminal_state(resp: dict) -> str:
+    """Map a `chat()` result to its explicit terminal state.
+
+    Must cover EVERY error signal the harness can produce: wall-clock timeout,
+    SSE error event, exception, or a clean completion.
+    """
+    if resp.get("error"):
+        if "wall-clock timeout" in str(resp["error"]):
+            return "timed_out"
+        return "error"
+    return "ok"
+
+
 def run_one_question(idx, q, total, question_timeout, checkpoint=None):
     """Run a single GAIA question against the server; return a full result dict.
 
@@ -937,6 +977,11 @@ def run_one_question(idx, q, total, question_timeout, checkpoint=None):
     sys.stdout.write(f"  ⏳ "); sys.stdout.flush()
     t0 = time.time()
 
+    # ── Per-question state machine ──────────────────────────────────
+    # pending → running → (verifying) → ok | timed_out | error.
+    # Every terminal condition the harness can produce is classified so the
+    # checkpoint records an explicit state instead of an implicit error field.
+    state = "running"
     resp = chat(prompt, timeout=180, wall_clock=question_timeout)
     elapsed = time.time() - t0
 
@@ -946,6 +991,7 @@ def run_one_question(idx, q, total, question_timeout, checkpoint=None):
     # replaces the scored response only when it produced a clean marker.
     if (not resp.get("error") and resp.get("session_id")
             and not re.search(r"(?i)final\s+answer", resp.get("text", ""))):
+        state = "verifying"
         fb = chat_followup(resp["session_id"], wall_clock=60)
         if (not fb.get("error") and fb.get("text", "").strip()
                 and re.search(r"(?i)final\s+answer", fb.get("text", ""))):
@@ -953,15 +999,25 @@ def run_one_question(idx, q, total, question_timeout, checkpoint=None):
             elapsed = time.time() - t0
             print("  ↻ terminal re-prompt: model re-committed a `Final answer:` line")
 
-    scoring = score_answer(resp["text"], gt)
-    passed = scoring["exact_match"] or scoring["substring_match"]
+    # Terminal state classification (must cover EVERY error signal).
+    state = classify_terminal_state(resp)
 
-    if scoring["exact_match"]:
-        status = "✅ EXACT"
-    elif scoring["substring_match"]:
-        status = "🟡 SUBSTR"
+    if gt:
+        scoring = score_answer(resp["text"], gt)
+        passed = scoring["exact_match"] or scoring["substring_match"]
+        if scoring["exact_match"]:
+            status = "✅ EXACT"
+        elif scoring["substring_match"]:
+            status = "🟡 SUBSTR"
+        else:
+            status = "❌ FAIL"
     else:
-        status = "❌ FAIL"
+        # Test split — no ground truth, so no scoring. Just extract the answer
+        # for the official leaderboard submission.
+        model_answer, _ = extract_final_answer(resp["text"])
+        scoring = {"predicted": model_answer, "recovered": False}
+        passed = None
+        status = "→ SUBMIT"
 
     tools_used = [t["name"] for t in resp["tool_calls"]]
 
@@ -982,9 +1038,10 @@ def run_one_question(idx, q, total, question_timeout, checkpoint=None):
         "tool_calls": resp["tool_calls"],
         "tools_used": tools_used,
         "pass": passed,
-        "exact_match": scoring["exact_match"],
-        "substring_match": scoring["substring_match"],
+        "exact_match": scoring.get("exact_match"),
+        "substring_match": scoring.get("substring_match"),
         "recovered": scoring.get("recovered", False),
+        "answer_value": scoring.get("predicted", ""),  # extracted answer (for self-consistency voting)
         "is_followup": resp.get("is_followup", False),
         "input_tokens": resp["input_tokens"],
         "output_tokens": resp["output_tokens"],
@@ -992,6 +1049,7 @@ def run_one_question(idx, q, total, question_timeout, checkpoint=None):
         "session_id": resp.get("session_id"),
         "message_id": resp.get("message_id"),
         "error": resp.get("error"),
+        "state": state,
     }
     if checkpoint:
         try:
@@ -1039,24 +1097,48 @@ def run_benchmark(questions: list, limit: int = None, start: int = 0,
     checkpoint = RESULTS_DIR / f"checkpoint_{time.strftime('%Y%m%d_%H%M%S')}.jsonl"
 
     def _one(item):
-        idx, q = item
+        idx, q, attempt = item
+        # `attempt` distinguishes runs in the work list; chat() opens a fresh
+        # session per call, so each attempt is independent (self-consistency).
         return run_one_question(idx, q, total, question_timeout,
                                 checkpoint=str(checkpoint))
 
+    grouped = {}
     if workers and workers > 1:
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        by_task = {}
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            futures = {ex.submit(_one, (i, q)): q["task_id"]
-                       for i, q in enumerate(questions)}
+            futures = {ex.submit(_one, (i, q, a)): (q["task_id"], a)
+                       for i, q in enumerate(questions)
+                       for a in range(ATTEMPTS)}
             for fut in as_completed(futures):
                 res = fut.result()
                 if res:
-                    by_task[res["task_id"]] = res
-        # Restore stable question ordering in the report
-        results = [by_task[q["task_id"]] for q in questions if q["task_id"] in by_task]
+                    grouped.setdefault(res["task_id"], []).append(res)
     else:
-        results = [_one((i, q)) for i, q in enumerate(questions)]
+        for i, q in enumerate(questions):
+            grouped[q["task_id"]] = [_one((i, q, a)) for a in range(ATTEMPTS)]
+
+    # Aggregate attempts → one result per question + self-consistency metrics.
+    from collections import Counter
+    results = []
+    for q in questions:
+        grp = grouped.get(q["task_id"])
+        if not grp:
+            continue
+        if ATTEMPTS <= 1:
+            results.append(grp[0])
+            continue
+        r = dict(grp[0])
+        # pass@N: any attempt exact.
+        r["pass_any"] = any(x.get("exact_match") for x in grp if x.get("exact_match") is not None)
+        # Majority vote over the extracted answer values (also used for the
+        # test-set submission).
+        votes = Counter(x.get("answer_value", "") for x in grp)
+        r["vote_answer"] = votes.most_common(1)[0][0]
+        if r.get("ground_truth"):
+            vs = score_answer(r["vote_answer"], r["ground_truth"])
+            r["vote_exact"] = vs["exact_match"]
+        results.append(r)
 
     # ── Summary ──
     n = len(results)
@@ -1070,6 +1152,12 @@ def run_benchmark(questions: list, limit: int = None, start: int = 0,
     print("GAIA Benchmark Results — EverEvo Agent")
     print("=" * 70)
     print(f"  Questions:           {n}")
+    if ATTEMPTS > 1 and SCORING_MODE == "official":
+        passN = sum(1 for r in results if r.get("pass_any"))
+        voteN = sum(1 for r in results if r.get("vote_exact"))
+        print(f"  Pass@1 (first):     {exact_score}/{n} ({exact_score/n*100:.1f}%)")
+        print(f"  Pass@N (any of {ATTEMPTS}): {passN}/{n} ({passN/n*100:.1f}%)")
+        print(f"  Majority vote:      {voteN}/{n} ({voteN/n*100:.1f}%)")
     if SCORING_MODE == "official":
         print(f"  Official exact:     {exact_score}/{n} ({exact_score/n*100:.1f}%)"
               f"  [scoring={SCORING_MODE}]")
@@ -1134,6 +1222,24 @@ def run_benchmark(questions: list, limit: int = None, start: int = 0,
 
     print(f"  Tool Usage:          {questions_with_tools}/{n} questions used tools ({total_tool_calls} total tool calls)")
     ok(f"Results saved: {out}")
+
+    # Test split has no ground truth — the deliverable is the official
+    # leaderboard submission JSONL (task_id / model_answer / reasoning_trace).
+    if SPLIT == "test":
+        sub_path = RESULTS_DIR / f"submission_{ts}.jsonl"
+        with open(sub_path, "w", encoding="utf-8") as f:
+            for r in results:
+                # With self-consistency, submit the majority-voted answer.
+                if ATTEMPTS > 1 and r.get("vote_answer"):
+                    model_answer = r["vote_answer"]
+                else:
+                    model_answer, _ = extract_final_answer(r["predicted"])
+                f.write(json.dumps({
+                    "task_id": r["task_id"],
+                    "model_answer": model_answer,
+                    "reasoning_trace": r.get("thinking") or "",
+                }, ensure_ascii=False) + "\n")
+        ok(f"Test-set submission ({len(results)} answers) → {sub_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -1345,6 +1451,16 @@ if __name__ == "__main__":
     parser.add_argument("--workers", type=int, default=1,
                         help="Concurrent question workers (default 1; 2-4 overlaps "
                              "web-tool wait time — each question is an isolated session)")
+    parser.add_argument("--split", default="validation", choices=["validation", "test"],
+                        help="GAIA split to run (default: validation). The official "
+                             "leaderboard only accepts TEST-set submissions — the test "
+                             "split has no ground truth, so answers are not scored and a "
+                             "submission_*.jsonl is written for upload.")
+    parser.add_argument("--attempts", type=int, default=1,
+                        help="Run each question N times (self-consistency voting). "
+                             "With N>1 reports pass@1, pass@N (any attempt correct), "
+                             "and majority-vote accuracy; the voted answer is used "
+                             "for test-set submissions.")
     parser.add_argument("--question-timeout", type=int, default=300,
                         help="Wall-clock cap per question in seconds (default 300; "
                              "prevents stuck web-retry loops from churning forever)")
@@ -1363,6 +1479,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     SCORING_MODE = args.scoring  # module scope: rebinds the module global directly
+    SPLIT = args.split  # module scope: rebinds the module global directly
+    ATTEMPTS = args.attempts  # module scope: rebinds the module global directly
 
     if args.self_test:
         sys.exit(0 if run_self_tests() else 1)

@@ -1,14 +1,19 @@
 //! SandboxedShellTool — the per-session wrapper that routes commands into
 //! the sandbox with confirmation-gate support.
 //!
-//! Extracted from `chat.rs` to keep the route handler focused on SSE streaming.
+//! Extracted from the server's chat handler and moved into the agent crate
+//! during the P1.1 tool-ownership refactor: the confirmation-gate state now
+//! comes from [`crate::tools::session_store::SessionStore`].
 
-use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+
 use uuid::Uuid;
 
-use crate::app_state::{ConfirmationNotification, PendingConfirmation};
+use everevo_core::sandbox::SandboxProvider;
+use everevo_core::session::{ConfirmationNotification, PendingConfirmation};
+
+use crate::tools::session_store::SessionStore;
 
 /// Wraps a sandbox to force all commands into the session work directory.
 /// Also handles the confirmation flow: when the sandbox requires user
@@ -19,15 +24,12 @@ use crate::app_state::{ConfirmationNotification, PendingConfirmation};
 /// commands execute with `confirmed: true` immediately, bypassing the
 /// confirmation gate. Admin commands fail-fast instead of deadlocking.
 pub struct SandboxedShellTool {
-    pub inner: Arc<dyn everevo_core::sandbox::SandboxProvider>,
-    pub work_dir: std::path::PathBuf,
+    pub inner: Arc<dyn SandboxProvider>,
+    pub work_dir: PathBuf,
     pub session_id: Uuid,
-    /// Shared pending confirmations map — the confirm endpoint resolves these.
-    pub confirmations: Arc<RwLock<HashMap<Uuid, PendingConfirmation>>>,
-    /// Channel to notify the SSE stream about a pending confirmation.
-    pub notif_tx: mpsc::UnboundedSender<ConfirmationNotification>,
-    /// When true, bypass the confirmation gate entirely.
-    pub auto_confirm: bool,
+    /// Session-scoped confirmation state (pending map, SSE notif channel,
+    /// auto-confirm mode).
+    pub store: Arc<dyn SessionStore>,
 }
 
 #[async_trait::async_trait]
@@ -61,7 +63,7 @@ impl everevo_core::tool::Tool for SandboxedShellTool {
         })?;
         let timeout_secs = params["timeout_secs"].as_u64().unwrap_or(30).min(300);
 
-        let confirmed = self.auto_confirm
+        let confirmed = self.store.auto_confirm()
             || params
                 .get("confirmed")
                 .and_then(|v| v.as_bool())
@@ -75,7 +77,7 @@ impl everevo_core::tool::Tool for SandboxedShellTool {
 
         // Confirmation gate (Claude Code style)
         if result.needs_confirmation {
-            if self.auto_confirm {
+            if self.store.auto_confirm() {
                 tracing::warn!(session_id = %self.session_id, command = %command, reason = %result.confirmation_reason, "Sub-agent admin command blocked (auto_confirm)");
                 return Ok(everevo_core::tool::ToolOutput {
                     content: format!(
@@ -86,9 +88,11 @@ impl everevo_core::tool::Tool for SandboxedShellTool {
                     ..Default::default()
                 });
             }
+            let confirmations = self.store.confirmations();
+            let notif_tx = self.store.confirm_notif_tx();
             let reason = result.confirmation_reason.clone();
             let (tx, rx) = tokio::sync::oneshot::channel();
-            self.confirmations.write().await.insert(
+            confirmations.write().await.insert(
                 self.session_id,
                 PendingConfirmation {
                     command: command.to_string(),
@@ -96,14 +100,14 @@ impl everevo_core::tool::Tool for SandboxedShellTool {
                     response_tx: tx,
                 },
             );
-            let _ = self.notif_tx.send(ConfirmationNotification {
+            let _ = notif_tx.send(ConfirmationNotification {
                 session_id: self.session_id,
                 command: command.to_string(),
                 reason: reason.clone(),
             });
             tracing::info!(session_id = %self.session_id, command = %command, %reason, "Waiting for user confirmation...");
             let approved = rx.await.unwrap_or(false);
-            self.confirmations.write().await.remove(&self.session_id);
+            confirmations.write().await.remove(&self.session_id);
             if !approved {
                 return Ok(everevo_core::tool::ToolOutput {
                     content: format!("User denied execution: {reason}"),

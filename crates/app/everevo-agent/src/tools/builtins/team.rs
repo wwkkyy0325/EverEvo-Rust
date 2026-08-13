@@ -270,9 +270,23 @@ impl TeamTool {
         &self.pending
     }
 
+    /// Cancel every dispatched member's cancel token. Used when dispatch hits a
+    /// fatal error (semaphore closed / 30s slot timeout) so the members started
+    /// so far are not orphaned in the background (audit MEDIUM, 2026-08-13).
+    fn cancel_all(&self) {
+        let handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
+        for h in handles.iter() {
+            h.cancel.cancel();
+        }
+    }
+
     /// Dispatch a team member sub-agent.
     /// Returns the sub-agent UUID for deterministic result collection.
     /// The semaphore permit is moved into the spawned task for concurrency control.
+    ///
+    /// `parent_cancel` propagates the caller's session cancellation into the
+    /// member (the member runs on a child token) — without this, a cancelled
+    /// session left team members running to completion.
     fn dispatch_one(
         &self,
         description: &str,
@@ -280,6 +294,7 @@ impl TeamTool {
         task_prompt: &str,
         max_turns: usize,
         _permit: tokio::sync::OwnedSemaphorePermit,
+        parent_cancel: Option<&CancellationToken>,
     ) -> Uuid {
         let llm = match self.llm.clone() {
             Some(l) => l,
@@ -305,11 +320,15 @@ impl TeamTool {
         let max_turns = if max_turns == 0 { 3 } else { max_turns };
         let desc = format!("[{}] {}", role.as_str(), description);
 
+        // Child of the caller's token when present, so session cancellation and
+        // cancel_all() both reach the member's run.
+        let member_cancel = parent_cancel.map(|pc| pc.child_token()).unwrap_or_default();
+
         let handle = SubAgentHandle {
             id: subagent_id,
             description: desc.clone(),
             started_at: chrono::Utc::now(),
-            cancel: CancellationToken::new(),
+            cancel: member_cancel.clone(),
         };
 
         let status = SubAgentStatus {
@@ -351,7 +370,7 @@ impl TeamTool {
                 .with_context_budget(40000);
 
             let result_text = config
-                .run_subagent(llm, tools, messages, CancellationToken::new())
+                .run_subagent(llm, tools, messages, member_cancel.clone())
                 .await;
 
             // Feed into subagent_rx so the main loop injects [SubAgent Result]
@@ -454,7 +473,7 @@ impl Tool for TeamTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _cancel: Option<&CancellationToken>,
+        cancel: Option<&CancellationToken>,
     ) -> Result<ToolOutput, EverEvoError> {
         let task = params["task"]
             .as_str()
@@ -493,6 +512,8 @@ impl Tool for TeamTool {
                 Ok(Ok(p)) => p,
                 Ok(Err(_)) => {
                     tracing::error!("Team semaphore closed unexpectedly — aborting dispatch");
+                    // Kill members already dispatched so they are not orphaned.
+                    self.cancel_all();
                     return Err(everevo_core::EverEvoError::Tool {
                         tool: "team".into(),
                         message: "Semaphore closed unexpectedly".into(),
@@ -500,21 +521,22 @@ impl Tool for TeamTool {
                 }
                 Err(_elapsed) => {
                     tracing::error!("Team dispatch timed out waiting for slot (30s)");
+                    // Kill members already dispatched so they are not orphaned.
+                    self.cancel_all();
                     return Err(everevo_core::EverEvoError::Tool {
                         tool: "team".into(),
                         message: "Timed out waiting for concurrent task slot".into(),
                     });
                 }
             };
-            let id = self.dispatch_one(focus, role, task, max_turns, permit);
-            member_ids.push((
-                id,
-                format!("- **{}**: {}", role.as_str(), role.description()),
-            ));
-            let member_name = member_ids
-                .last()
-                .map(|(_, name)| name.clone())
-                .unwrap_or_else(|| "unknown".to_string());
+            let id = self.dispatch_one(focus, role, task, max_turns, permit, cancel);
+            // Audit MEDIUM (2026-08-13): a nil dispatch (missing llm/tools wiring)
+            // used to be reported as a successful member. Surface it visibly.
+            let mut member_name = format!("- **{}**: {}", role.as_str(), role.description());
+            if id == Uuid::nil() {
+                member_name.push_str(" ⚠️ NOT dispatched — agent llm/tools not wired");
+            }
+            member_ids.push((id, member_name.clone()));
             dispatched.push(member_name);
         }
 

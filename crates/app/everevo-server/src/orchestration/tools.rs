@@ -24,9 +24,12 @@
 //! | task, workflow, team | ❌ | **always** | Sub-agent orchestration |
 //! | review/audit/reflect hooks | callable tools | **always** | Auto-gate vs on-demand call |
 
-use crate::app_state::{AppState, ConfirmationNotification};
-use crate::sandbox_tool::SandboxedShellTool;
+use crate::app_state::{AppState, AskNotification, ConfirmationNotification};
+use crate::session_store::ServerSessionStore;
 use everevo_agent::subagent_context::SubAgentContext;
+use everevo_agent::tools::builtins::{
+    AskUserTool, PipelineTool, ProblemModelTool, SandboxedShellTool, WebSearchDelegateTool,
+};
 use everevo_agent::tools::builtins::{SubAgentHandle, SubAgentStatus};
 use everevo_core::tool::ToolRegistry;
 use std::path::PathBuf;
@@ -72,6 +75,7 @@ pub async fn assemble(
     session_id: Uuid,
     client: &Arc<everevo_agent::llm::HttpClient>,
     notif_tx: &mpsc::UnboundedSender<ConfirmationNotification>,
+    ask_user_tx: &mpsc::UnboundedSender<AskNotification>,
     permission_level: &str,
     sub_ctx: &SubAgentContext,
 ) -> AssembledTools {
@@ -124,6 +128,13 @@ pub async fn assemble(
             project_root.join("plugins").join("target").join("release"),
         ];
 
+        // NOTE: plan_mode is intentionally NOT auto-loaded as an MCP plugin —
+        // plugin-plan-mode's `enter_plan_mode`/`exit_plan_mode` run in a separate
+        // process and cannot write the shared `PlanModeState` the chat route's
+        // write-tool filter reads, so they are a no-op that misleads the agent
+        // into believing write tools are blocked. The in-process
+        // EnterPlanMode/ExitPlanMode (registered below, step [5]) are the single
+        // functional track (plan-mode merge, 2026-08-13).
         let tool_plugins = [
             ("web_search", "plugin-web-search.exe"),
             ("web_fetch", "plugin-web-fetch.exe"),
@@ -136,7 +147,6 @@ pub async fn assemble(
             ("verify", "plugin-verify.exe"),
             ("compact", "plugin-compact.exe"),
             ("todo_write", "plugin-todo-write.exe"),
-            ("plan_mode", "plugin-plan-mode.exe"),
             ("skill", "plugin-skill.exe"),
         ];
 
@@ -201,7 +211,29 @@ pub async fn assemble(
         }
     }
 
-    // ── Per-session tools ──
+    // ── web_search_local delegate ──
+    // Replace the plugin's cn.bing/Sogou chain with a native server-side web
+    // search through the first Anthropic-format provider (DeepSeek etc.) when
+    // one is configured. Same tool name → ToolRegistry::register replaces the
+    // plugin version; research_search from the plugin stays untouched.
+    if let Some(ws) = state.web_search_llm.read().await.as_ref().cloned() {
+        registry.register(Arc::new(WebSearchDelegateTool { llm: ws.client }));
+        tracing::info!("web_search_local → delegated to native web-search provider");
+    }
+
+    // ── Per-session store (P1.1: session-stateful tools live in the agent
+    // crate and depend on the SessionStore seam; the server implements it). ──
+    let store: Arc<dyn everevo_agent::tools::session_store::SessionStore> =
+        Arc::new(ServerSessionStore::new(
+            Arc::clone(state),
+            session_id,
+            ask_user_tx.clone(),
+            notif_tx.clone(),
+            // Headless/fully_auto: never block a human.
+            is_fully_auto || std::env::var("EVEREVO_BENCHMARK").is_ok(),
+            is_fully_auto,
+        ));
+
     // Reuse the work_dir from the sandbox (already read above).
     // Register sandbox-scoped shell and download tools.
     if let Some(ref work_dir) = session_work_dir {
@@ -211,12 +243,7 @@ pub async fn assemble(
                 inner: sb.provider(),
                 work_dir: work_dir.clone(),
                 session_id,
-                confirmations: state.confirmations.clone(),
-                notif_tx: notif_tx.clone(),
-                // Under fully_auto (unattended containers) even admin commands
-                // (sudo/su/…) must fail fast instead of blocking on a human
-                // confirmation that never arrives — mirror the sub-agent branch.
-                auto_confirm: is_fully_auto,
+                store: Arc::clone(&store),
             });
             registry.register(shell);
 
@@ -229,6 +256,22 @@ pub async fn assemble(
     }
 
     // ── Global tools ──
+    // ask_user: blocks the MAIN loop until the user replies (Claude Code style).
+    // Never registered for sub-agents (base_for_task/base_for_workflow below) —
+    // only the main loop may block on a human. Headless/fully_auto short-circuits.
+    registry.register(Arc::new(AskUserTool {
+        session_id,
+        store: Arc::clone(&store),
+    }));
+    // problem_model: session-scoped structural causal draft for HARD questions.
+    // Main loop only — sub-agents don't need to modify the parent's problem model.
+    registry.register(Arc::new(ProblemModelTool {
+        session_id,
+        store: Arc::clone(&store),
+    }));
+    // pipeline: tool-callable context pipeline (selective reuse / self-assembly).
+    // Main loop only — sub-agents keep their pre-built registries.
+    registry.register(Arc::new(PipelineTool));
     registry.register(Arc::new(
         everevo_agent::tools::builtins::BootstrapTool::new(state.bootstrap.clone()),
     ));
@@ -247,12 +290,14 @@ pub async fn assemble(
     registry.register(Arc::new(
         everevo_agent::tools::builtins::EnterPlanModeTool::new(
             Arc::clone(&plan_state),
+            session_id,
             state.config.data_dir.clone(),
         ),
     ));
     registry.register(Arc::new(
         everevo_agent::tools::builtins::ExitPlanModeTool::new(
             Arc::clone(&plan_state),
+            session_id,
             state.config.data_dir.clone(),
         ),
     ));
@@ -308,14 +353,7 @@ pub async fn assemble(
             .map(|sb| sb.provider());
         if let Some(sandbox) = sandbox_provider {
             // Build base_for_workflow before RealCallbacks so agent_run can use it
-            let mut wf_tools = ToolRegistry::new();
-            if let Some(shell) = registry.get("shell") {
-                wf_tools.register(Arc::clone(shell));
-            }
-            if let Some(memory) = registry.get("memory") {
-                wf_tools.register(Arc::clone(memory));
-            }
-            let wf_tools = Arc::new(wf_tools);
+            let wf_tools = Arc::new(registry.subset(&["shell", "memory"]));
             let wf_llm = Arc::clone(client);
             let wf_sub_ctx = sub_ctx.clone();
             let wf_cancel = tokio_util::sync::CancellationToken::new();
@@ -396,14 +434,10 @@ pub async fn assemble(
                         everevo_core::llm::LlmMessage::user(prompt),
                     ];
                     let mt = if max_turns == 0 { 3 } else { max_turns };
+                    let llm: Arc<dyn everevo_core::LlmProvider> = self.llm.clone();
                     let result = everevo_agent::AgentLoop::new()
                         .with_max_turns(mt)
-                        .run_subagent(
-                            Arc::clone(&self.llm),
-                            Arc::clone(&self.tools),
-                            messages,
-                            self.cancel.clone(),
-                        )
+                        .run_subagent(llm, Arc::clone(&self.tools), messages, self.cancel.clone())
                         .await;
                     Ok(result)
                 }
@@ -472,29 +506,15 @@ pub async fn assemble(
     // ── Cluster tool ──
     // Build a SubAgentPool for cluster patterns (fan_out, map_reduce, verify)
     let cluster_pool = {
-        let mut cluster_base = ToolRegistry::new();
-        if let Some(shell) = registry.get("shell") {
-            cluster_base.register(Arc::clone(shell));
-        }
-        if let Some(memory) = registry.get("memory") {
-            cluster_base.register(Arc::clone(memory));
-        }
-        if let Some(read_file) = registry.get("read_file") {
-            cluster_base.register(Arc::clone(read_file));
-        }
-        if let Some(list_dir) = registry.get("list_dir") {
-            cluster_base.register(Arc::clone(list_dir));
-        }
-        if let Some(code_search) = registry.get("code_search") {
-            cluster_base.register(Arc::clone(code_search));
-        }
+        let cluster_base =
+            Arc::new(registry.subset(&["shell", "memory", "read_file", "list_dir", "code_search"]));
         let pool = everevo_agent::subagent_pool::SubAgentPool::new(
             everevo_agent::subagent_pool::SubAgentPoolConfig {
                 max_concurrent: 8,
                 timeout_secs: 300,
             },
             Arc::clone(client),
-            Arc::new(cluster_base),
+            cluster_base,
             sub_ctx.clone(),
             Arc::new(
                 session_work_dir
@@ -509,61 +529,43 @@ pub async fn assemble(
     ));
 
     // ── Base registries for sub-agents ──
-    let mut base_for_task = ToolRegistry::new();
-    if let Some(shell) = registry.get("shell") {
-        if is_fully_auto {
-            if let Some(sandboxes) = state.sandboxes.read().await.get(&session_id) {
-                let auto_shell = Arc::new(SandboxedShellTool {
-                    inner: sandboxes.provider(),
-                    work_dir: sandboxes.work_dir().clone(),
-                    session_id,
-                    confirmations: state.confirmations.clone(),
-                    notif_tx: notif_tx.clone(),
-                    auto_confirm: true,
-                });
-                base_for_task.register(auto_shell);
-            } else {
-                base_for_task.register(Arc::clone(shell));
-            }
-        } else {
-            base_for_task.register(Arc::clone(shell));
+    // base_for_task and base_for_workflow share the same tool set; the task
+    // variant swaps shell for an auto-confirming SandboxedShellTool under
+    // fully_auto (the per-session store's auto_confirm inherits it). Both
+    // derive from the single main registry by name.
+    let base_for_workflow = registry.subset(&[
+        "shell",
+        "memory",
+        "code_map",
+        "list_dir",
+        "read_file",
+        "code_search",
+    ]);
+    let mut base_for_task = registry.subset(&[
+        "shell",
+        "memory",
+        "code_map",
+        "list_dir",
+        "read_file",
+        "code_search",
+    ]);
+    if is_fully_auto {
+        if let Some(sandboxes) = state.sandboxes.read().await.get(&session_id) {
+            let auto_shell = Arc::new(SandboxedShellTool {
+                inner: sandboxes.provider(),
+                work_dir: sandboxes.work_dir().clone(),
+                session_id,
+                store: Arc::clone(&store),
+            });
+            base_for_task = base_for_workflow.subset(&[
+                "memory",
+                "code_map",
+                "list_dir",
+                "read_file",
+                "code_search",
+            ]);
+            base_for_task.register(auto_shell);
         }
-    }
-    if let Some(memory) = registry.get("memory") {
-        base_for_task.register(Arc::clone(memory));
-    }
-    if let Some(code_map) = registry.get("code_map") {
-        base_for_task.register(Arc::clone(code_map));
-    }
-    // Sub-agents need read access to workspace files for productive work
-    if let Some(list_dir) = registry.get("list_dir") {
-        base_for_task.register(Arc::clone(list_dir));
-    }
-    if let Some(read_file) = registry.get("read_file") {
-        base_for_task.register(Arc::clone(read_file));
-    }
-    if let Some(code_search) = registry.get("code_search") {
-        base_for_task.register(Arc::clone(code_search));
-    }
-
-    let mut base_for_workflow = ToolRegistry::new();
-    if let Some(shell) = registry.get("shell") {
-        base_for_workflow.register(Arc::clone(shell));
-    }
-    if let Some(memory) = registry.get("memory") {
-        base_for_workflow.register(Arc::clone(memory));
-    }
-    if let Some(code_map) = registry.get("code_map") {
-        base_for_workflow.register(Arc::clone(code_map));
-    }
-    if let Some(list_dir) = registry.get("list_dir") {
-        base_for_workflow.register(Arc::clone(list_dir));
-    }
-    if let Some(read_file) = registry.get("read_file") {
-        base_for_workflow.register(Arc::clone(read_file));
-    }
-    if let Some(code_search) = registry.get("code_search") {
-        base_for_workflow.register(Arc::clone(code_search));
     }
 
     // ── Task tool (sub-agent delegation) ──
@@ -571,19 +573,14 @@ pub async fn assemble(
     // base_for_task gets a task tool clone; TaskTool itself gets a copy without it.
     let max_depth = state.config.subagent_max_depth;
     let task_tool = if sub_ctx.depth < max_depth {
-        let mut task_registry = ToolRegistry::new();
-        for name in &[
+        let task_registry = base_for_task.subset(&[
             "shell",
             "memory",
             "code_map",
             "list_dir",
             "read_file",
             "code_search",
-        ] {
-            if let Some(tool) = base_for_task.get(name) {
-                task_registry.register(Arc::clone(tool));
-            }
-        }
+        ]);
         // Give sub-agents a TaskTool with tighter limits for deeper recursion
         let sub_task = everevo_agent::tools::builtins::TaskTool::new(
             Arc::new(state.config.data_dir.join("sandbox")),
@@ -683,13 +680,7 @@ pub async fn assemble(
     ));
 
     // ── Team tool — wired with LLM + tools for real sub-agent dispatch ──
-    let mut team_base = ToolRegistry::new();
-    if let Some(shell) = registry.get("shell") {
-        team_base.register(Arc::clone(shell));
-    }
-    if let Some(memory) = registry.get("memory") {
-        team_base.register(Arc::clone(memory));
-    }
+    let team_base = registry.subset(&["shell", "memory"]);
     let sandbox_root = state.config.data_dir.join("sandbox");
     let mut team_tool = everevo_agent::tools::builtins::TeamTool::new()
         .with_llm(Arc::clone(client))

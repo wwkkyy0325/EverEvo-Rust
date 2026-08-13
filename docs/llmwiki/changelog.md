@@ -4,6 +4,321 @@ All notable changes to EverEvo-Rust. Append-only, newest first.
 
 ---
 
+## 2026-08-13 — 物理重构:文件/文件夹对齐逻辑层次 + 拆大合小
+
+**背景:** 逻辑层次(审计/方案)已定,用户指令做**物理层**——文件/文件夹对齐逻辑层、拆 >900 行文件、合并逻辑相近小文件。计划经两轮研究(3 agent 侦察 + 大文件结构核实)后批准。
+
+**Workstream A — crate 归位(含 MCP):**
+- `everevo-webagent` app→tools(独立二进制,只依赖 everevo-net);`everevo-mcp` + `everevo-mcp-protocol` kernel→infra(MCP 是传输客户端);改 3 处 Cargo.toml path 依赖 + mcp 的 everevo-core path
+- 删 `server/src/problem_model.rs`(6 行垫片)+ `agent/src/sandbox.rs`(8 行垫片)+ `everevo-kernel/src/bootstrap/plugin_dev.rs.bak`(垃圾文件);修 agent/src/skill.rs 的 webagent builtin-skills 编译期路径
+- 文档:CLAUDE.md + design.md crate 列表改按层分组(依赖方向 kernel→infra→app→tools 无环)
+
+**Workstream B — 拆 3 个 >900 行文件(全部 <900):**
+- `loop_/mod.rs` 1126→37:`AgentLoop` struct+builders+run/run_subagent → `agent.rs`;~650 行测试 → `tests.rs`;mod.rs 成纯门面
+- `loop_/driver.rs` 1109→892:`ToolKind`+`classify_tool` → `classify.rs`;`deduplicate_tool_results` → `dedup.rs`;overflow-recovery LLM 调用 → `llm_call.rs`(LlmCallError 携带 overflow 标记,T4/T3 由调用方路由);token-stream 事件循环 → `token_stream.rs`(StreamAccum);turn-complete 遥测 → `retrospective.rs::emit_turn_complete`
+- `chat/handler.rs` 1093→891:auto-continue 循环 → `auto_continue.rs`(run_auto_continue,16 参数带 #[allow(too_many_arguments)]);`apply_session_agent_wiring` → `wiring.rs`
+
+**Workstream C — 合并(中等):**
+- `stages/verification/` 物理归组:gate.rs(difficulty+util)、skeptic.rs(evidence_checklist+verify_candidate)、discipline.rs(answer_discipline)、modeling.rs(problem_modeling);6 处 coupling 同步改(driver.rs/agent_character.rs/4 stage);stages/mod.rs + pipeline.rs re-export 保公共路径
+- `delegate/types.rs`(24)并入 `delegate/spawn.rs`;core `context/budget.rs`+`data.rs` 合并(estimate_tokens + ContextBudget + fragment/snapshot 类型,~517)
+- **C2 跳过**:RollingSummaryStage 实为 core stage;agent/context/rolling_summary.rs 是维护引擎(非 ContextStage),位置本就正确——侦察 agent 的误报
+
+**Workstream D — 微型路由按域归组:**
+- `routes/system_routes.rs` = health+model+mcp+tools;`knowledge_routes.rs` = kg+diary;`utility_routes.rs` = command+context+character+workspace;HTTP path 逐字保留;routes/mod.rs 更新
+
+**验证:** workspace 全绿(agent 299 + server 22/34 + core 92,0 FAILED)/ clippy -D warnings 0 / fmt 干净。所有公共路径经 re-export 保留(外部调用点零改动)。
+
+## 2026-08-13 — 底层大调整 P3 审计修复(主体完成)+ 真实服务冒烟
+
+**背景:** P0(统一循环+入口)/P1(工具归属)/P2(写入收敛)验收通过后,继续 P3 边界审计剩余项。
+
+**P3 修复(全部带单元测试,除 plan_mode 为 HIGH 外均为 MEDIUM):**
+- **verify_candidate 提示优先级倒置**:EvidenceChecklist(提交门)p2→p3,稳定排在 ProblemModeling/VerifyCandidate 之后——提交门提示不再先于建模/验证。
+- **agent_character token cap**:voice_samples + sources/ 无上限注入 → 4096-token 前缀保留截断(结构化字段在前,截断只砍样本尾巴)。
+- **cluster map_reduce items 上限 + cancel**:items 无上限 → cap_batch 纯函数,20 项上限 + 可见丢弃提示;claims 上限 5;cancel 传入全部子 agent 任务。
+- **shell `confirmed` 死路**:gate 文本承诺 `confirmed: true` 但永不读取 → schema + execute 读取,传给 ExecutionConfig.with_confirmed;git 守卫 confirmed 时跳过。
+- **web_search_delegate**:恒 is_error=false + max_results 忽略 → 读 max_results(1-20)入 prompt;子 agent Error:/Cancelled./空 → is_error=true。
+- **team 静默 nil 派发 + 超时孤儿**:nil 派发输出可见 "⚠️ NOT dispatched";30s 超时/信号量关闭 → cancel_all() 杀已派发成员;成员 token = 父 cancel 子 token。
+- **错误表对账**:DB 行 wrong-claim → `SessionContent::persist_user` 失败曾 `?` 杀整轮,改 warn+continue(修复 P2 引入的回归);补 视觉 describe_image 恢复行 + 沙箱恢复行。
+- **LOW(已知 3 项)**:pipeline 注释 "11 stages"→16;browser_bridge `c as u8` 截断 CJK URL → 全 UTF-8 百分号编码;parallel_agents 每任务 300s 硬超时 + 父 cancel 传播。
+
+**真实服务冒烟(debug 二进制 + 真实 deepseek):** 问候 SSE 全链路;shell 迁移工具答对 "main";**plan_mode session_id 修复实机验证**——双会话独立进计划模式(旧 bug 会 nil 冲突),写工具被拦截(改用只读读 .git/HEAD 答对),P2 DB 持久化全块结构正常。
+
+**验证:** workspace 全绿(agent 299)/ clippy 0 / fmt 干净 / 冒烟通过。
+
+**遗留:** 无。P0-P3 全部完成。
+
+## 2026-08-13 — P3 低风险收尾(15 LOW 全处理)+ 真实服务验收
+
+**背景:** 从压缩前 transcript 挖出完整 15 项 LOW 清单(子 agent 已核验全部存在),逐项处理 + 真实服务启动验收。
+
+**stage_catalog 完整派生(P1.2):** `TOOL_VISIBLE_STAGES` 静态实例表成为唯一来源,catalog 从 tool_visible 元数据派生 name/description;canned prompt 集中 `canonical_prompt()`;漂移守卫改测派生契约(1:1 覆盖 + tool_visible + 描述一致 + 无重复)。
+
+**plan mode 双轨合并:** MCP `plugin-plan-mode`(enter_plan_mode/exit_plan_mode)在独立进程无状态写,是骗 agent 以为写工具被拦的 no-op → 从 auto-load 移除;in-process EnterPlanMode/ExitPlanMode 成为唯一功能轨(写共享 PlanModeState,chat 路由读它做写过滤);AppState 字段类型统一 `PlanModeState`。
+
+**LOW 文档类:** pipeline.rs + stages/mod.rs 优先级文档补齐(漏 problem_modeling/verify_candidate/evidence_checklist p3、rolling_summary p75);verify_candidate.rs 过时措辞;problem_model_tool 补 add_nodes;error-transition-table 修正 Context overflow 行(实为 trim 半预算→一次重试→放弃,无紧急 LLM autocompact)+ Asset integrity 行(Fail when all missing)+ 补 auto-continue 升级 2 行 + thinking-only-turn 恢复行。
+
+**LOW 代码类:** parallel_agents 空 tasks → is_error=true;todo_write 缺失 todos → 形状提示;shell timeout_secs floor 1(0 瞬时杀进程)。
+
+**真实服务启动验收(debug + 真实 deepseek):** 服务起、health OK、普通 chat 答对 "main"(`Final answer: main`)、plan mode 合并验证——只有 `EnterPlanMode`(MCP no-op 消失)、写过滤生效(shell 被 registry 移除 → "Unknown tool shell, Available: 只读工具")、CJK 全链路正常。
+
+**验证:** workspace 全绿 / clippy 0 / fmt 干净 / 真实服务验收通过。**P0-P3 全部完成,无遗留。**
+
+## 2026-08-13 — P1.1 遗留:子 agent 基础注册表收敛(5 份手抄 → 名称列表)
+
+- assemble() 里 base_for_task / base_for_workflow / cluster_base / wf_tools / team_base / task_registry 六处手写 `ToolRegistry::new()` + `if let Some(...) register(Arc::clone(...))` → 全部改用现成的 `ToolRegistry::subset(&[names])` 从主注册表按名派生。
+- base_for_task/base_for_workflow 共享同一 6 工具名称表;fully_auto 下 auto_shell 替换 plain shell 的逻辑保留(经 subset 去 shell + 注册 auto_shell)。
+- 主注册表成为子 agent 工具集的**单一来源**;五份手抄克隆样板消除。
+- 验证:`cargo check/test -p everevo-server` 全绿 / clippy 0 / fmt 干净。
+
+---
+
+## 2026-08-13 — GAIA 验证轮(1800s 官方)+ 边界审计
+
+**GAIA 验证轮(6 个错题,index 30/33/46/57/69/81,1800s,official scoring,EVEREVO_BENCHMARK_WALLCLOCK=1770):2/6 EXACT,0 超时,4 提交但错。**
+- ✅ **arXiv(33) EXACT 31** — 曾 400s 超时空 pred → **恢复且答对**。防超时修复(满足性终止判据 + verified-aware 提示)生效。
+- ✅ Tropicos(46) EXACT 3 — 本来就对(选题误选:b9763138 是 Tropicos 非 PubChem 4192,建模纪律题没测到)。
+- ❌ 4 提交但错:NatGeo 3.8 vs 1.8(1391s/136 工具)、Freon 193 vs 55(221s/25)、BoxOffice 3 vs 6(223s/30)、Crocodiles 20 vs 6(198s/24)。
+- **0/6 空 pred 超时**(此前 6 题中 4 题 400s 超时)——收敛修复的**主目标达成**。
+- 新主战场 = **提交但值错**:BoxOffice/Freon/Crocodiles 仅 24-30 工具 ~200s 提交,疑似满足性触发过早/弱证据提交(收敛 vs 正确性平衡待查)。
+- 机制确认:server env `EVEREVO_BENCHMARK=1`;verify_candidate 463 次、problem_model 48 次。结果 `gaia_results_20260813_113355.json`。
+- **选题教训:** gaia_bench `--questions` 序号是完整 165 行列表的 1-based 位置(2 个 unsupported 附件仍被 append,只计数),不是过滤后列表。
+
+**边界审计(4 维 × 39 agent,对抗验证):26 确认 / 9 证伪。**
+- **HIGH:** plan_mode 状态 key 在从不注入的 `params["session_id"]` → 全局单例,工具发起的 plan mode 永不触发逐会话过滤。
+- **MEDIUM(关键):** difficulty 分类器只认 ASCII 数字/英文关键词 → 中文困难题误判 Simple 跳过验证(默认 persona zh-CN);agent_character 无 token 上限;verify_candidate priority 倒置(EvidenceChecklist p2 排在 ProblemModeling/VerifyCandidate p3 前,提交门提示先于建模/验证);shell builtins 永不读 `confirmed`;web_search_delegate 恒 is_error=false + max_results 忽略;cluster map_reduce items 无上限 + 忽略 cancel;team 静默 nil 派发 + 30s 超时孤儿;错误表 DB 行 wrong-claim + 沙箱/视觉恢复缺表。
+- **LOW:** 15(pipeline 文档过期"11 stages"=16、browser_bridge 中文 URL 截断、parallel_agents 无超时等)。
+
+---
+
+## 2026-08-13 — 状态机全接入(方案 A,FSM T21-T26)
+
+**背景:** 用户指令"agent 全部接入状态机"(先出设计文档 → 确认"先做a等级")。差距分析发现主循环骨架走 FSM(T1-T20),但**收敛升级 + 验证螺旋两个行为是内联 `if/else`,不在状态机里**。
+
+**实施:**
+- `state.rs`:新增 `Stalled`(验证螺旋)/ `Escalating`(收敛升级)状态;`VerifiedStalled`/`BudgetConverge`/`BudgetCommit` 事件;**T21 Act→Stalled、T23/T25 Act→Escalating、T22/T24 循环边界回归 Observe、T26 全局 WallClockLow 覆盖**。测试断言每一行(14 项全过)。
+- `driver.rs` section 6:内联收敛/螺旋逻辑改为 `transition()` 路由。优先级 **Commit > Converge > Stalled**(同 turn 互斥);verified-aware 提示在升级阶段覆盖螺旋提示。
+- 文档:`agent-states.md`(状态表/转移表更新至 T26)、`error-transition-table.md`(验证螺旋行引用 T21/T23/T25/T26)、设计文档 `agent-fsm-full-integration.md` 标记 IMPLEMENTED。
+
+**决策(默认推荐):** 仅 Act→Stalled(不加 Solve→Stalled);Escalating 独立(不复用 Converge);预算行/观察期保持现状。
+
+**验证:** `cargo check -p everevo-agent` ✓;`cargo test -p everevo-agent --lib state` 14 passed ✓。
+
+**为后续底层大调整铺路:** 状态机现在是行为地图(T1-T26),新行为新增状态/事件/转移即可,测试防漂移。
+
+---
+
+## 2026-08-13 — 跑分反馈学习:agent 收敛(anti-verification-spiral)
+
+**分析批 4-7(24 题,5 EXACT / 19 FAIL)根因:**
+- **13/19 超时** — 同一形状:agent 已有带来源候选(VERIFIED),却继续"更严谨"地重搜/重验证,400s 硬停、空 pred。根因是认知框架缺**停止判据**——verified 且无矛盾的候选不构成终止条件。
+- **4/19 提交但错** — 对不完整证据的虚假自信(Box Office 截断页自称 VERIFIED;循环验证警告被自己圆过去)。1 厂商错误(DeepSeek HTTP 500)、1 GT 错字(Polybius/Ploybius)。
+
+**权威依据:** CGDP(arXiv 2605.07042)耗尽门省 39% token 不掉分;SAAS(2605.29796)直击"证据已足仍不终止";satisficing 满足性判据;groundedness 声明须追溯到检索来源。
+
+**实施(两层,与框架对称):**
+- **静态规则(ContextStage)**:AnswerDiscipline 加**满足性终止判据**(候选+≥1 直接来源+无矛盾=SUFFICIENT→立即提交);VerifyCandidate 加"一次性检查点,过则即交"+ 循环验证警告=需独立重推;EvidenceChecklist 加"已验证项保持完成,全项完成后提交,不扩展清单";ProblemModeling 加"≤3 次 problem_model 调用 + cluster map_reduce 并行采集(禁止串行)+ 瞬时失败记 UNKNOWN"。
+- **运行时强制(driver.rs)**:新增 `post_verify_turns` 计数 + `POST_VERIFY_STALL_TURNS=6`;已验证但继续探索时,收敛提示换成 **verified-aware**(`verified_wrapup_prompt`/`verified_deadline_prompt`,点名模型已拥有的值),与现有"未验证即提交"门(line 458)对称。收敛阈值**保持原值**(turn 0.85/0.70,wall 0.15/0.30)——阈值微调方向已按用户指令放弃。
+- **SYSTEM_PROMPT Critical Rules**:视觉/工具失败协议(describe_image 失败两次禁止像素取证,改用离线脚本或提交最佳努力并标 [UNVERIFIED])。
+
+**验证:** `cargo check --workspace` ✓;`cargo test -p everevo-agent --lib` 280 passed ✓(convergence 9 项含新 verified-aware 测试);`cargo fmt --check` ✓;`cargo clippy -p everevo-agent -p everevo-core -- -D warnings` ✓。未触发 benchmark(绑定约束)。
+
+**任务文档:** `docs/llmwiki/tasks/2026-08-13-agent-convergence.md`
+
+---
+
+## 2026-08-13 — 错误集批量实测(批4/5/6):+5 恢复,0 回归
+
+- **批 4**(21,25,27,30,33,46):**3/6 EXACT**(17.056 / 3 / Li Peng),+3。问题建模层净正:agent 用 `problem_model`(因果草稿)+ `verify_candidate.py` 全链路。
+- **批 5**(49,57,64,69,61,67):1/6 EXACT(17)。3 题 400s 超时(研究重型)+ **视觉 502**(本地 Qwen 视觉没起 → 已启动)。
+- **批 6**(80,81,73,90,85,86):1/6 EXACT(2)。**发现 GAIA 数据错别字**:Polybius 题 GT="Ploybius"(agent 答对 "Polybius" 但官方按错别字判错)。
+- **累计 +5/18 恢复,0 回归**。修复后:空 action 默认 list、add_nodes 批量、紧凑 ≤5 节点、cluster 并行收集引导、helpful tool-not-found。
+
+---
+
+## 2026-08-13 — 问题建模层实测 + 错误转移表/工具注册文档
+
+**批 4 实测(21,25,27,30,33,46,attempts=1)**:**3/6 EXACT(50%)**,6 题全为之前 FAIL → **+3 恢复,0 回归**(17.056 / 3 / Li Peng)。**问题建模层净正** ✓:agent 在 Hard 题调用 `problem_model`(因果草稿)+ `verify_candidate.py`(确定性验证)全链路生效。
+
+**暴露并修复**:
+- 过度建模板:单题 8 次 `problem_model` 逐个 add_node(含 2 次空 action 浪费)→ **修复**:空 action 默认 `list`(不再报错)、加 `add_nodes` 批量 action(一次加多节点)、建模指引收紧为**紧凑模型 ≤5 节点**。
+- 3 题 400s 超时(建模+串行研究挤占预算)→ 指引加 **cluster map_reduce 并行收集**("独立子部分并行研究再入模型")+ 时间纪律。
+- tool-not-found 错误改为**列出可用工具**(helpful,agent 可恢复)。
+
+**新增文档**:`docs/llmwiki/error-transition-table.md`(错误转移表:每类错误→检测→恢复→耗尽兜底,不 throw-and-ignore)+ `docs/llmwiki/tool-registration.md`(工具注册时机/数量/机制/生效/联调)。
+
+---
+
+## 2026-08-13 — 问题建模层 + 管线即工具(ADR 0010/0011)
+
+**问题建模层(Phase A,ADR 0010)**:困难题主动建模。
+- 新增 `ProblemModelStore`(session 作用域因果图:子问题/事实/声明/候选/约束节点 + 因果/依赖/证据/矛盾边 + VERIFIED/UNVERIFIED/UNKNOWN 三态)+ `problem_model` 工具(init/add_node/add_edge/update_status/list/finalize,main-loop only)。
+- 新增 `ProblemModelingStage`(Hard-only,priority 3,验证前):引导因果草稿→查权威→多方考究→按模型系统作答。
+- driver 加 `is_problem_model_finalize` + `model_drafted`:Hard 提交门控在未验证且未建模时建议建模(信息性,非强制)。
+- post-turn 方案沉淀:finalized 模型 → 保存通用 `causal-draft-problem-modeling` workflow(仅流程结构,不含具体内容,防污染;benchmark 跳过)。
+
+**管线即工具(Phase B,ADR 0011)**:默认行为 + 工具调用并存。
+- `ContextStage` 加 `tool_visible()`/`description()` 元数据;标记 4 个验证/建模 stage。
+- `stage_catalog()`(agent)+ `pipeline` 工具(main-loop only):`list_stages` / `run_stage`(选择性复用部分)/ `run_pipeline`(子集)/ `compose`(关键词推荐序列,SELF-DISCOVER-lite)。
+- 默认管线按 priority 自动注入不变;工具是按需补充。
+
+**服务启动验证(2026-08-13)**:release server 构建 + 启动成功,`/api/health` status ok,DB/LLM/视觉配置 pass;唯一 `fail=1` 为既有 "Asset integrity 未 provisioned"(非本次引入)。验证后已停止服务。
+
+验证:`cargo test --workspace` 全绿(server 27 / agent 274),fmt/clippy 干净。未触发 benchmark。
+
+---
+
+## 2026-08-13 — P1 软性三级角色 + P2 上下文边界清理(ADR 0009)
+
+**软性三级角色**(ADR 0009,按用户修正:在归档的 Supervisor/SubAgent/Skill 设计基础上改造,不硬砍):
+- 新增 `subagent_roles.rs`:`AgentRole`(共享词汇)+ `AgentTier`(Supervisor/SubAgent/Verifier 软分层**标注**)。现有 `stype_guidance`/`TeamRole` 保留各自提示词与行为;`code-explorer`→Researcher 保留历史默认;可扩展。
+- 子代理上下文预算软穿窗:`SubAgentContext.max_context_tokens`(默认 80000)继承父模型窗口,喂给子代理 AgentLoop 上下文上限(`×4` chars/token);`assemble_subagent_context` 加可选参数,handler 传主窗口。
+
+**P2 上下文边界清理**(用户核心目的:描绘边界,防上下文污染):
+- drift-bomb 去重:"我做了X/继续"只留 `TaskStateStage`;"Fix tests/验证/Match style"只留 `BestPracticesStage`;从 SYSTEM_PROMPT 移除(一个约定只放一层)。
+- **认知边界规则**(AnswerDiscipline Hard):`[VERIFIED]/[UNVERIFIED]/[UNKNOWN]` 三态显式标注,只提交 VERIFIED —— "让 agent 知道什么不知道什么"的直接落地。
+- Hard 验证 prompt 套 `clamp_verify_fragment` 宽松上限(基于 memory 分配,当前无截断,防最坏情况)。
+
+验证:`cargo test --workspace` 全绿(274 agent),fmt/clippy 干净。
+
+---
+
+## 2026-08-12 — P0 状态机 + 会话生命周期 + 熔断器(ADR 0008)
+
+**主循环显式 FSM**(`loop_/state.rs`,ADR 0008):把平铺 while + 12 隐式终止弧 + 3 重循环弧形式化为 `LoopState/LoopEvent/transition` 转移表 **T1-T20**,单测逐行断言(`docs/llmwiki/agent-states.md` 为同源文档防漂移)。`run_loop` 决策点全部走 `transition()`(控制流重构,语义不变)。
+
+**缺口修复**:`run_loop` 轮间 `Observe` 态检查 `cancel.is_cancelled()`(T16)—— 此前 cancel 只能等下一次 LLM/工具调用才生效,现在 ≤1 轮生效。
+
+**熔断器 + 退避**(`llm/http.rs`):`Closed→Open→HalfOpen→Closed`,5 次连续瞬时失败(429/5xx)→ 30s 冷却 → 半开探测;原有指数退避(1s/2s/4s,MAX_RETRIES=3)保留。provider 宕机/限流时全会话 fast-fail,不再每次烧退避。
+
+**会话生命周期复活**:`SessionState` 枚举(types.rs,原死代码)接线 —— Running(会话开始)/WaitingUser(ask_user 阻塞)/Completed(finalize)/Failed(错误或 panic),经 `update_session_metadata` 持久化;`GET /api/sessions/{id}` 状态端点报告真实状态。
+
+**harness 逐题状态机**:`gaia_bench.py` `classify_terminal_state()` 显式分类 `ok/timed_out/error`,checkpoint 加 `state` 字段;Phase-1b 重提示期间为 `verifying`。
+
+验证:`cargo test -p everevo-agent --lib` 270 通过(+6 FSM +4 熔断),`cargo test -p everevo-server --lib` 22 通过,零警告。
+
+---
+
+## 2026-08-12 — 自适应多方验证 (Adaptive Multi-Party Verification) + 错误集批量恢复
+
+**错误集爬升(attempts 降至 1 前两批)**:批量1(7题,att3)恢复 2/7,批量2(6题,att2)恢复 2/6 = **累计 4/13 恢复、0 回归**,预测 107 → 111/165 (67.3%)。**关键发现**:`pass@1` 恒等于 `pass@N` —— temp 0.0 下投票零价值(每题 N 个全新 session,N× 全量成本),故后续一律 `--attempts 1`。
+
+**新架构:自适应多方验证**(ADR 0007,研究背书 VerifiAgent / Leni arXiv 2607.17044 / CalVerT / DeepVerifier):
+- 新增 `stages/difficulty.rs`:确定性免费难度分类(数字/计数/歧义/附件/长度 → Simple|Hard,保守偏 Hard)。
+- `VerifyCandidate` / `EvidenceChecklist` 门控:Simple 题返回 None 完全不注入;`AnswerDiscipline` 拆两档(Simple 只留格式契约短版)。简单题零验证开销,研究实证强制验证伤简单题。
+- Hard 题强化多方验证:两个 stage 重构为**独立评审 persona**(非回答作者,破自我参考陷阱);`verify_candidate.py` 确定性验证强制,分歧时升级 `cluster verify` 对抗子代理。
+- **loop 提交门控**(driver.rs):Hard 题未经验证就提交 → re-prompt(上限 2 次,时间/轮数感知),之后最佳努力提交;Simple 零干预。
+- meta-agent 自治诊断按难度门控(Simple 会话不触发)。
+- 弃用 `--attempts N` 投票(已实测零价值)。
+
+**gaia_bench.py 离线缓存加载**:GAIA 门控数据已在本地 HF 缓存 → 无 HF_TOKEN 时离线读缓存(165 题 + 36 附件本地解析),不再回退 sample 0 题。token 只在首次下载需要。
+
+验证:`cargo test -p everevo-agent --lib` 260 通过,`cargo clippy -p everevo-agent` 干净。
+
+---
+
+## 2026-08-12 — 全量 L1+L2+L3 首跑 107/165 (64.8%);阈值参数化 + 官方对齐
+
+**Run-7f(全量 165 题,deepseek 主脑 + 本地 Qwen3.5-2B 视觉):107/165 = 64.8%**。按级别:L1 **45/53 (84.9%)**(追平 run-4 L1 最佳)、L2 50/86 (58.1%)、L3 12/26 (46.2%)。**400 错误全 0**(此前每轮 40-50% 题 400 失败),所有失败均为真实答错或 300s 收敛超时(~8-10 题)。官方提交格式已导出(`submission_20260812_185556.jsonl`),`scripts/官网校验.py` 复核 107/165。
+
+**400 根因链完整修复**(Workflow 多代理审查确认):
+1. 空 content(文本块/单工具结果)→ body.rs 空格占位。
+2. run_subagent 多工具 payload 格式错误(`[id]: content` 行格式 → JSON `[{"i","c"}]`)→ 子代理交替断裂。
+3. **mask_observations 把多工具结果掩码成非 JSON 头部**(保留 `tool_call_id="id1|id2"`)→ body 解析失败 → 0 个 tool_result 块 → 交替断裂。修复:mask 跳过多工具结果 + body 解析失败时按 `|` 拆 id 兜底发 tool_result。
+4. 清洗器(后置 sweep):任何消息任何块的空 content 都替换为空格。
+
+**阈值参数化(为官方对齐准备)**:`EVEREVO_MAX_TURNS`(默认 20)、`EVEREVO_BENCHMARK_WALLCLOCK`(默认 300)、`EVEREVO_MAX_OUTPUT_TOKENS`(默认 16384)、`EVEREVO_THINKING_BUDGET`(已有)全部 env 可配;driver.rs 收敛 nudge 的 wall_frac 改用实际总时长。GAIA 官方每题上限 1800s —— 下次跑:1800s / 200 轮 / 不限思考。
+
+**核心修复的真实价值**(非仅测评):web_search 委托、流式 id-less 参数、400 空 content 都是真实 bug,普通聊天同样受益;仅收敛门控是 benchmark 专属。
+
+## 2026-08-12 — deepseek 全量 L1+L2+L3 + 修复 deepseek 400 "non-empty content" bug
+
+用户决策变更:放弃本地 Qwen3.5-2B 当主脑(2B 收敛失败,smoke 全超时空 pred),**主脑换回 deepseek-v4-flash**,本地 Qwen3.5-2B(18080,llama.cpp + `--mmproj`,ctx 从 262144 收到 **32768**)改为**仅视觉**用途。全量 `--level all`(165 题,2 附件跳过)workers=6。
+
+**修复 — `llm/http/body.rs`(deepseek anthropic 400 bug)**:全量跑发现约 40% 题目报 `HTTP 400 "messages.11: all messages must have non-empty content"`。根因:anthropic body 构造时,空 content 消息会序列化成 `{"type":"text","text":""}`,或空工具输出变成空 `tool_result.content`(空 shell 输出/空 assistant 回合)→ deepseek 拒绝整条消息,打断答案提取(pred 变成一长串散文)。修复:
+- text 块:content 为空且无 thinking/tools 时用单个空格占位(语义惰性,deepseek 只要求非空)。
+- tool_result:content 为空时同样用空格占位。
+- **回归测试** `anthropic_body_never_sends_empty_text_block` + `anthropic_body_guards_empty_tool_result`:断言空消息不再产生空块。
+
+验证:`cargo test -p everevo-agent --lib` 通过(2 新 + 245 旧),`cargo check` 干净,release 重建。修复前 400 命中 ~40%(2/5 题);修复后全量重跑中。
+
+**Run-7 partial(修复前)结果**:5 题完成 3 EXACT(Kipchoge 17、Mercedes Sosa 3、34689)+ 2 FAIL(均带 400)。deepseek 答对本地 2B 连续失败的两道题(每题 76-83s)。
+
+## 2026-08-12 — GAIA 本地 2B smoke:Q1/Q2/Q3 全部 300s 超时空 pred → 主循环加 wall-clock 硬截止
+
+流式 bug 修复后复跑 smoke(limit 5):工具调用全部正常(web_search_local 返回 2440-3987 字符真实内容,delegate 委托 deepseek 搜索确认出活),但 **Q1/Q2/Q3 仍全部 300s 超时且 pred 为空**。新根因 = **收敛失败**:本地 2B 每轮 LLM+工具 15-25s,15 个搜索就耗尽 300s,永远走不到 `max_turns=20` 的强制收尾;逐轮收敛 nudge(剩 90s/45s 时注入 "STOP exploring")只是往对话里塞文字,模型无视照搜不误。Q3 更极端——只做 2 个工具调用就超时(思考烧掉了其余 wall-clock)。
+
+**修复** — `loop_/driver.rs` 主循环末尾(nudge 块之后):
+- benchmark 模式(`wall_clock_deadline.is_some()` + `max_turns > 0`)下,当剩余 wall-clock ≤ 30s 时 `break`,落入已有的强制终局提交路径(768 行,无工具 LLM 调用提取最终值)。
+- 效果:慢模型也保证产出非空 pred,而不是被 harness 外部 kill 成空。对能跑到 max_turns 的快模型(deepseek)无行为变化(30s 阈值远在 max_turns 触发之后)。
+- **回归测试** `test_wallclock_hardstop_forces_terminal_commit`:喂 2 组工具调用流 + 1 条文字、`wall_deadline` 已过期、`max_turns=20`;断言 `call_count == 2`(break 后只跑一次强制提交调用,而非继续搜)。红绿验证:禁用 break → `call_count=4` FAIL → 启用 → PASS。
+
+验证:`cargo check --workspace` 绿、`cargo test -p everevo-agent --lib` 245 pass/0 fail、`cargo clippy --workspace -D warnings` 干净。本轮代码改动全部完成并验证;旧二进制 smoke 已停;release 重建中,重建完成后按污染协议重跑 smoke(limit 5)。
+
+## 2026-08-12 — 修复流式工具调用参数碎片被丢弃 bug(id-less deltas)→ 所有工具调用 "Missing <param>"
+
+GAIA smoke 复跑时发现主循环(非委托)的**真正故障**:llama-server(OpenAI 兼容流)流式发送工具参数时,**只有第一片参数带 `id`**,后续参数碎片不带 `id`(OpenAI 流式约定)。而 `run_loop` 与 `run_subagent` 两处事件循环都按 `pending_id == &id` 严格匹配:
+
+- 空 `id` 的参数碎片(`"query":"..."` 等)全部被丢弃 → 累积下来的参数只有孤零零的 `{`。
+- `serde_json::from_str("{")` 失败 → `unwrap_or_default()` 得 `Value::Null` → 所有需要参数的工俱一律报 "Missing '<param>'"。
+- smoke 实测:web_search_local 每次调用(07:51-07:54,10+ 次)全挂 "Missing 'query'",shell 也报 "command is required";2B 模型陷入"搜索→失败→再搜索"死循环烧光 300s。
+
+**修复**(两处同样的代码,均为 `loop_/`):
+- **`driver.rs`(主循环 `run_loop`)与 `mod.rs`(`run_subagent`)**:`pending_tool` 从 `Option<(id,name,args)>` 改为 `Vec<...>`;`ToolCallArg` 空 id 碎片归属当前工具调用(append 到 `pending_tool.last_mut()`);`Done` 时 `drain(..)` 全部工具调用(此前只保留最后一个,前面的整段丢失)。
+- **回归测试** `test_stream_idless_arg_deltas_accumulate`:用 `MockLlmProvider::with_stream` 复刻 llama-server 的 id-less 碎片序列,断言 `AgentEvent::ToolCallStart.arguments == {"text":"hello"}`。红绿验证:旧代码 `left: Null`(FAIL)→ 新代码 PASS。
+
+验证:`cargo test --workspace` 全绿(exit 0)、`cargo clippy -p everevo-agent -- -D warnings` 干净。llama-server 冷启动无孤儿生成。
+
+## 2026-08-12 — web_search_local 委托 deepseek 原生 web 搜索(本地视觉主脑 + 云端搜索腿)
+
+GAIA L1 本地模型接入排障根因:本地 Qwen3.5-2B(llama-server,port 18080)主脑 + 插件 `web_search_local`(cn.bing/Sogou/DDG 链)在 GAIA 下每次返回 ~25 字符空结果(anti-bot/GFW)→ 模型在无用搜索上死循环烧光 300s wall-clock → 超时。按用户决策(B 选项)实现 **本地推理 + 委托 deepseek 搜**:
+
+- **`app_state.rs`**:加 `web_search_llm: RwLock<Option<ResolvedProvider>>`,`AppState::new` 后调 `resolve_web_search_provider()`。
+- **`app_state/providers.rs`**:新 `resolve_web_search_provider()` — 找第一个 `api_format == "anthropic"` 的 `[[llm]]` 条目(默认 "anthropic"),复用现有 client。
+- **`web_search_delegate.rs`(新)**:同名 `web_search_local` 工具,`execute()` 内用 `run_subagent(max_turns=3)` 跑整轮研究 — deepseek 的 Anthropic 端点**服务端执行** `web_search_20250305`,多轮搜索后单请求合成带出处的答案(结果 `encrypted_content` 只有 deepseek 能读,故委托返回合成文本而非原文)。
+- **`orchestration/tools.rs`**:插件加载后、per-session 工具前,若 delegate 已解析则 `ToolRegistry::register` 同名替换(`research_search` 插件工具不受影响)。
+- **`routes/config.rs`**:3 处 resolve 点(`put_config`/`reload_llm`/`put_routing`)补 `resolve_web_search_provider()`。
+
+验证:单请求研究实测通过(deepseek 服务端多轮搜索 + 合成答案,Mercedes Sosa → 3 张专辑 = GAIA 正确答案);`cargo check --workspace` 通过。llama-server 重启清掉 300s 超时未取消的孤儿长生成(2006 任务 44k+ token 占满 GPU slot)后重跑 GAIA smoke。
+
+## 2026-08-12 — 架构审计 + 修复审计发现的 2 个新功能缺陷(B1/B2),真实服务实机验证
+
+全仓架构审计完成(6 维探查 + 逐条对抗复核,42 sub-agent,0 错误):**36 条发现 = 1 Critical + 19 Major + 16 Minor + 1 Refuted**。报告存档 `<user-home>\AppData\Local\Temp\everevo-architecture-audit.html`(临时目录,建议归档进 docs/llmwiki)。
+
+**随审计当场修复并实机验证的 2 个新功能缺陷**:
+
+- **B1(fix)**:`loop_/driver.rs:405` 调 `execute_with_hooks` 时硬编码传 `None` 作 cancel token → 阻塞中的 `ask_user` 走 `rx.await` 无取消分支,`/interrupt` 与 SSE 断开都无法终止(会话永久卡死)。改为传 `cancel`,取消链路(AgentLoop → driver 参数)原本就存在。**实机验证**:`awaiting_user` 出现后 POST /interrupt → 日志 "LLM stream cancelled by user" → terminal=done 497ms;ask_user oneshot map 已清理(再 POST /ask → HTTP 404);会话未楔死,后续消息正常。
+- **B2(fix)**:auto-continue 循环重建的 `agent2`(`routes/chat/handler.rs:874`)缺 `.with_context_budget(context_window_tokens * 4)` → 回落到 `AgentLoop` 默认 80_000 字符硬编码,同一会话主跑 ~524k 预算 / 续跑 80k 两套上限。已补上,与主循环同款 per-model 上下文上限。
+
+**实机验证结果**(真实服务,新功能全部 PASS):
+- ask_user Test 1:`awaiting_user` SSE → POST /api/sessions/{id}/ask(reply="Blue")→ 200 → terminal=done;落库完整:assistant 提问占位 → user 回复 "Blue" → 工具结果 → 最终答复 "You chose blue. Final answer: Blue"。
+- ContextBudget 实机数学:context snapshot `max_context_tokens=128000 / safety_reserved=12800 / output_reserved=2560 / available_tokens=112640` —— 128k floor `resolve(None)` 精确匹配。
+
+验证:`cargo check --workspace` + `cargo test --workspace` 265 tests green。未触碰 benchmark / scoring 层;`EVEREVO_BENCHMARK` 未导出。
+
+## 2026-08-12 — 阻塞式 ask_user 工具(照抄 Claude Code)+ 模型上下文长度适配管线(128k floor)
+
+按用户决策「照抄 claude / token 预算从新到旧滑窗 / 落库持久化」实现两项功能。
+
+**Feature 1 — `ask_user` 阻塞式提问工具(仅主循环)**:
+- 新工具 `ask_user`(参数 `question`,必填),`risk_level: Low`,只注册在主 Agent 循环(sub-agent 不放)。
+- **无限期阻塞,无自动超时**(driver.rs 豁免),经 `AppState.ask_user` oneshot 停车 + `awaiting_user` SSE 事件通知前端;回复经新端点 `POST /api/sessions/{id}/ask`(body `{reply}`)触发 oneshot 恢复,空回复 400、无 pending 404。
+- 终止路径:SSE 断开 / `/interrupt` cancel(`tokio::select!` + cancel token)。benchmark(`EVEREVO_BENCHMARK=1`)与 fully_auto 短路返回固定文案,GAIA 不挂死。
+- **落库持久化**:提问作为 assistant 消息写入,回复作为 user 消息写入,刷新后可见。
+- 前端:`store.ts` 加 `askQueue` / `resolveAsk`,`awaiting_user` SSE push 队列;新 `AskUserDialog.tsx` 弹层(Enter 提交 / Shift+Enter 换行)。
+
+**Feature 2 — `ContextBudget` 上下文长度适配管线**:
+- 新 `everevo-core::context::budget::ContextBudget`,按**主模型 `context_window`** 每次请求计算:safety=10%、output=(window/50).clamp(2048,8192)、available 余量;fixed 14.5% + memory/domain 15% + rolling_summary 4% + history 余量(~66.5%),不变式 fixed+memory+summary+history==available。
+- **128k 是 floor 不是 clamp**:`None` → 128_000;`Some(32768)` 保持 32768。
+- `ContextBuildContext` 加 `budget` 字段;`ConversationHistoryStage` 改用 `history_window()` token 滑窗(从新到旧累积 `estimate_tokens` ≤ history 预算),`max_messages` 仅作 window==0 回退。
+- `MemoryStage` / `DomainStage` 输出按 `budget.stage(...)` 钳制 + 截断注记。
+- `AppState.main_llm` + `resolve_main_provider()`:按 `[routing] mainModelId`(fallback `"primary"`)解析主窗口;handler 计算预算并喂给 `ContextBuildContext` + `AgentLoop::with_context_budget(window*4)`——主会话告别 80_000 硬编码。
+- 核心 `LlmProviderConfig` 加 `#[serde(default)] context_window: Option<u32>` + `from_env_*` 环境变量(`*_CONTEXT_WINDOW`)。
+- 前端 routing 4+2 个模型 `<select>` option label 显示 `model · 128K`(null 不渲染,纯展示)。
+- `AppConfig.max_context_tokens` 不再驱动主输入预算,仅留 summarize_threshold 与 compact 维护用(doc-comment 已注明)。
+
+接口协议:ADR-0005 新建;api-registry.md 同步更新。全量验证见后。未重跑 benchmark。
+
 ## 2026-08-12 — 仓库卫生清理:删除编译产物/缓存/测试残留,文档归位,docs/ 建顶层索引,.gitignore 补全
 
 穷尽盘点(多 agent 交叉引用 + 人工复核)后清理与代码无关的杂物。**未触碰 crates/、frontend/、migrations/、src-tauri/ 的进行中代码(视觉/上下文管理 WIP)。**
@@ -265,7 +580,7 @@ is always true, so any host path is readable; the protection is quarantine, not 
 **Quarantine applied:** moved `data/bench/gaia-results/` (analysis/, gaia_results_*.json,
 checkpoint_*.jsonl, official_regrade_*.json, GAIA_L1_REPORT_*.md, server log, transcripts)
 and the HF GAIA dataset caches (`~/.cache/huggingface/hub/datasets--gaia-benchmark--GAIA`
-+ `~/.cache/huggingface/datasets/gaia-benchmark___gaia`) → `C:\Users\lcx\gaia-quarantine-20260811\`.
++ `~/.cache/huggingface/datasets/gaia-benchmark___gaia`) → `<user-home>\gaia-quarantine-20260811\`.
 Recreated empty `data/bench/gaia-results/`. Deleted one contaminated session tool_cache.
 Clean run launches with `HF_HOME`/`HF_DATASETS_CACHE` pointed at a fresh quarantine subdir
 (fresh download, obscured path, deleted after). Residual accepted: `data/db/everevo.db` +

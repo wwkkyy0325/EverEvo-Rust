@@ -42,6 +42,11 @@ pub struct AppConfig {
     pub database_path: Option<String>,
 
     /// Maximum tokens for conversation context window.
+    ///
+    /// Note: since the context-budget pipeline (2026-08-12), the main session's
+    /// input budget is driven by the main provider's `context_window`
+    /// (`ContextBudget::resolve`), not this field. This value now only feeds
+    /// `summarize_threshold` and compact-provider maintenance.
     #[serde(default = "default_max_context_tokens")]
     pub max_context_tokens: usize,
 
@@ -390,6 +395,9 @@ impl LlmProviderConfig {
             max_tokens: std::env::var("ANTHROPIC_MAX_TOKENS")
                 .ok()
                 .and_then(|s| s.parse().ok()),
+            context_window: std::env::var("ANTHROPIC_CONTEXT_WINDOW")
+                .ok()
+                .and_then(|s| s.parse().ok()),
         })
     }
 
@@ -403,6 +411,9 @@ impl LlmProviderConfig {
             max_tokens: std::env::var("OPENAI_MAX_TOKENS")
                 .ok()
                 .and_then(|s| s.parse().ok()),
+            context_window: std::env::var("OPENAI_CONTEXT_WINDOW")
+                .ok()
+                .and_then(|s| s.parse().ok()),
         })
     }
 
@@ -414,6 +425,9 @@ impl LlmProviderConfig {
             model: std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "llama3.1".into()),
             base_url: Some(base_url),
             max_tokens: std::env::var("OLLAMA_MAX_TOKENS")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            context_window: std::env::var("OLLAMA_CONTEXT_WINDOW")
                 .ok()
                 .and_then(|s| s.parse().ok()),
         })

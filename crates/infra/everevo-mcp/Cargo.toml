@@ -7,7 +7,7 @@ license.workspace = true
 description = "EverEvo MCP (Model Context Protocol) client — connect to external tool servers"
 
 [dependencies]
-everevo-core = { path = "../everevo-core" }
+everevo-core = { path = "../../kernel/everevo-core" }
 everevo-mcp-protocol = { path = "../everevo-mcp-protocol" }
 
 serde = { workspace = true, features = ["derive"] }

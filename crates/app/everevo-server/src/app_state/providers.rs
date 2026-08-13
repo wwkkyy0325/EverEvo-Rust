@@ -170,4 +170,129 @@ impl AppState {
             );
         }
     }
+
+    /// Resolve the main execution provider and its `context_window`, used to
+    /// budget the primary chat session's context assembly.
+    ///
+    /// Reuses the same re-key rule as `load_llm_from_file`: `[routing]
+    /// mainModelId` wins, falling back to the "primary" re-key. Reads
+    /// config.toml fresh so it stays in sync after PUT /api/config or
+    /// /api/routing. Idempotent.
+    pub async fn resolve_main_provider(&self) {
+        let path = self.config.data_dir.join("config.toml");
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let table: toml::Value = match toml::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let llm_arr = match table.get("llm").and_then(|v| v.as_array()) {
+            Some(a) => a,
+            None => return,
+        };
+
+        let mut windows: HashMap<String, u32> = HashMap::new();
+        for entry in llm_arr {
+            let id = entry
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("primary")
+                .to_string();
+            if let Some(w) = entry.get("context_window").and_then(|v| v.as_integer()) {
+                windows.insert(id, w.max(0) as u32);
+            }
+        }
+
+        // Same precedence as load_llm_from_file: mainModelId, else "primary".
+        let main_id = table
+            .get("routing")
+            .and_then(|r| r.get("mainModelId"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "primary".to_string());
+
+        let main = {
+            let guard = self.llm.read().await;
+            guard
+                .get(&main_id)
+                .or_else(|| guard.get("primary"))
+                .and_then(|c| c.clone())
+                .map(|client| ResolvedProvider {
+                    client,
+                    context_window: windows
+                        .get(&main_id)
+                        .or_else(|| windows.get("primary"))
+                        .copied(),
+                })
+        };
+        *self.main_llm.write().await = main;
+        tracing::info!(main_id, "Main provider resolved");
+    }
+
+    /// Resolve the web-search delegate provider — the first Anthropic-format
+    /// `[[llm]]` entry (e.g. DeepSeek) whose API natively executes server-side
+    /// web search (`web_search_20250305`). When set, the in-process
+    /// `web_search_local` tool delegates research to it instead of the plugin's
+    /// cn.bing/Sogou chain. Reads config.toml fresh; idempotent.
+    pub async fn resolve_web_search_provider(&self) {
+        let path = self.config.data_dir.join("config.toml");
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let table: toml::Value = match toml::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let llm_arr = match table.get("llm").and_then(|v| v.as_array()) {
+            Some(a) => a,
+            None => return,
+        };
+
+        let mut windows: HashMap<String, u32> = HashMap::new();
+        for entry in llm_arr {
+            let id = entry
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("primary")
+                .to_string();
+            if let Some(w) = entry.get("context_window").and_then(|v| v.as_integer()) {
+                windows.insert(id, w.max(0) as u32);
+            }
+        }
+
+        // First entry whose API format supports server-side native web search.
+        // Default is "anthropic" (matches load_llm_from_file), so entries that
+        // omit api_format count as candidates; OpenAI/llama-server do not.
+        let ws_id = llm_arr
+            .iter()
+            .find(|e| {
+                e.get("api_format")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("anthropic")
+                    == "anthropic"
+            })
+            .and_then(|e| e.get("id").and_then(|v| v.as_str()))
+            .map(|s| s.to_string());
+
+        let ws = {
+            let guard = self.llm.read().await;
+            ws_id
+                .as_deref()
+                .and_then(|id| guard.get(id).and_then(|c| c.clone()))
+                .map(|client| ResolvedProvider {
+                    client,
+                    context_window: ws_id.as_deref().and_then(|id| windows.get(id).copied()),
+                })
+        };
+        *self.web_search_llm.write().await = ws;
+        if self.web_search_llm.read().await.is_some() {
+            tracing::info!(
+                ws_id = ws_id.unwrap_or_default(),
+                "Web-search delegate provider resolved"
+            );
+        }
+    }
 }

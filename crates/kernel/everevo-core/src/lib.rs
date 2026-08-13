@@ -18,9 +18,11 @@ pub mod context;
 pub mod error;
 pub mod llm;
 pub mod memory;
+pub mod problem_model;
 pub mod provider;
 pub mod retrieval;
 pub mod sandbox;
+pub mod session;
 pub mod slash_command;
 pub mod telemetry;
 pub mod tool;
@@ -37,8 +39,10 @@ pub use llm::{
     FinishReason, ImageData, LlmMessage, LlmProvider, LlmResponse, LlmRole, StreamEvent, ToolSchema,
 };
 pub use memory::{FactType, MemoryFact, MemoryIndexEntry, ProjectionMetadata, SourcePointer};
+pub use problem_model::{EdgeKind, EpiStatus, NodeKind, ProblemEdge, ProblemModel, ProblemNode};
 pub use provider::{BootstrapProvider, BootstrapStatus};
 pub use sandbox::{ExecutionConfig, ExecutionResult, SandboxProvider};
+pub use session::{AskNotification, ConfirmationNotification, PendingAsk, PendingConfirmation};
 pub use telemetry::{
     default_telemetry_pipeline, AgentTurnRecord, RetrievalRecord, SpanGuard, Telemetry,
     TelemetryConfig, TelemetryEmitContext, TelemetryPipeline, TelemetryRecord, TelemetrySnapshot,

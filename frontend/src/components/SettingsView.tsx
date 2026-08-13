@@ -437,6 +437,14 @@ const CASCADE_LABELS = [
   { label: 'L3 · 强力执行' },
 ];
 
+// Option label for a provider — appends the context window (e.g. "model · 128K")
+// when configured. null / missing = no suffix (pure display).
+function modelOptionLabel(p: Provider): string {
+  const name = p.model || '(未命名)';
+  if (p.context_window == null) return name;
+  return `${name} · ${Math.round(p.context_window / 1024)}K`;
+}
+
 function RoutingConfig() {
   const { config, setMainModel, setMainEffort, setTier, setVisionModel, setCompactModel, setMetaAgentEnabled } = useRoutingConfig();
   const [providers, setProviders] = useState<Provider[]>([]);
@@ -493,7 +501,7 @@ function RoutingConfig() {
               className="flex-1 bg-background border border-border rounded px-2.5 py-1.5 text-xs text-foreground
                          focus:outline-none focus:border-primary appearance-none cursor-pointer">
               {providers.map((p) => (
-                <option key={p.id} value={p.id}>{p.model || '(未命名)'}</option>
+                <option key={p.id} value={p.id}>{modelOptionLabel(p)}</option>
               ))}
             </select>
             <select value={config.mainEffort}
@@ -524,7 +532,7 @@ function RoutingConfig() {
                   className="flex-1 bg-background border border-border rounded px-2.5 py-1.5 text-xs text-foreground
                              focus:outline-none focus:border-primary appearance-none cursor-pointer">
                   {providers.map((p) => (
-                    <option key={p.id} value={p.id}>{p.model || '(未命名)'}</option>
+                    <option key={p.id} value={p.id}>{modelOptionLabel(p)}</option>
                   ))}
                 </select>
                 <select value={tier.effort}
@@ -555,7 +563,7 @@ function RoutingConfig() {
                          focus:outline-none focus:border-primary appearance-none cursor-pointer">
               <option value="">不使用视觉模型</option>
               {providers.map((p) => (
-                <option key={p.id} value={p.id}>{p.model || '(未命名)'}</option>
+                <option key={p.id} value={p.id}>{modelOptionLabel(p)}</option>
               ))}
             </select>
           </div>
@@ -575,7 +583,7 @@ function RoutingConfig() {
                          focus:outline-none focus:border-primary appearance-none cursor-pointer">
               <option value="">复用主 Agent</option>
               {providers.map((p) => (
-                <option key={p.id} value={p.id}>{p.model || '(未命名)'}</option>
+                <option key={p.id} value={p.id}>{modelOptionLabel(p)}</option>
               ))}
             </select>
           </div>

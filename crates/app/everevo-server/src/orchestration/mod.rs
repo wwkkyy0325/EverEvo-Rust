@@ -133,6 +133,7 @@ pub async fn build_registry(
         session_id,
         client,
         &coord.confirm_tx,
+        &coord.ask_user_tx,
         permission_level,
         sub_ctx,
     )
@@ -141,6 +142,28 @@ pub async fn build_registry(
 
 /// Persist the assistant message and send closing SSE events with a 5s timeout.
 #[allow(clippy::too_many_arguments)]
+/// Persist a session's lifecycle state (`SessionState`) into its DB metadata
+/// JSON. Revives the previously-dead `SessionState` enum so the status endpoint
+/// and reconnect path report real state instead of an implicit-`idle` default.
+pub async fn set_session_state(
+    db: &everevo_db::Database,
+    session_id: Uuid,
+    new_state: everevo_core::types::SessionState,
+) {
+    let Ok(Some(session)) = db.get_session(session_id).await else {
+        return;
+    };
+    let mut meta: everevo_core::types::SessionMeta =
+        serde_json::from_str(&session.metadata).unwrap_or_default();
+    let state_str = new_state.as_str();
+    meta.state = new_state;
+    let serialized = serde_json::to_string(&meta).unwrap_or_default();
+    if let Err(e) = db.update_session_metadata(session_id, &serialized).await {
+        tracing::warn!(%session_id, state = %state_str, error = %e, "Failed to persist session state");
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // finalize bundles a full persisted response
 pub async fn finalize_response(
     tx: &mpsc::Sender<Result<Event, Infallible>>,
     state: &Arc<AppState>,

@@ -103,6 +103,51 @@ pub(super) async fn spawn_post_turn_tasks(
         });
     }
 
+    // Problem-model distillation (方案沉淀): if the session ended with a
+    // FINALIZED structural problem model, distill the GENERIC causal-draft
+    // process (the node/edge structure, NOT the specific question content —
+    // anti-contamination) into a reusable workflow. Lightweight: a fixed
+    // template of Agent steps; the existing `workflow_compose` above handles
+    // content-specific workflow extraction.
+    if !benchmark {
+        let pm_read = state.problem_models.read().await;
+        let finalized = pm_read
+            .get(&session_id)
+            .is_some_and(|m| m.finalized && !m.is_empty());
+        drop(pm_read);
+        if finalized {
+            spawn_guarded("problem_model_distill", {
+                let dir = state.config.data_dir.join("workflows");
+                async move {
+                    let runner = everevo_agent::tools::builtins::WorkflowRunnerTool::new()
+                        .with_workflows_dir(dir);
+                    let def_json = serde_json::json!({
+                        "name": "causal-draft-problem-modeling",
+                        "description": "Generic causal-draft problem modeling for complex questions: decompose into sub-questions, tag epistemic status, research + verify each, synthesize.",
+                        "steps": [
+                            {"id": "decompose", "type": "agent", "description": "Decompose the question into sub-questions / facts / claims; tag each VERIFIED/UNVERIFIED/UNKNOWN.", "params": {"prompt": "Decompose the task into sub-questions and key claims. For each, note whether a retrieved source states it."}},
+                            {"id": "research", "type": "agent", "description": "Search authoritative sources for each sub-question; record the source for every value.", "params": {"prompt": "Research each sub-question via authoritative sources and record the exact source for every value."}},
+                            {"id": "verify", "type": "agent", "description": "Run the deterministic verifier, then adversarial review on disagreement.", "params": {"prompt": "Verify each candidate value: recompute numerics, check verbatim fidelity against the source, and escalate to adversarial review on disagreement."}},
+                            {"id": "answer", "type": "agent", "description": "Finalize and answer each sub-question with its [VERIFIED] source.", "params": {"prompt": "Produce the final answer: each sub-question gets its value with its verified source."}}
+                        ]
+                    });
+                    match serde_json::from_value(def_json) {
+                        Ok(def) => {
+                            if let Err(e) =
+                                runner.save_workflow("causal-draft-problem-modeling", &def)
+                            {
+                                tracing::warn!(error = %e, "Failed to save distilled problem-modeling workflow");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Failed to parse distilled workflow def")
+                        }
+                    }
+                }
+            });
+        }
+    }
+
     // Persona auto-update (evolves communication style from accumulated facts)
     if !benchmark {
         spawn_guarded("persona_update", {

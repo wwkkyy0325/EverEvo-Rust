@@ -41,6 +41,7 @@ use everevo_agent::tools::builtins::{SubAgentHandle, SubAgentStatus};
 pub struct SessionReceivers {
     pub sse_rx: mpsc::Receiver<Result<axum::response::sse::Event, std::convert::Infallible>>,
     pub confirm_rx: mpsc::UnboundedReceiver<crate::app_state::ConfirmationNotification>,
+    pub ask_user_rx: mpsc::UnboundedReceiver<crate::app_state::AskNotification>,
 }
 
 #[derive(Clone)]
@@ -52,6 +53,8 @@ pub struct SessionCoordinator {
     pub tx_sse: mpsc::Sender<Result<axum::response::sse::Event, std::convert::Infallible>>,
     /// Shell confirmation notification sender (cloned to SandboxedShellTool).
     pub confirm_tx: mpsc::UnboundedSender<crate::app_state::ConfirmationNotification>,
+    /// Ask-user notification sender (cloned to AskUserTool).
+    pub ask_user_tx: mpsc::UnboundedSender<crate::app_state::AskNotification>,
 
     // ── Shared State (Arc/Mutex — Clone) ────────────────
     /// Running sub-agent count — AgentLoop blocks "Done" while >0.
@@ -79,11 +82,13 @@ impl SessionCoordinator {
     pub fn new(session_id: Uuid) -> (Self, SessionReceivers) {
         let (tx_sse, sse_rx) = mpsc::channel(256);
         let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
+        let (ask_user_tx, ask_user_rx) = mpsc::unbounded_channel();
 
         let coord = Self {
             session_id,
             tx_sse,
             confirm_tx,
+            ask_user_tx,
             pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             backlog: Arc::new(Mutex::new(Vec::new())),
             handles: Arc::new(Mutex::new(Vec::new())),
@@ -92,6 +97,13 @@ impl SessionCoordinator {
             cancel: CancellationToken::new(),
         };
 
-        (coord, SessionReceivers { sse_rx, confirm_rx })
+        (
+            coord,
+            SessionReceivers {
+                sse_rx,
+                confirm_rx,
+                ask_user_rx,
+            },
+        )
     }
 }

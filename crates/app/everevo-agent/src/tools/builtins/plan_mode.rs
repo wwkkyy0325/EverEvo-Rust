@@ -1,10 +1,11 @@
 //! In-process plan mode tools with shared PlanModeState across sessions.
 //!
-//! Complemented by MCP plugin `plugin-plan-mode`. This in-process version manages
-//! the shared PlanModeState (RwLock<HashMap>) that the chat route reads for write-tool
-//! filtering — a cross-session state the MCP plugin cannot access.
-//! This in-process implementation is kept for backward compatibility.
-//! New development should use the MCP plugin version.
+//! THIS is the single functional plan-mode track (plan-mode merge, 2026-08-13):
+//! it writes the shared `PlanModeState` (RwLock<HashMap>) that the chat route
+//! reads for write-tool filtering. The MCP `plugin-plan-mode` was removed from
+//! auto-load because its `enter_plan_mode`/`exit_plan_mode` run in a separate
+//! process, cannot touch this map, and so were a no-op that misled the agent
+//! into believing write tools were blocked when they weren't.
 
 //! Plan Mode tools — Claude Code-aligned state machine.
 //!
@@ -70,11 +71,15 @@ pub fn is_tool_allowed_in_plan_mode(tool_name: &str) -> bool {
 
 pub struct EnterPlanModeTool {
     plan_state: PlanModeState,
+    session_id: Uuid,
 }
 
 impl EnterPlanModeTool {
-    pub fn new(plan_state: PlanModeState, _data_dir: PathBuf) -> Self {
-        Self { plan_state }
+    pub fn new(plan_state: PlanModeState, session_id: Uuid, _data_dir: PathBuf) -> Self {
+        Self {
+            plan_state,
+            session_id,
+        }
     }
 }
 
@@ -110,13 +115,10 @@ impl Tool for EnterPlanModeTool {
 
     async fn execute(
         &self,
-        params: serde_json::Value,
+        _params: serde_json::Value,
         _cancel: Option<&CancellationToken>,
     ) -> Result<ToolOutput, EverEvoError> {
-        let session_id = params["session_id"]
-            .as_str()
-            .and_then(|s| Uuid::parse_str(s).ok())
-            .unwrap_or_else(Uuid::nil);
+        let session_id = self.session_id;
 
         let mut state = self.plan_state.write().await;
 
@@ -161,13 +163,15 @@ impl Tool for EnterPlanModeTool {
 
 pub struct ExitPlanModeTool {
     plan_state: PlanModeState,
+    session_id: Uuid,
     data_dir: PathBuf,
 }
 
 impl ExitPlanModeTool {
-    pub fn new(plan_state: PlanModeState, data_dir: PathBuf) -> Self {
+    pub fn new(plan_state: PlanModeState, session_id: Uuid, data_dir: PathBuf) -> Self {
         Self {
             plan_state,
+            session_id,
             data_dir,
         }
     }
@@ -206,14 +210,11 @@ impl Tool for ExitPlanModeTool {
 
     async fn execute(
         &self,
-        params: serde_json::Value,
+        _params: serde_json::Value,
         _cancel: Option<&CancellationToken>,
     ) -> Result<ToolOutput, EverEvoError> {
-        let session_id = params["session_id"]
-            .as_str()
-            .and_then(|s| Uuid::parse_str(s).ok())
-            .unwrap_or_else(Uuid::nil);
-        let plan_summary = params["plan"].as_str().unwrap_or("Plan ready for review");
+        let session_id = self.session_id;
+        let plan_summary = _params["plan"].as_str().unwrap_or("Plan ready for review");
 
         // Check if actually in plan mode
         {
@@ -318,7 +319,7 @@ mod tests {
     #[test]
     fn test_enter_plan_mode_name_and_schema() {
         let state = Arc::new(RwLock::new(HashMap::new()));
-        let tool = EnterPlanModeTool::new(state, PathBuf::from("/tmp"));
+        let tool = EnterPlanModeTool::new(state, Uuid::nil(), PathBuf::from("/tmp"));
         assert_eq!(tool.name(), "EnterPlanMode");
         assert_eq!(tool.risk_level(), RiskLevel::Low);
     }
@@ -328,7 +329,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let state = Arc::new(RwLock::new(HashMap::new()));
-            let tool = ExitPlanModeTool::new(state, PathBuf::from("/tmp"));
+            let tool = ExitPlanModeTool::new(state, Uuid::nil(), PathBuf::from("/tmp"));
             let result = tool
                 .execute(serde_json::json!({"plan": "test plan"}), None)
                 .await
@@ -344,8 +345,10 @@ mod tests {
         rt.block_on(async {
             let session_id = Uuid::new_v4();
             let state: PlanModeState = Arc::new(RwLock::new(HashMap::new()));
-            let enter = EnterPlanModeTool::new(Arc::clone(&state), PathBuf::from("/tmp"));
-            let exit = ExitPlanModeTool::new(Arc::clone(&state), PathBuf::from("/tmp"));
+            let enter =
+                EnterPlanModeTool::new(Arc::clone(&state), Uuid::nil(), PathBuf::from("/tmp"));
+            let exit =
+                ExitPlanModeTool::new(Arc::clone(&state), Uuid::nil(), PathBuf::from("/tmp"));
 
             // Enter plan mode
             let r = enter

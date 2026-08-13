@@ -403,7 +403,10 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max])
+        // Char-safe: `&s[..max]` panics on multi-byte UTF-8 straddling the
+        // boundary (server-crash risk). Take chars instead.
+        let truncated: String = s.chars().take(max).collect();
+        format!("{truncated}...")
     }
 }
 

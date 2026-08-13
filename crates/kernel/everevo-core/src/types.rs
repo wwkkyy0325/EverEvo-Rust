@@ -186,6 +186,10 @@ pub struct LlmProviderConfig {
     pub model: String,
     pub base_url: Option<String>,
     pub max_tokens: Option<u32>,
+    /// Model context window in tokens — drives per-model context-budget
+    /// assembly. `None` → `ContextBudget` falls back to the 128k floor.
+    #[serde(default)]
+    pub context_window: Option<u32>,
 }
 
 impl std::fmt::Debug for LlmProviderConfig {
@@ -196,6 +200,7 @@ impl std::fmt::Debug for LlmProviderConfig {
             .field("model", &self.model)
             .field("base_url", &self.base_url)
             .field("max_tokens", &self.max_tokens)
+            .field("context_window", &self.context_window)
             .finish()
     }
 }

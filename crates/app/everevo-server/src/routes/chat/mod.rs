@@ -7,11 +7,13 @@
 //! - `helpers` — title truncation, DB conversion, permission, git, workspace context
 //! - `reconnect` — session reconnection handler
 
+pub mod auto_continue;
 pub mod handler;
 pub mod helpers;
 pub mod post_turn;
 pub mod reconnect;
 pub mod slash_commands;
+pub mod wiring;
 
 pub use handler::router;
 

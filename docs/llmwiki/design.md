@@ -28,24 +28,29 @@ Frontend (React/Vite/Zustand)  ← HTTP/SSE →  Backend (Rust/Axum)
                                                  SQLite + HNSW + Oxigraph
 ```
 
-## Crate Structure (14 crates + 2 binaries)
+## Crate Structure (15 crates + 2 binaries, layer-grouped 2026-08-13)
 
 ```
-everevo-core         Shared types, traits, errors, config, context pipeline, telemetry
-everevo-agent        Agent loop, 内置工具集 + MCP adapter, LLM client, memory, stages, skills
-everevo-server       Axum HTTP, SSE chat, 14 route modules, orchestration layer
-everevo-db           SQLite via SQLx, migrations, foreign_keys enabled
-everevo-sandbox      Tiered sandbox (4 permission levels), process isolation
-everevo-vector       ONNX embeddings, HNSW vector store (LanceDB abandoned)
-everevo-knowledge    Knowledge graph (Oxigraph) + domain document ingestion
-everevo-a2a          A2A protocol gateway (v0.3.0), agent cards, task execution
-everevo-bootstrap    Runtime provisioning (Python/Node/Git/ONNX/models)
-everevo-downloader   HTTP download engine (multi-mirror, resume, concurrent)
-everevo-mcp          MCP protocol client (stdio + HTTP transports)
-everevo-workflow     JSON-defined multi-step automation workflows
-everevo-bundler      Standalone asset bundler binary (CLI) — no lib.rs
-everevo-webagent     Standalone MCP search service binary — no lib.rs
+kernel/   everevo-core         Shared types, traits, errors, config, context pipeline, telemetry
+kernel/   everevo-kernel       Microkernel: plugin runtime, protection, bootstrap tools
+infra/    everevo-db           SQLite via SQLx, migrations, foreign_keys enabled
+infra/    everevo-sandbox      Tiered sandbox (4 permission levels), process isolation
+infra/    everevo-vector       ONNX embeddings, HNSW vector store (LanceDB abandoned)
+infra/    everevo-net          Unified HTTP egress (proxy-aware)
+infra/    everevo-knowledge    Knowledge graph (Oxigraph) + domain document ingestion
+infra/    everevo-downloader   HTTP download engine (multi-mirror, resume, concurrent)
+infra/    everevo-bootstrap    Runtime provisioning (Python/Node/Git/ONNX/models)
+infra/    everevo-mcp          MCP protocol client (stdio + HTTP transports) — moved from kernel 2026-08-13
+infra/    everevo-mcp-protocol MCP protocol types (zero-async) — moved from kernel 2026-08-13
+app/      everevo-agent        Agent loop, 内置工具集 + MCP adapter, LLM client, memory, stages, skills
+app/      everevo-server       Axum HTTP, SSE chat, route modules, orchestration layer
+app/      everevo-a2a          A2A protocol gateway (v0.3.0), agent cards, task execution
+app/      everevo-workflow     JSON-defined multi-step automation workflows
+tools/    everevo-bundler      Standalone asset bundler binary (CLI) — no lib.rs
+tools/    everevo-webagent     Standalone MCP search service binary — no lib.rs (moved from app 2026-08-13)
 ```
+
+> Dependency direction acyclic: `kernel → infra → app → tools` (+ `app→app` peers).
 
 > `everevo-telemetry` was merged into `everevo-core::telemetry`.
 > `everevo-kg` and `everevo-domain` were merged into `everevo-knowledge`.

@@ -9,6 +9,8 @@
 //! - q37: constraint-interpretation (quantifier/reading enumeration)
 //! - q16: candidate verification against every question constraint
 
+use super::gate::clamp_verify_fragment;
+use super::gate::{classify, Difficulty};
 use everevo_core::context::{ContextBuildContext, ContextFragment, ContextStage};
 use everevo_core::llm::LlmMessage;
 
@@ -16,7 +18,32 @@ use everevo_core::llm::LlmMessage;
 /// fidelity, constraint enumeration, and candidate verification.
 ///
 /// Priority: 2 (after persona at 1 and best-practices at 2; before skills).
+/// Adaptive: simple questions get only the format contract below; the
+/// per-failure-mode remediation sections are injected for hard questions only.
 pub struct AnswerDisciplineStage;
+
+/// Format essentials that the answer scorer depends on — injected for EVERY
+/// question regardless of difficulty (the `Final answer:` marker and bare-value
+/// formatting must never vary). Heavy failure-mode remediation lives in the
+/// full stage content (hard questions only).
+const SIMPLE_DISCIPLINE: &str = "\
+## Answer Discipline
+
+### Final answer (HARD RULE)
+Your final message MUST end with a single explicit `Final answer:` line \
+containing ONLY the value — no reasoning, no prose, no explanations after it, \
+and nothing between the value and the end of the message.
+
+### Output format, by answer type
+- **Yes/No question:** output exactly `Yes` or `No` — nothing else.
+- **Numeric answer:** output the bare number as digits — no units, no `$`, no \
+`%`, no thousands separators, no words. Do not round to an approximate form \
+unless the question explicitly asks for it. Express the number in the units \
+the QUESTION asks for.
+- **String answer:** output the EXACT spelling and capitalization of the \
+source term — no added articles (\"the\" / \"a\"), no rephrasing.
+- **List answer:** output the item NAMES verbatim, comma-separated — never \
+shortened, renamed, or reordered, and never a different count.";
 
 impl ContextStage for AnswerDisciplineStage {
     fn priority(&self) -> i32 {
@@ -25,9 +52,26 @@ impl ContextStage for AnswerDisciplineStage {
     fn name(&self) -> &str {
         "answer_discipline"
     }
+    fn tool_visible(&self) -> bool {
+        true
+    }
+    fn description(&self) -> &str {
+        "Output fidelity: end with a single `Final answer:` line containing only the value; bare numbers, exact spelling, verbatim lists; epistemic boundary (commit only [VERIFIED])."
+    }
 
-    fn build(&self, _ctx: &ContextBuildContext) -> Option<ContextFragment> {
-        let content = "\
+    fn build(&self, ctx: &ContextBuildContext) -> Option<ContextFragment> {
+        // Simple questions: only the format contract above. The heavy
+        // per-failure-mode sections are skipped to avoid the extra tokens (and
+        // the forced-caution overhead) that research shows harms trivial tasks.
+        if classify(&ctx.user_message) == Difficulty::Simple {
+            return Some(ContextFragment {
+                label: "Answer Discipline".into(),
+                messages: vec![LlmMessage::user(SIMPLE_DISCIPLINE)],
+            });
+        }
+        let content = clamp_verify_fragment(
+            &ctx.budget,
+            "\
 ## Answer Discipline
 
 ### Final answer (HARD RULE)
@@ -35,6 +79,29 @@ Your final message MUST end with a single explicit `Final answer:` line \
 containing ONLY the value — no reasoning, no prose, no explanations after it, \
 and nothing between the value and the end of the message. Never bury the \
 answer inside a sentence, and never append a closing remark after the value.
+
+### Epistemic boundary (know what you don't know)
+Keep THREE categories explicit and never blur them:
+- **[VERIFIED]** — the value appeared in a tool result you actually retrieved.
+- **[UNVERIFIED]** — you derived or recalled it, but no retrieved source states it.
+- **[UNKNOWN]** — you could not retrieve a source for it.
+Commit on the `Final answer:` line ONLY a `[VERIFIED]` value. If a candidate is \
+`[UNVERIFIED]` or `[UNKNOWN]`, keep retrieving (different engine, direct fetch, \
+download) until it is verified — or, if genuinely unreachable, say so rather \
+than presenting an assumption as fact. This boundary is what stops context \
+pollution from producing a confident-but-wrong generation.
+
+### Satisficing — when to STOP (HARD RULE)
+A candidate is SUFFICIENT, and you COMMIT it immediately, when ALL of these hold:
+- it answers the question (right value, units, scale, and form per the format rules below), and
+- at least ONE directly-retrieved tool result states the exact value, and
+- no retrieved evidence contradicts it.
+Once a candidate is SUFFICIENT, STOP researching. Re-verifying an already-verified
+fact, or adding a second source \"to be rigorous\", does NOT improve the answer —
+every extra call risks exhausting the budget and producing NO answer at all, which
+scores 0. Only continue if a SPECIFIC open sub-question remains whose answer could
+change the value. Do not continue \"for certainty\" — a SUFFICIENT candidate is
+already the answer; commit it on the `Final answer:` line.
 
 ### Output format, by answer type
 Format the value on the `Final answer:` line exactly as follows, or the \
@@ -240,7 +307,8 @@ Research ONLY the question's actual subject matter — the article, website, \
 person, dataset, or event it names — via the normal retrieval tools. If the \
 subject is unreachable and your only route to an answer would be the answer key, \
 report the source as unreachable and say you cannot determine the answer rather \
-than committing a value from the dataset.";
+than committing a value from the dataset.",
+        );
         Some(ContextFragment {
             label: "Answer Discipline".into(),
             messages: vec![LlmMessage::user(content)],

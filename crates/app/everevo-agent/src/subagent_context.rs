@@ -35,7 +35,7 @@
 
 use std::path::PathBuf;
 
-use everevo_core::context::{ContextBuildContext, ContextStage};
+use everevo_core::context::{ContextBudget, ContextBuildContext, ContextStage};
 
 use crate::stages::DomainKnowledgeStage;
 use crate::stages::MemoryStage;
@@ -75,10 +75,18 @@ pub struct SubAgentContext {
     pub memory_context: Option<String>,
     /// Knowledge graph metadata (entity count etc.) for context awareness.
     pub kg_context: Option<String>,
+    /// Token budget for the sub-agent's own loop, inherited from the parent's
+    /// model window when available (fallback 80000 ≈ the legacy hardcoded
+    /// value). Feeds the sub-agent `AgentLoop` context ceiling.
+    pub max_context_tokens: usize,
 }
 
 /// Maximum recursion depth for sub-agent delegation.
 pub const MAX_RECURSION_DEPTH: u32 = 3;
+
+/// Fallback sub-agent context ceiling (tokens) when the parent window is
+/// unknown — matches the pre-existing hardcoded value.
+pub const DEFAULT_SUBAGENT_MAX_TOKENS: usize = 80_000;
 
 impl Default for SubAgentContext {
     fn default() -> Self {
@@ -95,6 +103,7 @@ impl Default for SubAgentContext {
             todo_summary: None,
             memory_context: None,
             kg_context: None,
+            max_context_tokens: DEFAULT_SUBAGENT_MAX_TOKENS,
         }
     }
 }
@@ -259,14 +268,16 @@ pub async fn assemble_subagent_context(
     tool_names: &[String],
     todo_summary: Option<String>,
     skill_list: Option<String>,
+    parent_max_context_tokens: Option<usize>,
 ) -> SubAgentContext {
+    let max_context_tokens = parent_max_context_tokens.unwrap_or(DEFAULT_SUBAGENT_MAX_TOKENS);
     let ctx = ContextBuildContext {
         user_message: user_message.to_string(),
         session_id: None,
         session_title: None,
         history: vec![],
         history_tokens: 0,
-        max_context_tokens: 80000,
+        max_context_tokens,
         shell_name: Some(shell_name.to_string()),
         permission_level: Some("semi_auto".into()),
         trusted_paths: vec![],
@@ -284,9 +295,13 @@ pub async fn assemble_subagent_context(
         startup_verified: false,
         hook_feedback: None,
         summary: None,
+        budget: ContextBudget::resolve(Some(max_context_tokens as u32)),
     };
 
-    let mut sub_ctx = SubAgentContext::default();
+    let mut sub_ctx = SubAgentContext {
+        max_context_tokens,
+        ..SubAgentContext::default()
+    };
     sub_ctx.system_info = build_system_info_block(shell_name, tool_names);
 
     // ── Skill list from registry ──────────────────────────────

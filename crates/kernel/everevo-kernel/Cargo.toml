@@ -8,8 +8,8 @@ description = "EverEvo microkernel — immutable core loop, plugin registry, boo
 
 [dependencies]
 everevo-core = { path = "../everevo-core" }
-everevo-mcp = { path = "../everevo-mcp" }
-everevo-mcp-protocol = { path = "../everevo-mcp-protocol" }
+everevo-mcp = { path = "../../infra/everevo-mcp" }
+everevo-mcp-protocol = { path = "../../infra/everevo-mcp-protocol" }
 
 serde.workspace = true
 serde_json.workspace = true

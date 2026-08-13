@@ -5,6 +5,7 @@ import SettingsView from './components/SettingsView';
 import DevPanel from './components/DevPanel';
 import SessionSidebar from './components/SessionSidebar';
 import ConfirmDialog from './components/ConfirmDialog';
+import AskUserDialog from './components/AskUserDialog';
 import ErrorBoundary from './components/ErrorBoundary';
 import AppStatusBar from './components/AppStatusBar';
 import { Dialog } from './components/ui/dialog';
@@ -93,6 +94,7 @@ function App() {
 
       {/* Dialogs */}
       <ConfirmDialog />
+      <AskUserDialog />
 
       {/* LLM config prompt — shown after bootstrap if no LLM configured */}
       <Dialog

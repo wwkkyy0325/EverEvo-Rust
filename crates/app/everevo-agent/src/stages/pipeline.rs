@@ -10,15 +10,20 @@
 //!   1: Persona          — user communication style + thinking paradigm
 //!   2: BestPractices    — verification, planning, code quality rules
 //!   2: AnswerDiscipline — final-answer marker, verbatim fidelity, constraint & candidate checks
-//!   2: EvidenceChecklist — ECLoop-style pre-commit evidence checklist + deterministic verifier gate
 //!   2: Skill            — loaded SKILL.md instructions
 //!   3: TaskState        — current TodoWrite task list (from default_pipeline)
 //!   3: Memory           — relevant memory facts (RRF-ranked)
+//!   3: ProblemModeling  — causal-draft structural modeling (Hard questions only)
+//!   3: VerifyCandidate  — independent skeptical verification of the candidate
+//!   3: EvidenceChecklist — ECLoop-style pre-commit checklist + deterministic verifier gate
 //!   4: DomainKnowledge  — relevant domain document chunks
 //!   5: SessionMetadata  — runtime env, shell, git status (from default_pipeline)
+//!  75: RollingSummary   — rolling conversation summary (from default_pipeline)
 //!  80: ConversationHistory — current session messages, sliding window
 //!  90: LatestMessage   — the new user input
 //! ```
+//! (Same 3-stage verification ensemble order at priority 3: ProblemModeling →
+//! VerifyCandidate → EvidenceChecklist, the commit gate.)
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,11 +32,14 @@ use everevo_core::context::{default_pipeline, ContextPipeline};
 
 use super::{
     AgentCharacterStage, AnswerDisciplineStage, BestPracticesStage, DomainKnowledgeStage,
-    EvidenceChecklistStage, MemoryStage, PersonaStage, SkillStage,
+    EvidenceChecklistStage, MemoryStage, PersonaStage, ProblemModelingStage, SkillStage,
+    VerifyCandidateStage,
 };
 use crate::skill::SkillRegistry;
 
-/// Build the complete production context pipeline with all 11 stages.
+/// Build the complete production context pipeline — 16 stages total
+/// (6 from `default_pipeline()` + 10 added below; audit LOW, 2026-08-13: the
+/// comment previously said "all 11 stages").
 ///
 /// This replaces the manual `.with_stage()` chain previously in `chat.rs`
 /// so all stage registration lives in one place — alongside the stage
@@ -62,10 +70,16 @@ pub fn build_full_pipeline(
     // fidelity, constraint enumeration, candidate verification). Stable-sorts
     // right after BestPractices, before skills.
     pipeline = pipeline.with_stage(AnswerDisciplineStage);
+    // Priority 3 — causal-draft problem modeling for hard questions, stable-
+    // sorts right BEFORE the verification ensemble.
+    pipeline = pipeline.with_stage(ProblemModelingStage);
+    pipeline = pipeline.with_stage(VerifyCandidateStage);
 
-    // Priority 2 — verifier-gated commit (ECLoop-style evidence checklist:
+    // Priority 3 — verifier-gated commit (ECLoop-style evidence checklist:
     // pre-declare the constraints, verify each deterministically, then commit).
-    // Stable-sorts right after AnswerDiscipline, before skills.
+    // Stable-sorts right AFTER ProblemModeling/VerifyCandidate so the commit-gate
+    // prompt follows the modeling + verification instructions, not precedes them
+    // (audit MEDIUM: priority inversion, 2026-08-13).
     pipeline = pipeline.with_stage(EvidenceChecklistStage);
 
     // Priority 2 — loaded SKILL.md instructions

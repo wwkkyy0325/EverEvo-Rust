@@ -186,7 +186,9 @@ impl ContentBlockStreamer {
                 result,
             } => {
                 let _ = tx.send(Ok(Event::default().event("subagent_result").data(
-                    serde_json::json!({"id": id, "description": description, "result": &result[..2000.min(result.len())]}).to_string(),
+                    // Char-safe truncation — `&result[..N]` panics when a
+                    // multi-byte UTF-8 char straddles byte N.
+                    serde_json::json!({"id": id, "description": description, "result": result.chars().take(2000).collect::<String>()}).to_string(),
                 ))).await;
                 StreamerAction::Continue
             }

@@ -98,7 +98,7 @@ impl Tool for ClusterTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _cancel: Option<&CancellationToken>,
+        cancel: Option<&CancellationToken>,
     ) -> Result<ToolOutput, EverEvoError> {
         let pool = self
             .pool
@@ -118,7 +118,7 @@ impl Tool for ClusterTool {
         let workers = params["workers"].as_u64().unwrap_or(3).min(10) as usize;
 
         match action {
-            "fan_out" => execute_fan_out(pool, prompt, workers).await,
+            "fan_out" => execute_fan_out(pool, prompt, workers, cancel).await,
             "map_reduce" => {
                 let items: Vec<String> = params["items"]
                     .as_array()
@@ -135,7 +135,7 @@ impl Tool for ClusterTool {
                         ..Default::default()
                     });
                 }
-                execute_map_reduce(pool, prompt, &items).await
+                execute_map_reduce(pool, prompt, &items, cancel).await
             }
             "verify" => {
                 let claims: Vec<String> = params["claims"]
@@ -156,7 +156,7 @@ impl Tool for ClusterTool {
                     .unwrap_or_else(|| {
                         vec!["correctness".into(), "security".into(), "edge_cases".into()]
                     });
-                execute_verify(pool, &claims, &perspectives).await
+                execute_verify(pool, &claims, &perspectives, cancel).await
             }
             _ => Ok(ToolOutput {
                 content: format!("Unknown action: {action}. Use fan_out, map_reduce, or verify."),
@@ -169,11 +169,29 @@ impl Tool for ClusterTool {
 
 // ── Cluster Patterns ───────────────────────────────────────────────────
 
+/// Hard cap on map-reduce items (audit MEDIUM, 2026-08-13): an unbounded
+/// `items` array would spawn one sub-agent per item, exhausting the pool /
+/// budget. Excess items are dropped with a visible note rather than executed.
+const MAX_MAP_REDUCE_ITEMS: usize = 20;
+/// Hard cap on verify claims — same unbounded fan-out class as items.
+const MAX_VERIFY_CLAIMS: usize = 5;
+
+/// Split `items` into the batch to execute and the count dropped past `cap`.
+/// Pure so the cap math is directly unit-testable without a live pool.
+fn cap_batch<T>(items: &[T], cap: usize) -> (&[T], usize) {
+    if items.len() > cap {
+        (&items[..cap], items.len() - cap)
+    } else {
+        (items, 0)
+    }
+}
+
 /// Fan-out: N workers run the same prompt in parallel. Results are concatenated.
 async fn execute_fan_out(
     pool: &SubAgentPool,
     prompt: &str,
     workers: usize,
+    cancel: Option<&CancellationToken>,
 ) -> Result<ToolOutput, EverEvoError> {
     let tasks: Vec<SubAgentTask> = (0..workers)
         .map(|i| SubAgentTask {
@@ -184,7 +202,7 @@ async fn execute_fan_out(
             ),
             max_turns: 5,
             system_prompt_override: None,
-            cancel_token: None,
+            cancel_token: cancel.cloned(),
         })
         .collect();
 
@@ -209,9 +227,14 @@ async fn execute_map_reduce(
     pool: &SubAgentPool,
     prompt: &str,
     items: &[String],
+    cancel: Option<&CancellationToken>,
 ) -> Result<ToolOutput, EverEvoError> {
+    // Cap the fan-out: silently executing thousands of items is never right —
+    // drop the excess visibly so the agent can narrow the batch.
+    let (truncated_items, dropped) = cap_batch(items, MAX_MAP_REDUCE_ITEMS);
+
     // ── Map phase ──
-    let map_tasks: Vec<SubAgentTask> = items
+    let map_tasks: Vec<SubAgentTask> = truncated_items
         .iter()
         .enumerate()
         .map(|(i, item)| SubAgentTask {
@@ -219,7 +242,7 @@ async fn execute_map_reduce(
             prompt: format!("{prompt}\n\n---\nItem: {item}"),
             max_turns: 5,
             system_prompt_override: None,
-            cancel_token: None,
+            cancel_token: cancel.cloned(),
         })
         .collect();
 
@@ -249,7 +272,7 @@ async fn execute_map_reduce(
              Flag any findings that appear unreliable."
                 .into(),
         ),
-        cancel_token: None,
+        cancel_token: cancel.cloned(),
     }];
 
     let reduce_results = pool.execute_all(reduce_tasks).await;
@@ -258,10 +281,19 @@ async fn execute_map_reduce(
         .map(|r| r.content.clone())
         .unwrap_or_else(|| "Reduce phase failed.".into());
 
+    let cap_note = if dropped > 0 {
+        format!(
+            "\n\n> ⚠️ {dropped} items beyond the {MAX_MAP_REDUCE_ITEMS}-item cap were dropped — \
+             narrow the batch and retry if they matter."
+        )
+    } else {
+        String::new()
+    };
+
     Ok(ToolOutput {
         content: format!(
-            "## Map-Reduce: {} items\n\n**Prompt:** {prompt}\n\n---\n\n## Synthesis\n\n{synthesis}",
-            items.len(),
+            "## Map-Reduce: {} items\n\n**Prompt:** {prompt}\n\n---\n\n## Synthesis\n\n{synthesis}{cap_note}",
+            truncated_items.len(),
         ),
         is_error: false,
         ..Default::default()
@@ -274,14 +306,17 @@ async fn execute_verify(
     pool: &SubAgentPool,
     claims: &[String],
     perspectives: &[String],
+    cancel: Option<&CancellationToken>,
 ) -> Result<ToolOutput, EverEvoError> {
+    // Cap claims to keep the fan-out bounded (claims × perspectives sub-agents).
+    let (truncated_claims, _) = cap_batch(claims, MAX_VERIFY_CLAIMS);
     let mut output = format!(
         "## Adversarial Verification: {} claims × {} perspectives\n\n",
-        claims.len(),
+        truncated_claims.len(),
         perspectives.len(),
     );
 
-    for (i, claim) in claims.iter().enumerate() {
+    for (i, claim) in truncated_claims.iter().enumerate() {
         let tasks: Vec<SubAgentTask> = perspectives
             .iter()
             .map(|persp| SubAgentTask {
@@ -298,7 +333,7 @@ async fn execute_verify(
                     "You are a {persp} reviewer. Be skeptical. Default to \
                      REFUTED if uncertain. Provide concrete evidence."
                 )),
-                cancel_token: None,
+                cancel_token: cancel.cloned(),
             })
             .collect();
 
@@ -338,6 +373,13 @@ async fn execute_verify(
         output.push_str("\n---\n\n");
     }
 
+    if claims.len() > MAX_VERIFY_CLAIMS {
+        output.push_str(&format!(
+            "> ⚠️ {} claims beyond the {MAX_VERIFY_CLAIMS}-claim cap were dropped.\n",
+            claims.len() - MAX_VERIFY_CLAIMS,
+        ));
+    }
+
     Ok(ToolOutput {
         content: output,
         is_error: false,
@@ -359,5 +401,40 @@ mod tests {
         let schema = tool.parameters_schema();
         assert_eq!(schema["required"][0], "action");
         assert!(schema["properties"]["action"]["enum"].is_array());
+    }
+
+    #[test]
+    fn test_cap_batch_truncates_over_cap() {
+        // Audit MEDIUM (2026-08-13): unbounded `items` spawned one sub-agent per
+        // item. cap_batch must keep only the first `cap` and report the drop.
+        let items: Vec<String> = (0..MAX_MAP_REDUCE_ITEMS + 30)
+            .map(|i| format!("item-{i}"))
+            .collect();
+        let (kept, dropped) = cap_batch(&items, MAX_MAP_REDUCE_ITEMS);
+        assert_eq!(kept.len(), MAX_MAP_REDUCE_ITEMS);
+        assert_eq!(dropped, 30);
+        // Kept the FIRST batch, not an arbitrary slice.
+        assert_eq!(kept[0], "item-0");
+        assert_eq!(
+            kept[kept.len() - 1],
+            format!("item-{}", MAX_MAP_REDUCE_ITEMS - 1)
+        );
+    }
+
+    #[test]
+    fn test_cap_batch_under_cap_unchanged() {
+        let items: Vec<String> = vec!["a".into(), "b".into(), "c".into()];
+        let (kept, dropped) = cap_batch(&items, MAX_VERIFY_CLAIMS);
+        assert_eq!(kept.len(), 3);
+        assert_eq!(dropped, 0);
+        assert!(std::ptr::eq(kept, items.as_slice())); // no copy for under-cap
+    }
+
+    #[test]
+    fn test_cap_constants_bound_spawn() {
+        // The caps exist and are positive — guards against a future regression
+        // that turns them into no-ops.
+        assert!(MAX_MAP_REDUCE_ITEMS > 0);
+        assert!(MAX_VERIFY_CLAIMS > 0);
     }
 }

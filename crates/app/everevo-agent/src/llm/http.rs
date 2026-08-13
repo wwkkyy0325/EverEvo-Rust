@@ -22,6 +22,63 @@ use async_trait::async_trait;
 use everevo_core::llm::{LlmMessage, LlmProvider, LlmResponse, StreamEvent, ToolSchema};
 use everevo_core::EverEvoError;
 
+// ── Circuit breaker ───────────────────────────────────────────────────────
+
+/// Consecutive transient failures (429/5xx) before the circuit opens.
+const CIRCUIT_OPEN_THRESHOLD: u32 = 5;
+/// Cooldown while the circuit is open (fast-fail), before a half-open probe.
+const CIRCUIT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Lightweight provider circuit breaker (`Closed → Open → HalfOpen → Closed`).
+/// Shared across sessions because `HttpClient` is `Arc`-shared; protects the
+/// whole app from hammering a down / rate-limited provider (research: rate
+/// limiting is the single largest reliability issue in agent systems).
+#[derive(Debug, Default)]
+pub(crate) struct CircuitBreaker {
+    consecutive_failures: u32,
+    open_until: Option<std::time::Instant>,
+}
+
+impl CircuitBreaker {
+    /// Returns true if a request may proceed. While open (cooldown not
+    /// elapsed), calls fast-fail without hitting the API; after the cooldown a
+    /// half-open probe is allowed.
+    fn allows(&mut self) -> bool {
+        if let Some(t) = self.open_until {
+            if std::time::Instant::now() < t {
+                return false;
+            }
+            self.open_until = None; // cooldown elapsed → half-open probe
+        }
+        true
+    }
+
+    /// Record a transient failure; opens the circuit after the threshold.
+    fn failure(&mut self) {
+        self.consecutive_failures += 1;
+        if self.consecutive_failures >= CIRCUIT_OPEN_THRESHOLD {
+            self.open_until = Some(std::time::Instant::now() + CIRCUIT_COOLDOWN);
+            tracing::warn!(
+                failures = self.consecutive_failures,
+                cooldown_s = CIRCUIT_COOLDOWN.as_secs(),
+                "LLM provider circuit opened — fast-failing until cooldown"
+            );
+        }
+    }
+
+    /// Record success; closes the circuit and resets the failure counter.
+    fn success(&mut self) {
+        if self.consecutive_failures > 0 || self.open_until.is_some() {
+            tracing::info!(
+                failures = self.consecutive_failures,
+                "LLM provider circuit closed"
+            );
+        }
+        self.consecutive_failures = 0;
+        self.open_until = None;
+    }
+}
+
 // ── Client ────────────────────────────────────────────────────────────────
 
 /// LLM provider via HTTP (Anthropic Messages API or OpenAI Chat Completions).
@@ -34,6 +91,8 @@ pub struct HttpClient {
     /// Accumulated token usage across all API calls made by this client.
     total_input_tokens: Arc<std::sync::atomic::AtomicU64>,
     total_output_tokens: Arc<std::sync::atomic::AtomicU64>,
+    /// Provider circuit breaker (fast-fail while down).
+    circuit: Arc<std::sync::Mutex<CircuitBreaker>>,
 }
 
 impl HttpClient {
@@ -58,7 +117,32 @@ impl HttpClient {
             client,
             total_input_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             total_output_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            circuit: Arc::new(std::sync::Mutex::new(CircuitBreaker::default())),
         }
+    }
+
+    /// Returns true if a request may proceed (delegates to [`CircuitBreaker`]).
+    fn circuit_allows(&self) -> bool {
+        self.circuit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .allows()
+    }
+
+    /// Record a transient failure (delegates to [`CircuitBreaker`]).
+    fn circuit_failure(&self) {
+        self.circuit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .failure();
+    }
+
+    /// Record success (delegates to [`CircuitBreaker`]).
+    fn circuit_success(&self) {
+        self.circuit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .success();
     }
 
     /// Return accumulated token usage across all API calls.
@@ -108,6 +192,16 @@ impl LlmProvider for HttpClient {
         let body = self.build_body(messages, tools, false);
         let mut last_error: Option<EverEvoError> = None;
 
+        // Circuit breaker: if the provider is down, fail fast rather than
+        // spending MAX_RETRIES×backoff on every session that hits it.
+        if !self.circuit_allows() {
+            return Err(EverEvoError::LlmProvider(
+                "LLM provider circuit is open (repeated transient failures). \
+                 Try again in a moment."
+                    .into(),
+            ));
+        }
+
         for attempt in 0..=HttpClient::MAX_RETRIES {
             if attempt > 0 {
                 let delay_ms = HttpClient::BASE_BACKOFF_MS * (1u64 << (attempt - 1)); // 1s, 2s, 4s
@@ -150,8 +244,10 @@ impl LlmProvider for HttpClient {
                             attempt + 1,
                             HttpClient::MAX_RETRIES + 1
                         )));
+                        self.circuit_failure();
                         continue;
                     }
+                    self.circuit_failure();
                     return Err(EverEvoError::LlmProvider(e.to_string()));
                 }
             };
@@ -180,6 +276,7 @@ impl LlmProvider for HttpClient {
                             attempt + 1,
                             HttpClient::MAX_RETRIES + 1
                         )));
+                        self.circuit_failure();
                         continue;
                     }
                     return Err(EverEvoError::LlmProvider(format!(
@@ -196,12 +293,14 @@ impl LlmProvider for HttpClient {
                         attempt + 1,
                         HttpClient::MAX_RETRIES + 1
                     )));
+                    self.circuit_failure();
                     continue;
                 }
                 // Client errors (400, 401, 403, 404) — don't retry
                 return Err(EverEvoError::LlmProvider(classified));
             }
 
+            self.circuit_success();
             return Ok(Self::parse_response(&json));
         }
 
@@ -244,7 +343,26 @@ impl HttpClient {
         let client = self.client.clone();
         let input_counter = Arc::clone(&self.total_input_tokens);
         let output_counter = Arc::clone(&self.total_output_tokens);
+        let circuit = Arc::clone(&self.circuit);
         tokio::spawn(async move {
+            // Circuit breaker fast-fail: provider down → don't burn backoff.
+            if !circuit.lock().unwrap_or_else(|e| e.into_inner()).allows() {
+                let _ = tx
+                    .send(StreamEvent::Error(
+                        "LLM provider circuit is open (repeated transient failures). \
+                         Try again in a moment."
+                            .into(),
+                    ))
+                    .await;
+                let _ = tx
+                    .send(StreamEvent::Done {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        stop_reason: None,
+                    })
+                    .await;
+                return;
+            }
             // Send with retries for transient failures (mirrors chat()). A
             // transient 429/5xx/connect/timeout must not silently become the
             // model's "answer" — retry before streaming. Non-retryable client
@@ -281,9 +399,11 @@ impl HttpClient {
                         };
                         if retryable && attempt < HttpClient::MAX_RETRIES {
                             tracing::warn!(attempt, %e, "LLM HTTP request failed — retrying");
+                            circuit.lock().unwrap_or_else(|e| e.into_inner()).failure();
                             continue;
                         }
                         tracing::error!(%e, "LLM HTTP request failed");
+                        circuit.lock().unwrap_or_else(|e| e.into_inner()).failure();
                         let _ = tx.send(StreamEvent::Error(msg)).await;
                         let _ = tx
                             .send(StreamEvent::Done {
@@ -301,9 +421,11 @@ impl HttpClient {
                     let classified = Self::classify_http_error(status, &body_text);
                     if HttpClient::is_retryable(status) && attempt < HttpClient::MAX_RETRIES {
                         tracing::warn!(attempt, %status, "LLM API transient error — retrying");
+                        circuit.lock().unwrap_or_else(|e| e.into_inner()).failure();
                         continue;
                     }
                     tracing::error!(%status, %body_text, "LLM API error");
+                    circuit.lock().unwrap_or_else(|e| e.into_inner()).failure();
                     let _ = tx.send(StreamEvent::Error(classified)).await;
                     let _ = tx
                         .send(StreamEvent::Done {
@@ -315,6 +437,7 @@ impl HttpClient {
                     return;
                 }
                 resp = Some(r);
+                circuit.lock().unwrap_or_else(|e| e.into_inner()).success();
                 break;
             }
 
@@ -593,5 +716,57 @@ impl HttpClient {
         });
 
         Ok(rx)
+    }
+}
+
+#[cfg(test)]
+mod circuit_tests {
+    use super::*;
+
+    #[test]
+    fn test_circuit_starts_closed() {
+        let cb = CircuitBreaker::default();
+        assert_eq!(cb.consecutive_failures, 0);
+        assert!(cb.open_until.is_none());
+    }
+
+    #[test]
+    fn test_circuit_opens_after_threshold() {
+        let mut cb = CircuitBreaker::default();
+        // Below threshold the circuit stays closed (allows() true).
+        for _ in 0..CIRCUIT_OPEN_THRESHOLD - 1 {
+            assert!(cb.allows());
+            cb.failure();
+        }
+        assert!(cb.open_until.is_none());
+        // The threshold failure opens it → fast-fail.
+        cb.failure();
+        assert!(cb.open_until.is_some());
+        assert!(!cb.allows());
+    }
+
+    #[test]
+    fn test_circuit_success_resets() {
+        let mut cb = CircuitBreaker::default();
+        cb.failure();
+        cb.failure();
+        cb.failure();
+        assert!(cb.allows()); // still under threshold
+        cb.success();
+        assert_eq!(cb.consecutive_failures, 0);
+        assert!(cb.open_until.is_none());
+    }
+
+    #[test]
+    fn test_circuit_fast_fails_when_open() {
+        let mut cb = CircuitBreaker::default();
+        for _ in 0..CIRCUIT_OPEN_THRESHOLD {
+            cb.failure();
+        }
+        assert!(!cb.allows());
+        // A success (half-open probe) closes it again.
+        cb.success();
+        assert!(cb.allows());
+        assert_eq!(cb.consecutive_failures, 0);
     }
 }

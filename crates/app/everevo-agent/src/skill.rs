@@ -45,7 +45,8 @@ const BUILTIN_SKILLS: &[(&str, &str)] = &[
     ),
     (
         "web-research",
-        include_str!("../../everevo-webagent/builtin-skills/web-research/SKILL.md"),
+        // webagent moved to crates/tools (2026-08-13 physical restructure).
+        include_str!("../../../tools/everevo-webagent/builtin-skills/web-research/SKILL.md"),
     ),
     (
         "write-tests",

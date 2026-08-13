@@ -7,4 +7,4 @@ pub mod http;
 pub mod mock;
 
 pub use http::HttpClient;
-pub use mock::MockLlmProvider;
+pub use mock::{MockLlmProvider, MockScript, MockStep};

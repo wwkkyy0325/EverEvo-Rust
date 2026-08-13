@@ -29,7 +29,7 @@ impl HttpClient {
         tools: &[ToolSchema],
         stream: bool,
     ) -> serde_json::Value {
-        let msgs: Vec<serde_json::Value> = messages
+        let mut msgs: Vec<serde_json::Value> = messages
             .iter()
             .map(|m| {
                 let is_tool_result = m.tool_call_id.is_some();
@@ -54,9 +54,19 @@ impl HttpClient {
                     let has_thinking_or_tools = m.thinking.as_ref().is_some_and(|t| !t.is_empty())
                         || m.tool_calls.is_some();
                     if !m.content.is_empty() || !has_thinking_or_tools {
+                        // DeepSeek's Anthropic endpoint rejects an empty text
+                        // block ("all messages must have non-empty content",
+                        // HTTP 400). A message with empty content, no thinking
+                        // and no tools still needs a non-empty block — a single
+                        // space is semantically inert.
+                        let text = if m.content.is_empty() {
+                            " ".to_string()
+                        } else {
+                            m.content.clone()
+                        };
                         content_blocks.push(serde_json::json!({
                             "type": "text",
-                            "text": m.content,
+                            "text": text,
                         }));
                     }
                     // Multimodal: append image blocks (e.g. browser screenshots)
@@ -70,11 +80,18 @@ impl HttpClient {
                 }
                 if let Some(ref tcs) = m.tool_calls {
                     for tc in tcs {
+                        // Defensive: a tool call with null arguments would send
+                        // `"input": null` — use an empty object instead.
+                        let input = if tc.arguments.is_null() {
+                            serde_json::json!({})
+                        } else {
+                            tc.arguments.clone()
+                        };
                         content_blocks.push(serde_json::json!({
                             "type": "tool_use",
                             "id": tc.id,
                             "name": tc.name,
-                            "input": tc.arguments,
+                            "input": input,
                         }));
                     }
                 }
@@ -88,10 +105,36 @@ impl HttpClient {
                             serde_json::from_str::<Vec<serde_json::Value>>(&m.content)
                         {
                             for item in &items {
+                                // Same empty-content guard: a multi-tool turn
+                                // where one tool (e.g. TodoWrite) returned
+                                // nothing would otherwise send an empty
+                                // tool_result block and trigger DeepSeek's
+                                // HTTP 400 "non-empty content" rejection.
+                                let c = item["c"].as_str().unwrap_or("");
+                                let c = if c.is_empty() { " " } else { c };
                                 content_blocks.push(serde_json::json!({
                                     "type": "tool_result",
                                     "tool_use_id": item["i"].as_str().unwrap_or(""),
-                                    "content": item["c"].as_str().unwrap_or(""),
+                                    "content": c,
+                                }));
+                            }
+                        } else {
+                            // Payload is not JSON (e.g. an old multi-tool result
+                            // that was masked to a plain header) — emit one
+                            // tool_result per id from tool_call_id so every
+                            // tool_use keeps its tool_result and DeepSeek's
+                            // strict alternation holds. Content is the raw
+                            // (masked) string, guarded non-empty.
+                            let c = if m.content.is_empty() {
+                                " ".to_string()
+                            } else {
+                                m.content.clone()
+                            };
+                            for id in raw_id.split('|') {
+                                content_blocks.push(serde_json::json!({
+                                    "type": "tool_result",
+                                    "tool_use_id": id,
+                                    "content": c,
                                 }));
                             }
                         }
@@ -99,7 +142,16 @@ impl HttpClient {
                         // Anthropic tool_result.content accepts an array of
                         // text/image blocks — used to carry screenshots back.
                         let content = if m.images.is_empty() {
-                            serde_json::Value::String(m.content.clone())
+                            // Same DeepSeek guard as the text block above: a
+                            // tool (e.g. a shell command with no stdout) that
+                            // returns empty content must not send an empty
+                            // tool_result, or the API rejects the message.
+                            let c = if m.content.is_empty() {
+                                " ".to_string()
+                            } else {
+                                m.content.clone()
+                            };
+                            serde_json::Value::String(c)
                         } else {
                             let mut parts =
                                 vec![serde_json::json!({ "type": "text", "text": m.content })];
@@ -123,9 +175,80 @@ impl HttpClient {
             })
             .collect();
 
+        // DeepSeek's Anthropic endpoint rejects any message whose content is
+        // empty ("all messages must have non-empty content", HTTP 400). Empty
+        // content reaches this layer from many producers — an empty tool result
+        // (shell with no stdout, an empty web_fetch page), an empty assistant
+        // turn, an empty thinking-only response — at a message index that varies
+        // with the conversation (observed messages.11 / .14 / .23 in the
+        // 2026-08-12 full GAIA run). The per-block guards above cover the known
+        // producers; this pass is a belt-and-suspenders sweep that guarantees no
+        // text block or tool_result payload stays empty, whatever produced it.
+        for (msg_idx, msg) in msgs.iter_mut().enumerate() {
+            let mut fixed = false;
+            match msg.get_mut("content") {
+                Some(serde_json::Value::Array(blocks)) => {
+                    for block in blocks.iter_mut() {
+                        match block["type"].as_str() {
+                            Some("text") => {
+                                if block["text"].as_str().unwrap_or("").is_empty() {
+                                    block["text"] = serde_json::json!(" ");
+                                    fixed = true;
+                                }
+                            }
+                            Some("tool_result") => match block.get_mut("content") {
+                                Some(serde_json::Value::String(s)) => {
+                                    if s.is_empty() {
+                                        *s = " ".to_string();
+                                        fixed = true;
+                                    }
+                                }
+                                Some(serde_json::Value::Array(inner)) => {
+                                    for ib in inner.iter_mut() {
+                                        if ib["type"] == "text"
+                                            && ib["text"].as_str().unwrap_or("").is_empty()
+                                        {
+                                            ib["text"] = serde_json::json!(" ");
+                                            fixed = true;
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            },
+                            _ => {}
+                        }
+                    }
+                    if blocks.is_empty() {
+                        blocks.push(serde_json::json!({"type": "text", "text": " "}));
+                        fixed = true;
+                    }
+                }
+                Some(serde_json::Value::String(s)) if s.is_empty() => {
+                    *s = " ".to_string();
+                    fixed = true;
+                }
+                _ => {}
+            }
+            if fixed {
+                tracing::warn!(
+                    msg_idx,
+                    role = msg["role"].as_str().unwrap_or("?"),
+                    "Sanitized empty content for DeepSeek (HTTP 400 guard)"
+                );
+            }
+        }
+
+        // Output budget per request (thinking + content). Tunable via
+        // EVEREVO_MAX_OUTPUT_TOKENS so a long-budget GAIA run can give the
+        // model more reasoning room (default 16384).
+        let max_output: u32 = std::env::var("EVEREVO_MAX_OUTPUT_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(16_384);
         let mut body = serde_json::json!({
             "model": self.model,
-            "max_tokens": 16384,
+            "max_tokens": max_output,
             "temperature": 0.0,
             "messages": msgs,
         });
@@ -250,5 +373,131 @@ impl HttpClient {
             })).collect::<Vec<_>>());
         }
         body
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use everevo_core::llm::{LlmMessage, LlmRole};
+
+    fn client() -> HttpClient {
+        HttpClient::new("anthropic", "test-key", "http://localhost:1", "test-model")
+    }
+
+    // Regression: DeepSeek's Anthropic endpoint returns HTTP 400
+    // ("all messages must have non-empty content") when a message carries an
+    // empty text block or an empty tool_result. The 2026-08-12 full GAIA run
+    // hit this on ~40% of questions (messages.11) — an empty shell result or
+    // empty assistant turn was serialized as `"text": ""` / `"content": ""`.
+    #[test]
+    fn anthropic_body_never_sends_empty_text_block() {
+        let empty_assistant = LlmMessage {
+            role: LlmRole::Assistant,
+            content: String::new(),
+            thinking: None,
+            tool_calls: None,
+            tool_call_id: None,
+            images: Vec::new(),
+        };
+        let body = client().build_body(&[empty_assistant], &[], false);
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        let text = blocks
+            .iter()
+            .find(|b| b["type"] == "text")
+            .and_then(|b| b["text"].as_str())
+            .unwrap_or("");
+        assert!(
+            !text.is_empty(),
+            "empty text block must be guarded with a non-empty placeholder"
+        );
+    }
+
+    #[test]
+    fn anthropic_body_guards_empty_tool_result() {
+        let empty_tool = LlmMessage {
+            role: LlmRole::User,
+            content: String::new(),
+            thinking: None,
+            tool_calls: None,
+            tool_call_id: Some("call_1".into()),
+            images: Vec::new(),
+        };
+        let body = client().build_body(&[empty_tool], &[], false);
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        let content = blocks[0]["content"].as_str().unwrap_or("");
+        assert!(
+            !content.is_empty(),
+            "empty tool_result content must be guarded with a placeholder"
+        );
+    }
+
+    #[test]
+    fn anthropic_body_guards_null_tool_use_input() {
+        let tc = everevo_core::types::ToolCall {
+            id: "call_1".into(),
+            name: "todo_write".into(),
+            arguments: serde_json::Value::Null,
+        };
+        let msg = LlmMessage {
+            role: LlmRole::Assistant,
+            content: String::new(),
+            thinking: None,
+            tool_calls: Some(vec![tc]),
+            tool_call_id: None,
+            images: Vec::new(),
+        };
+        let body = client().build_body(&[msg], &[], false);
+        let input = &body["messages"][0]["content"][0]["input"];
+        assert!(
+            !input.is_null(),
+            "null tool_use input must be replaced with {{}}"
+        );
+    }
+
+    #[test]
+    fn anthropic_body_falls_back_for_nonjson_multi_tool_payload() {
+        // An old multi-tool result masked to a plain header keeps tool_call_id
+        // ("id1|id2") but its content is no longer JSON. The builder must emit
+        // one tool_result per id so the preceding tool_use ids aren't orphaned
+        // (DeepSeek HTTP 400 "tool_use ids were found without tool_result").
+        let masked = LlmMessage {
+            role: LlmRole::User,
+            content: "[tool result from \"shell\" masked; 1200 bytes elided...]".into(),
+            thinking: None,
+            tool_calls: None,
+            tool_call_id: Some("call_00_a|call_01_b".into()),
+            images: Vec::new(),
+        };
+        let body = client().build_body(&[masked], &[], false);
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2, "must emit one tool_result per id");
+        assert_eq!(blocks[0]["tool_use_id"], "call_00_a");
+        assert_eq!(blocks[1]["tool_use_id"], "call_01_b");
+        assert!(!blocks[0]["content"].as_str().unwrap_or("").is_empty());
+    }
+
+    #[test]
+    fn anthropic_body_guards_empty_multi_tool_result() {
+        // A multi-tool turn (tool_call_id joined with '|') where one tool
+        // returned nothing serializes each tool_result separately — the empty
+        // one must still carry a placeholder.
+        let multi = LlmMessage {
+            role: LlmRole::User,
+            content: r#"[{"i":"call_1","c":""},{"i":"call_2","c":"result"}]"#.into(),
+            thinking: None,
+            tool_calls: None,
+            tool_call_id: Some("call_1|call_2".into()),
+            images: Vec::new(),
+        };
+        let body = client().build_body(&[multi], &[], false);
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        let first = blocks[0]["content"].as_str().unwrap_or("");
+        assert!(
+            !first.is_empty(),
+            "empty multi-tool result must be guarded with a placeholder"
+        );
+        // The non-empty sibling survives untouched.
+        assert_eq!(blocks[1]["content"], "result");
     }
 }
