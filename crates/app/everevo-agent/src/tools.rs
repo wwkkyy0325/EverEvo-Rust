@@ -22,12 +22,32 @@ use std::sync::Arc;
 
 use everevo_core::tool::ToolRegistry;
 
-/// Build a minimal `ToolRegistry` for CLI mode (7 of 11 tools).
+/// The CLI-mode tool names (single source of truth for what `build_registry`
+/// registers). `download`/`bootstrap_check` are conditional (only when the
+/// corresponding provider is `Some`). A unit test below asserts the built
+/// registry's names are exactly this set (minus the conditional ones), and a
+/// server-side test asserts this set is a subset of the HTTP `assemble()`
+/// registry — the drift guard that replaced the old "keep in sync" comment.
+pub const CLI_REGISTRY_NAMES: &[&str] = &[
+    "shell",
+    "download",
+    "bootstrap_check",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "compact",
+    "tool_cache_read",
+    "team",
+    "workflow_run",
+    "code_search",
+    "code_map",
+    "Skill",
+];
+
+/// Build a minimal `ToolRegistry` for CLI mode (12 possible tools, 10 with
+/// default `None` downloader/bootstrap).
 ///
 /// For the full server-mode registry (Memory, TodoWrite, Task, Workflow, MCP
 /// tools, etc.), see `orchestration::tools::assemble()` in the server crate.
-///
-/// Keep in sync: any tool registered here should also be in the server registry.
 pub fn build_registry(
     sandbox: Arc<dyn everevo_core::sandbox::SandboxProvider>,
     downloader: Option<Arc<everevo_downloader::Downloader>>,
@@ -66,4 +86,44 @@ pub fn build_registry(
     );
     registry.register(Arc::new(builtins::SkillTool::new(skill_reg)));
     registry
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use everevo_core::tool::ToolRegistry;
+
+    /// Drift guard (WS2, 2026-08-13): the CLI registry must register exactly
+    /// `CLI_REGISTRY_NAMES` minus the conditional tools (`download`,
+    /// `bootstrap_check`), which need providers the test can't easily build.
+    #[test]
+    fn cli_registry_matches_name_list() {
+        let sandbox: Arc<dyn everevo_core::sandbox::SandboxProvider> = Arc::new(
+            everevo_sandbox::TieredSandbox::new(everevo_sandbox::SandboxConfig::default()).unwrap(),
+        );
+        let registry: ToolRegistry = build_registry(sandbox, None, None);
+        let mut names = registry.names();
+        names.sort();
+        let mut expected: Vec<&str> = CLI_REGISTRY_NAMES
+            .iter()
+            .copied()
+            .filter(|n| *n != "download" && *n != "bootstrap_check")
+            .collect();
+        expected.sort();
+        assert_eq!(
+            names, expected,
+            "CLI registry drifted from CLI_REGISTRY_NAMES — update the constant or build_registry"
+        );
+    }
+
+    #[test]
+    fn cli_name_list_has_no_duplicates() {
+        let mut seen = std::collections::HashSet::new();
+        for name in CLI_REGISTRY_NAMES {
+            assert!(
+                seen.insert(*name),
+                "duplicate tool name in CLI_REGISTRY_NAMES: {name}"
+            );
+        }
+    }
 }

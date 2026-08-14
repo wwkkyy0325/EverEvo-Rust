@@ -26,7 +26,7 @@
 //! ## Pipeline→Loop integration
 //!
 //! The sync phase writes feedback to a shared `hook_feedback` slot that
-//! the AgentLoop reads after tool execution. This enables the cyclical
+//! the AgentRun reads after tool execution. This enables the cyclical
 //! Observe→Plan→Review→Act→**Reflect**→Observe pattern without modifying
 //! the core loop.
 
@@ -43,7 +43,7 @@ use crate::memory::paradigm::{TrajectoryBuffer, TurnDigest};
 pub struct ReflectGateHook {
     /// Shared trajectory buffer for paradigm extraction (SAMULE pattern).
     pub trajectory_buffer: Arc<TrajectoryBuffer>,
-    /// Shared feedback slot — AgentLoop reads this after tool execution.
+    /// Shared feedback slot — AgentRun reads this after tool execution.
     pub hook_feedback: Arc<Mutex<Option<String>>>,
 }
 

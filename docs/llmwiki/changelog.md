@@ -4,6 +4,91 @@ All notable changes to EverEvo-Rust. Append-only, newest first.
 
 ---
 
+## 2026-08-14 — CODE 门首次突破错题修复平台期（8/37 → 10/37）
+
+**CODE 门跑批（37 错题, workers=6, attempts=1, 新二进制）:**
+- **10/37 (27.0%)**, 突破 v2 的 8/37 (21.6%)
+- L1: 2/3, L2: 7/23 (30.4%), L3: 1/11
+- 新增修复 5: **8b3379c0「1.8」**、**8131e2c0「101.376, 84.348」**(纯计算数值, CODE 门直接救活)、4d51c4bf、f0f46385、1dcc160f
+- 丢失 3 (翻转): 8f80e01c「90→9」、墓碑、50f58759 — 数值不稳定仍是天花板
+- 稳定修复 5: 853c8244、08c0b6e9、935e2cff、23dd907f、14569e28
+- 投影总分 ≈ 138/165 (83.6%)
+
+**验证结论:**
+- CODE 门 (值须来自 shell/python 计算) 治**纯计算数值题**有效 (8b3379c0 从 3.8/6.4 → 1.8, 8131e2c0 从 776 → 101.376)
+- 对**数据提取类** (LLM 读错输入, bec74516 36 vs 26.4) 仍无力 — 需强化"脚本解析源文件"而非硬编码值
+- 数值翻转 (8f80e01c 90↔9) 显示单位/提取处理跨轮不一致, 是下一个瓶颈
+
+---
+
+## 2026-08-14 — 自一致性多数投票对 GAIA 是纯负收益（负面结论，回退）
+
+**跑批:** 37 错题 × 3 attempts, workers=6, 90 分钟。结果:
+- **Pass@1: 5/37 (13.5%)** vs 单跑 v2 8/37 (21.6%) — 方差大, 无提升
+- **Pass@N (任一尝试): 9/37 (24.3%)** — 需 oracle 选对的那个, 运行时不可用
+- **多数投票: 4/37 (10.8%)** — 比单跑**减半**, 3× 成本
+
+**结论:** GAIA 错误是**系统性提取偏差**(多数尝试犯同样错), 非随机噪声。多数投票恰好选中多数错误 (f0f46385 有一次对但 2/3 错 → 投票错)。自一致性 (Wang 2022) 的方差削减假设在 GAIA 不成立。
+
+**决定:** GAIA 跑批回退 `--attempts 1`; `--attempts N` 保留作 Pass@N 诊断; 正确杠杆 = CODE 门控 (确定性提取)。
+
+---
+
+## 2026-08-14 — "Code for numbers" 确定性提取门控（PAL/TableCoder/VeNRA）
+
+**背景:** 三轮跑批 wrong-fix-rate 卡在 8/37 (21.6%)。诊断: 门控治好了行为类(0工具/无锚定/单方法计算), 但剩余 ~29 错题是**数据提取精度**错误 — LLM 拿到对的页面但读错具体数字(bec74516 ORCID 36 vs 26.4、04a04a9b 42 vs 41)。权威依据: PAL (arXiv:2211.10435, 计算交给 Python 解释器, GSM8K +15%)、TableCoder (ACL 2025, 代码生成结构化提取超 GPT-4 11-19%)、VeNRA(所有算术走代码)。核心: **"code for numbers, LLM for language"**。
+
+**实现:**
+- **AnswerDiscipline HARD RULE** (discipline.rs): 数值/计数/列表/表格题必须写 Python 脚本解析源并打印裸值, 禁止肉眼读页面数字; 最终答案必须等于脚本输出。
+- **`value_from_computation` 门控** (driver.rs): hard 数值题提交前, 答案值必须出现在 `shell`/`python` 工具结果里(通过 tool_call_id 关联工具名, 区分 shell 计算 vs web_fetch 页面)。只靠 LLM 读页面 → CODE_FOR_NUMBERS_PROMPT 拦截, 强制写代码。
+- **SGV 门扩展**: 现有 SGV(独立重算)门与 CODE 门级联 — 值非代码来源 → CODE prompt; 值来自代码但单方法 → SGV prompt。
+- 测试: 343 全绿(新增 code_for_numbers 2 + 更新 SGV 3 测试适配 CODE 门), clippy 干净。
+
+---
+
+## 2026-08-14 — GAIA round-2: content-anchored gate + SGV recompute gate + follow-up launder fix
+
+**背景:** 47 题验证跑批(37 错 + 10 正确样本)结果: 16/47 (34.0%), 8/37 wrong-fixed (21.6%), 但 2/10 correct-regression (20%, 阻塞), 2 个 round-1 修复回归 (00d579ea/50f58759)。数值类占仍错的大头。权威研究(自一致性 Wang 2022 arXiv:2203.11171 + 确定性 grounding guardrails arXiv:2607.08028、Dokis commit-time substring check)支撑三个确定性修复。
+
+**内容锚定提交门控 (driver + final_answer.rs):**
+- 证据门从"有无工具消息"(`any_evidence`)升级为"**答案内容逐字出现在检索结果**"(`content_grounded`): 提取答案的数值 token + ≥5 字母词, 任一出现在工具结果即 grounded; 纯数值答案豁免(交给 SGV 门)
+- 拦截 b4cc024b 类: 关键来源不可达仍硬猜 → UNGROUNDED_ANSWER_PROMPT(允许 `Final answer: unreachable` 弃答, 禁止猜测相关值)
+- GATE-DEBUG 增加 `answer_grounded` 字段
+
+**SGV 独立重算门控 (driver):**
+- `has_independent_recompute`: 会话中必须存在 `verify_candidate --recompute`(第二方法)或 `cluster verify`, 否则纯数值答案被拦截 → SGV_RECOMPUTE_PROMPT(治单方法 agreement-bias: c526d8d6 "0.0429"、04a04a9b "44")
+- 与证据门正交: 证据门管"有没有证据/答案是否锚定", SGV 门管"数值有没有独立重算"
+
+**harness follow-up launder 修复 (gaia_bench.py):**
+- chat_followup 只在主回合用过工具(`resp["tool_calls"]` 非空)时触发 — 0-tool 主回合不再被 follow-up 洗白成正式答案
+- 冒烟测试确认: Nature 38 工具、headstone 42 工具(原 0-tool), 全跑批 0 真 0-tool 提交
+
+**架构拖累识别 (数据实证):** shell 霸权 65% (401/620)、cluster 仅 19 次/47 题 (flash 士兵荒废)、累计 token 每题 150 万 (tool_cache_read 仅 1 次)。下一步: 强制 meta-orchestrator cluster fan-out + 工具偏好引导。
+
+**测试:** final_answer 8 tests + content_grounding 2 + sgv_ 2 + 既有 340 全绿; clippy -D warnings 干净。
+
+---
+
+## 2026-08-14 — MetaOrchestrator 管线上级 + verifier 修复落地
+
+**背景:** GAIA 失败 77% 是 committed-but-wrong(verifier 同源模型确认偏差)+ 时间窗利用率低(串行探索、后期才派发子 agent)。依据权威研究(SupervisorAgent arXiv:2510.26585、MARCH arXiv:2603.24579、Snell arXiv:2408.03314、arXiv:2512.08296)落地两套修复,全部 env-gated 惰性接线,不扰动在跑的 165q 全量。
+
+**VF-1 — 数值聚合独立重算(verify_candidate.py):**
+- 新增 `--recompute <expr2>`:与 `--compute` 同时给出时,两种独立方法必须一致,否则 `recompute_mismatch` violation 拦截(治 248→41、36.0→26.4 单公式嵌入同一错误的模式)
+- 修复 repair_loop 两个预旧 bug:`expected order <num>` 正则提取失效 + 强修到 expected 后 `circular` 检查死锁;18 个测试全过
+
+**MO-1..4 — MetaOrchestrator 纯策略层(LLM-free,Arc<Mutex<>> 观察者模式,镜像 MetaAgentState):**
+- `loop_/meta_orchestrator.rs`:Scout/DeepDive/Verify/Commit 相位机(阈值与 Convergence 逐条件一致,`phase_stage` 含 turn/wall 双驱动 + verified/Simple 跳转);5 道门 fan-out 治理器(`decide_fan_out`:Simple 不 fan-out / 仅 DeepDive / 仅 Independent≥2 / 防 overspawn / 成本覆盖);`drive_phase` 每次转场恰好一条指令;`subagent_phase_directive`
+- driver Section 6 惰性分支:`if let Some(orch)` 时在 convergence match 之后叠层 push 相位指令;`None` 字节等价(313→316 测试全绿,含 on/off 两个 run_loop 级测试)
+- cluster `verify` 新增 `asymmetric` 标志:reviewer system prompt 换成对抗性 `Verifier` 角色 + 明确"Solver 推导被隐藏,只看 claim + 证据指针"(MARCH independence-by-withholding)
+- `SubAgentContext.orchestrator_directive` 字段 + 渲染块;handler 单点从共享状态填充
+- server `wiring.rs` / `app_state::meta_orchestrator_effective()`:`EVEREVO_BENCHMARK` 设 **且** `EVEREVO_META_ORCHESTRATOR!=0` 才启用;`run_gaia_l1.sh` 已加 `export EVEREVO_META_ORCHESTRATOR=1`
+- skeptic.rs verify 调用加 `--recompute` 指导(VF-1 的 prompt 侧)
+
+**明确不做:** 不改自检 stages 的文本(信息不对称靠 Verify 相位指令 + cluster asymmetric);不引入第二循环;不改 FSM 语义。
+
+---
+
 ## 2026-08-13 — 物理重构:文件/文件夹对齐逻辑层次 + 拆大合小
 
 **背景:** 逻辑层次(审计/方案)已定,用户指令做**物理层**——文件/文件夹对齐逻辑层、拆 >900 行文件、合并逻辑相近小文件。计划经两轮研究(3 agent 侦察 + 大文件结构核实)后批准。

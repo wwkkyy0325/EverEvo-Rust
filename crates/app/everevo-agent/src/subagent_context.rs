@@ -77,8 +77,12 @@ pub struct SubAgentContext {
     pub kg_context: Option<String>,
     /// Token budget for the sub-agent's own loop, inherited from the parent's
     /// model window when available (fallback 80000 ≈ the legacy hardcoded
-    /// value). Feeds the sub-agent `AgentLoop` context ceiling.
+    /// value). Feeds the sub-agent `AgentRun` context ceiling.
     pub max_context_tokens: usize,
+    /// Parent orchestrator phase directive (Scout/DeepDive/Verify/Commit).
+    /// `None` (default) → the sub-agent runs without the parent's tactical
+    /// context. Set by the server from the shared orchestrator state.
+    pub orchestrator_directive: Option<String>,
 }
 
 /// Maximum recursion depth for sub-agent delegation.
@@ -104,6 +108,7 @@ impl Default for SubAgentContext {
             memory_context: None,
             kg_context: None,
             max_context_tokens: DEFAULT_SUBAGENT_MAX_TOKENS,
+            orchestrator_directive: None,
         }
     }
 }
@@ -244,6 +249,13 @@ impl SubAgentContext {
         prompt.push_str("- Report ALL findings, including empty results.\n");
         prompt.push_str("- Return thorough, structured results.\n\n");
 
+        // ── Orchestrator directive (parent phase context) ──────
+        if let Some(ref dir) = self.orchestrator_directive {
+            prompt.push_str("## Orchestrator Directive\n");
+            prompt.push_str(dir);
+            prompt.push_str("\n\n");
+        }
+
         // ── Task ───────────────────────────────────────────────
         prompt.push_str("## Task\n");
         prompt.push_str(task_description);
@@ -374,4 +386,37 @@ fn build_system_info_block(shell_name: &str, tool_names: &[String]) -> String {
         tools = tools_str,
         guide = shell_guide,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_orchestrator_directive_rendered_only_when_some() {
+        let mut ctx = SubAgentContext::default();
+        let prompt = ctx.build_system_prompt("solve");
+        assert!(
+            !prompt.contains("Orchestrator Directive"),
+            "no directive set → the section must be absent"
+        );
+
+        ctx.orchestrator_directive = Some("The parent is in the DEEPDIVE phase.".into());
+        let prompt = ctx.build_system_prompt("solve");
+        assert!(
+            prompt.contains("## Orchestrator Directive"),
+            "directive set → the section must render"
+        );
+        assert!(
+            prompt.contains("DEEPDIVE phase"),
+            "the directive text must be injected verbatim"
+        );
+        // The directive sits immediately before the task.
+        let dir_idx = prompt.find("## Orchestrator Directive").unwrap();
+        let task_idx = prompt.find("## Task").unwrap();
+        assert!(
+            dir_idx < task_idx,
+            "directive must precede the task section"
+        );
+    }
 }

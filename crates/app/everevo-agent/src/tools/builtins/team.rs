@@ -2,7 +2,8 @@
 //!
 //! Claude Code alignment: Agent Teams / Coordinator mode.
 //! Dispatches N sub-agents in parallel, each with a role-specific
-//! system prompt. The coordinator collects and synthesizes results.
+//! system prompt. The coordinator collects and concatenates member
+//! results; final synthesis happens in the main loop's auto-continue.
 //!
 //! ## Roles
 //!
@@ -365,12 +366,17 @@ impl TeamTool {
 
         tokio::spawn(async move {
             let _permit = _permit; // hold semaphore permit until task completes
-            let config = crate::loop_::AgentLoop::sub_agent(max_turns)
+            let config = crate::loop_::AgentRun::sub_agent(max_turns)
                 .with_tool_result_budget(4000)
                 .with_context_budget(40000);
 
             let result_text = config
-                .run_subagent(llm, tools, messages, member_cancel.clone())
+                .run_to_string(
+                    llm as Arc<dyn everevo_core::LlmProvider>,
+                    tools,
+                    messages,
+                    member_cancel.clone(),
+                )
                 .await;
 
             // Feed into subagent_rx so the main loop injects [SubAgent Result]
@@ -426,8 +432,8 @@ impl Tool for TeamTool {
     fn description(&self) -> &str {
         "Dispatch a team of role-specialized sub-agents to work on a task in parallel. \
          Each team member gets a role-specific system prompt (reviewer, researcher, coder, tester). \
-         Results are collected and synthesized. Use for complex tasks that benefit from \
-         multiple perspectives. \
+         Results are collected and concatenated (final synthesis happens in the main loop). \
+         Use for complex tasks that benefit from multiple perspectives. \
          Parameters: task (the overall task), members (array of {{role, focus}} — what each member should focus on)."
     }
 

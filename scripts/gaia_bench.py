@@ -56,6 +56,12 @@ SCORING_MODE = "official"
 # (no ground truth — the only split the official leaderboard accepts; writes a
 # submission_*.jsonl). Rebound from the --split CLI arg.
 SPLIT = "validation"
+# Per-question wall-clock cap (seconds). Rebound from --question-timeout.
+# The server's EVEREVO_BENCHMARK_WALLCLOCK is set to (this - 30) so the loop's
+# convergence/evidence gates stay armed for the FULL question budget (2026-08-14:
+# the gates' budget_ok check silently disarmed at the default 300s deadline,
+# letting 0-tool memory answers commit at ~320s on 1800s questions).
+QUESTION_TIMEOUT = 300
 # Self-consistency: run each question N times and vote (default 1 = single run).
 # Rebound from the --attempts CLI arg.
 ATTEMPTS = 1
@@ -297,6 +303,11 @@ def start_server():
     for _k in ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HF_ENDPOINT"):
         env.pop(_k, None)
     env["EVEREVO_DATA_DIR"] = str(WS_ROOT / "data")
+    # Match the loop's wall-clock deadline to the question budget so the
+    # convergence/evidence gates stay armed for the WHOLE question (a 300s
+    # default deadline disarms budget_ok at ~300s and lets 0-tool memory
+    # answers commit on 1800s questions).
+    env["EVEREVO_BENCHMARK_WALLCLOCK"] = str(max(60, QUESTION_TIMEOUT - 30))
     # Unattended benchmark: no human to approve shell commands. Under the
     # default semi_auto, dangerous-pattern / external-path commands (the `at `
     # substring pattern matches "eat"/"task"/"import") block on a confirmation
@@ -703,6 +714,40 @@ def _clean_candidate(s: str) -> str:
     return s.strip()
 
 
+_GLUE_RE = re.compile(
+    r"^\s*([-+]?\$?\d[\d,]*(?:\.\d+)?(?:%|m3|m\^3|m³)?)"
+    r"([A-Za-z][A-Za-z]*[\s.,;!?'\"”])"
+)
+_BARE_NUM_RE = re.compile(r"^[-+]?\$?\d[\d,]*(?:\.\d+)?(?:%|m3|m\^3|m³)?$")
+
+
+def _glued_prose_guard(s: str) -> str:
+    """Cut prose glued onto a `Final answer:` value (48eb8242: `6Let me...`).
+
+    Two CONSERVATIVE rules that only fire on signatures a legitimate single-line
+    value never produces, so this can never corrupt a correct answer:
+    - Rule B: a number immediately glued to a letter-word that is itself
+      terminated by whitespace/punctuation -> cut to the number. Protects `3D`,
+      `2nd`, `0.5mg` (trailing word runs to end-of-string), `8, 29`, `1:41.614`.
+    - Rule A: >=2 non-empty lines, FIRST is a bare number, a later line has a
+      letter -> cut to the first line. `42\nLet me verify` -> `42`.
+    Mirrors `loop_/final_answer.rs::sanitize_final_answer` (Rust driver).
+    """
+    m = _GLUE_RE.match(s)
+    if m:
+        v = m.group(1).strip()
+        if v:
+            return v
+    lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
+    if (
+        len(lines) >= 2
+        and _BARE_NUM_RE.match(lines[0])
+        and any(c.isalpha() for ln in lines[1:] for c in ln)
+    ):
+        return lines[0]
+    return s
+
+
 def extract_final_answer(text: str):
     """Extract the text after the LAST `Final answer:` marker.
 
@@ -710,11 +755,13 @@ def extract_final_answer(text: str):
     (answer, had_marker). If no marker, falls back to the last non-empty line
     (the final response), with had_marker=False so the report can flag the
     validity caveat. The candidate is cleaned of markdown/answer-label wrappers
-    before return (see _clean_candidate).
+    (see _clean_candidate) then passed through the conservative glued-prose
+    guard (Rule B/Rule A above) — it strips the model's trailing prose after a
+    correct value without ever corrupting a legitimately-formed answer.
     """
     matches = list(re.finditer(r"(?i)final\s+answer\s*(is\s*)?:?", text))
     if matches:
-        return _clean_candidate(text[matches[-1].end():]), True
+        return _glued_prose_guard(_clean_candidate(text[matches[-1].end():])), True
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     return _clean_candidate(lines[-1] if lines else ""), False
 
@@ -989,7 +1036,11 @@ def run_one_question(idx, q, total, question_timeout, checkpoint=None):
     # NATURALLY (no error AND a valid session_id came back — a wall-clock cap
     # leaves session_id None, so an in-flight turn is never raced). The follow-up
     # replaces the scored response only when it produced a clean marker.
+    # A 0-tool main run is NEVER followed up: nothing was gathered, so a re-prompt
+    # would just re-emit a memory guess ("Caused its demise.") — a laundered
+    # 0-tool commit. Only extract when the main run actually retrieved evidence.
     if (not resp.get("error") and resp.get("session_id")
+            and resp.get("tool_calls")
             and not re.search(r"(?i)final\s+answer", resp.get("text", ""))):
         state = "verifying"
         fb = chat_followup(resp["session_id"], wall_clock=60)
@@ -1370,6 +1421,19 @@ def run_self_tests() -> bool:
           sc["substring_match"] is True and sc["method"] == "legacy-substr")
     SCORING_MODE = "official"
 
+    # ── glued-prose guard (48eb8242 class, 2026-08-14) ─────────────────────
+    check("glue: 'Final answer: 6Let me do a final check' → 6",
+          extract_final_answer("Final answer: 6Let me do a final check")[0] == "6")
+    check("glue: 'Final answer: 42\\nLet me verify' → 42",
+          extract_final_answer("Final answer: 42\nLet me verify")[0] == "42")
+    for keep in ["Final answer: 1:41.614", "Final answer: Indonesia, Myanmar",
+                 "Final answer: 8, 29, 22, 1, 8, 26", "Final answer: 3D",
+                 "Final answer: 2nd", "Final answer: 0.5mg", "Final answer: bacon"]:
+        check(f"glue: preserved {keep!r}", extract_final_answer(keep)[0] == keep.split(": ", 1)[1])
+    sc = score_answer("Final answer: 6Let me do a final check — case-insensitive table search.",
+                      "6")
+    check("glue: 48eb8242-style glued value now passes exact-match", sc["exact_match"] is True)
+
     if failures:
         fail(f"{len(failures)} self-test(s) failed: {failures}")
         return False
@@ -1446,6 +1510,11 @@ if __name__ == "__main__":
     parser.add_argument("--questions", default=None,
                         help='Comma-separated 1-based question numbers to run '
                              '(e.g. --questions "8,10,11,12"). Overrides --start/--limit.')
+    parser.add_argument("--ids", default=None,
+                        help='Comma-separated task_ids to run (subset re-run, e.g. '
+                             'the wrong questions from a completed checkpoint). '
+                             'Filters the loaded list by task_id; independent of '
+                             '--questions/--start/--limit.')
     parser.add_argument("--use-sample", action="store_true",
                         help="Use built-in sample questions (no HF auth needed)")
     parser.add_argument("--workers", type=int, default=1,
@@ -1481,6 +1550,7 @@ if __name__ == "__main__":
     SCORING_MODE = args.scoring  # module scope: rebinds the module global directly
     SPLIT = args.split  # module scope: rebinds the module global directly
     ATTEMPTS = args.attempts  # module scope: rebinds the module global directly
+    globals()['QUESTION_TIMEOUT'] = args.question_timeout  # feeds the server wall-clock
 
     if args.self_test:
         sys.exit(0 if run_self_tests() else 1)
@@ -1509,6 +1579,10 @@ if __name__ == "__main__":
     sel_indices = None
     if args.questions:
         sel_indices = {int(x.strip()) - 1 for x in args.questions.split(",") if x.strip()}
+    if args.ids:
+        ids = {x.strip() for x in args.ids.split(",") if x.strip()}
+        questions = [q for q in questions if q["task_id"] in ids]
+        log(f"--ids: re-running {len(questions)} subset questions by task_id")
 
     try:
         run_benchmark(questions, limit=args.limit, start=args.start,

@@ -26,7 +26,7 @@ use crate::llm::HttpClient;
 use crate::memory::facts::FactManager;
 use crate::memory::paradigm::TrajectoryBuffer;
 
-// ── Meta-Agent State (wired into AgentLoop) ────────────────────────────────
+// ── Meta-Agent State (wired into AgentRun) ────────────────────────────────
 
 /// Tracks meta-agent triggering alongside proactivity.
 ///
@@ -124,7 +124,7 @@ impl Default for MetaAgentState {
 /// Run the meta-agent diagnosis on recent trajectory data.
 ///
 /// Fire-and-forget (same pattern as `reflect_on_turn`). Called as a
-/// background task from `post_turn.rs` or directly from `AgentLoop`.
+/// background task from `post_turn.rs` or directly from `AgentRun`.
 ///
 /// Returns `None` if the meta-agent has nothing useful to say, or if
 /// the LLM call fails (logged but not surfaced).

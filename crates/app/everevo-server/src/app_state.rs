@@ -73,6 +73,12 @@ pub struct AppState {
     /// Main execution provider — drives the context-window budget for the
     /// primary chat session. None → `ContextBudget::resolve(None)` (128k floor).
     pub main_llm: RwLock<Option<ResolvedProvider>>,
+    /// Sub-agent (soldier) provider — `[routing] subagentModelId`, fallback main.
+    /// Flash for cheap parallel fan-out; distinct from the main (commander).
+    pub subagent_llm: RwLock<Option<ResolvedProvider>>,
+    /// Verifier (officer) provider — `[routing] verifierModelId`, fallback main.
+    /// Strong/independent model for asymmetric `cluster verify` (MARCH).
+    pub verifier_llm: RwLock<Option<ResolvedProvider>>,
     /// Web-search delegate provider (first Anthropic-format entry, e.g. DeepSeek).
     /// When set, `web_search_local` runs a native server-side web search through
     /// this provider instead of the plugin's cn.bing/Sogou chain (which returns
@@ -377,6 +383,8 @@ impl AppState {
             vision_llm: RwLock::new(None),
             compact_llm: RwLock::new(None),
             main_llm: RwLock::new(None),
+            subagent_llm: RwLock::new(None),
+            verifier_llm: RwLock::new(None),
             web_search_llm: RwLock::new(None),
             meta_agent_enabled: RwLock::new(meta_agent_enabled),
             bootstrap,
@@ -445,6 +453,21 @@ pub async fn meta_agent_effective(state: &AppState) -> bool {
         return false;
     }
     *state.meta_agent_enabled.read().await
+}
+
+/// Effective meta-orchestrator switch. STRICTLY opt-in: enabled only when
+/// benchmark mode is active (a real wall-clock deadline exists for the phase
+/// machine to consume) AND `EVEREVO_META_ORCHESTRATOR` is set non-"0".
+/// Default OFF — the orchestrator is a benchmark/scaffolding enhancement,
+/// never product behavior.
+pub fn meta_orchestrator_effective() -> bool {
+    if std::env::var("EVEREVO_BENCHMARK").is_err() {
+        return false;
+    }
+    match std::env::var("EVEREVO_META_ORCHESTRATOR") {
+        Ok(v) => v != "0",
+        Err(_) => false,
+    }
 }
 
 /// Load persisted workspace from data/config/workspace.json (Claude Code alignment).

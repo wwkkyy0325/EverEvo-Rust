@@ -145,6 +145,16 @@ impl AppState {
             .and_then(|r| r.get("compactModelId"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        // Dual-model tier ids: soldiers (sub-agents) default to main, officers
+        // (asymmetric verifier) default to main. Empty → fall back to main.
+        let subagent_id = routing
+            .and_then(|r| r.get("subagentModelId"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let verifier_id = routing
+            .and_then(|r| r.get("verifierModelId"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
         let guard = self.llm.read().await;
         let resolve = |id: &str| -> Option<ResolvedProvider> {
@@ -156,12 +166,31 @@ impl AppState {
         };
         let vision = vision_id.as_deref().and_then(resolve);
         let compact = compact_id.as_deref().and_then(resolve);
+        // Fall back to the main provider for tiers without an explicit id.
+        let main_client = resolve("primary").or_else(|| {
+            resolve(
+                routing
+                    .and_then(|r| r.get("mainModelId"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("primary"),
+            )
+        });
+        let subagent = subagent_id
+            .as_deref()
+            .and_then(resolve)
+            .or_else(|| main_client.clone());
+        let verifier = verifier_id
+            .as_deref()
+            .and_then(resolve)
+            .or_else(|| main_client.clone());
         drop(guard);
 
         let vision_resolved = vision.is_some();
         let compact_resolved = compact.is_some();
         *self.vision_llm.write().await = vision;
         *self.compact_llm.write().await = compact;
+        *self.subagent_llm.write().await = subagent;
+        *self.verifier_llm.write().await = verifier;
         if vision_resolved || compact_resolved {
             tracing::info!(
                 "Special providers resolved: vision={}, compact={}",
@@ -169,6 +198,11 @@ impl AppState {
                 compact_id.unwrap_or_default()
             );
         }
+        tracing::info!(
+            "Tier providers: subagent={}, verifier={}",
+            subagent_id.unwrap_or_else(|| "main".into()),
+            verifier_id.unwrap_or_else(|| "main".into())
+        );
     }
 
     /// Resolve the main execution provider and its `context_window`, used to

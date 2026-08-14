@@ -539,7 +539,7 @@ async fn cmd_bootstrap(config: &everevo_core::AppConfig, check_only: bool) {
 }
 
 async fn cmd_chat(config: &everevo_core::AppConfig, message: &str) {
-    use everevo_agent::loop_::{AgentEvent, AgentLoop};
+    use everevo_agent::loop_::{AgentEvent, AgentRun};
     use everevo_agent::tools::build_registry;
     use everevo_core::llm::LlmMessage;
     use everevo_sandbox::{SandboxConfig, TieredSandbox};
@@ -555,7 +555,12 @@ async fn cmd_chat(config: &everevo_core::AppConfig, message: &str) {
     };
 
     // ── Sandbox ──────────────────────────────────────────────────────
-    let sandbox_root = config.data_dir.join("sandbox");
+    // `EVEREVO_SANDBOX_ROOT` lets the Terminal-Bench Harbor adapter point the
+    // agent's shell at the task container's working directory (the agent must
+    // operate directly on the container filesystem, not an isolated sandbox).
+    let sandbox_root = std::env::var("EVEREVO_SANDBOX_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| config.data_dir.join("sandbox"));
     std::fs::create_dir_all(&sandbox_root).ok();
     let sandbox = TieredSandbox::new(SandboxConfig {
         sandbox_root,
@@ -565,6 +570,12 @@ async fn cmd_chat(config: &everevo_core::AppConfig, message: &str) {
         eprintln!("Failed to create sandbox: {e}");
         std::process::exit(1);
     });
+    // Container-evaluation mode (Terminal-Bench): bypass permission gates —
+    // the container is the isolation boundary, so the agent must operate the
+    // full filesystem (/app, /tmp, /usr, …) without per-command confirmation.
+    if std::env::var("EVEREVO_SANDBOX_UNRESTRICTED").is_ok() {
+        sandbox.set_unrestricted(true);
+    }
     let sandbox: Arc<dyn everevo_core::sandbox::SandboxProvider> = Arc::new(sandbox);
 
     // ── Tools ────────────────────────────────────────────────────────
@@ -574,12 +585,23 @@ async fn cmd_chat(config: &everevo_core::AppConfig, message: &str) {
     ));
 
     // ── Agent Loop ───────────────────────────────────────────────────
-    let agent = AgentLoop::cli();
+    let agent = AgentRun::cli();
     let messages = vec![LlmMessage::user(message)];
+    // Clone before run() moves `llm` — read the cumulative token counters
+    // after the loop finishes (the Terminal-Bench Harbor adapter parses this
+    // line for cost accounting; the format is stable: `__TOKENS__ <in> <out>`).
+    let llm_for_tokens = Arc::clone(&llm);
 
     println!("🤖 EverEvo\n");
 
-    let mut events = agent.run(llm, tools, messages, None).await;
+    let mut events = agent
+        .run(
+            llm as Arc<dyn everevo_core::LlmProvider>,
+            tools,
+            messages,
+            None,
+        )
+        .await;
     let mut final_text = String::new();
 
     while let Some(event) = events.recv().await {
@@ -613,6 +635,11 @@ async fn cmd_chat(config: &everevo_core::AppConfig, message: &str) {
             _ => {}
         }
     }
+
+    // Report cumulative token usage for the run (stable line for the
+    // Terminal-Bench adapter's cost accounting).
+    let (in_tok, out_tok) = llm_for_tokens.token_usage();
+    println!("\n__TOKENS__ {in_tok} {out_tok}");
 }
 
 use everevo_server::main_impl::run_init_llm_phase;

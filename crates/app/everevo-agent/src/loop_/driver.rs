@@ -15,7 +15,9 @@ use super::convergence::{
     verified_wrapup_prompt, Convergence, POST_VERIFY_STALL_TURNS,
 };
 use super::dedup::deduplicate_tool_results;
+use super::final_answer::{content_grounded, final_answer_value, sanitize_final_answer};
 use super::hooks::execute_with_hooks;
+use super::meta_orchestrator::drive_phase;
 use super::proactivity::hash_args;
 use super::retrospective::{build_retrospective, truncate_for_retro};
 use super::state::{is_terminal, transition, LoopEvent, LoopState};
@@ -40,6 +42,187 @@ skeptical reviewer perspectives (e.g. \"numeric reviewer\", \
 \"source-verbatim reviewer\") on the candidate, and commit only if it \
 survives.
 Do not emit `Final answer:` until at least one verification step has run.";
+
+/// Hard-interception counter cap — a generous upper bound that the wall-clock
+/// budget normally exhausts first; purely a guard against a pathological model
+/// that neither calls a tool nor lets the deadline pass.
+const EVIDENCE_GATE_MAX: u32 = 50;
+
+/// Hard-interception prompt injected on EVERY no-tool-evidence commit. This is
+/// a GATE, not a nudge: the loop will not accept a hard question's answer until
+/// at least one tool result exists or the wall-clock is nearly gone. The round-1
+/// "0-tool confident-wrong" class (384d0dd8 "8166", 7a4a336d "1:56.56",
+/// c526d8d6 "0.0429") is exactly what this blocks.
+const EVIDENCE_BEFORE_COMMIT_PROMPT: &str = "\
+You are about to commit a final answer but have NOT retrieved ANY evidence via \
+tools in this conversation. This is BLOCKED: a value committed purely from \
+memory is a guess, not an answer. You MUST call at least one tool now — \
+`web_search` / `web_fetch` for external facts, `wayback_lookup` for historical \
+pages, `read_file` / `describe_image` / `python` for attached files — and cite \
+what it returns. If you already hold a well-supported answer from the question \
+or an attached file, verify it with ONE tool read and commit it unchanged — do \
+not change a correct answer. The commit will be rejected until a tool result \
+exists.";
+
+/// Content-anchored intercept: the candidate value does NOT appear verbatim in
+/// any retrieved tool result, even though tools ran. The answer is a memory
+/// fabrication dressed up as research (b4cc024b "Lützow Free Corps" when the
+/// key Whitney source was unreachable). Deterministic commit-time grounding —
+/// the value's key terms must trace to a retrieved source, or the model must
+/// abstain ("report the source as unreachable") rather than guess.
+const UNGROUNDED_ANSWER_PROMPT: &str = "\
+Your proposed final answer does NOT appear in ANY retrieved tool result — its \
+key terms/numbers are not grounded in what you fetched. This is BLOCKED: \
+committing a value no source states is fabrication, not an answer. Either \
+(1) call a tool that retrieves a source ACTUALLY containing the value and cite \
+it, or (2) if the authoritative source is genuinely unreachable, commit exactly \
+`Final answer: unreachable` and name the source you could not retrieve — never \
+guess a related value. Re-run with a real retrieval, then commit the value you \
+found verbatim in the tool result.";
+
+/// SGV independent-recompute intercept: a pure-numeric answer on a hard
+/// question was derived by ONE method only (the model's own computation — the
+/// single-pass agreement-bias failure: c526d8d6 "0.0429", 04a04a9b "44",
+/// bec74516 "36"). An independent recompute (`verify_candidate --recompute`
+/// with a DIFFERENT decomposition, or a skeptical `cluster verify`) must agree
+/// before the commit is accepted.
+const SGV_RECOMPUTE_PROMPT: &str = "\
+Your numeric answer was computed by only ONE method, so there is no \
+independent confirmation — a single pass can silently use the wrong density, \
+units, or column. This is BLOCKED until you run an INDEPENDENT recompute. \
+Run `python verify_candidate.py verify --answer <candidate> --compute \
+<method1> --recompute <method2>` where method2 is a DIFFERENT path to the \
+same value (different decomposition, unit conversion, or re-derivation from \
+the raw tool data) — NOT the same formula restated. Alternatively run \
+`cluster verify` with a skeptical \"numeric reviewer\" perspective. Commit \
+only when the independent recompute agrees with your candidate.";
+
+/// "Code for numbers" intercept (2026-08-14, PAL/TableCoder/VeNRA): the value
+/// was READ off a fetched page by the model, not derived by code. LLMs
+/// hallucinate numbers when they eyeball raw tables/text; the fix is to make
+/// the model write a Python script that PARSES the retrieved source and PRINTS
+/// the value. The commit is blocked until the answer appears in a shell/python
+/// output.
+const CODE_FOR_NUMBERS_PROMPT: &str = "\
+Your answer value was READ from a fetched page, not COMPUTED from code — when \
+an LLM eyeballs raw numbers it confabulates them. This is BLOCKED. Write and \
+run a Python script that parses the retrieved source (the fetched HTML/CSV/\
+text you already have) and PROGRAMMATICALLY extracts/counts/computes the \
+value, then prints ONLY the bare value. Do NOT read the number off the page — \
+extract it with code (regex, table parse, arithmetic). Commit the exact value \
+your script printed.";
+
+/// True when the conversation contains an INDEPENDENT numeric verification:
+/// a `verify_candidate` shell call with `--recompute` (a second method), or a
+/// `cluster verify` adversarial review. A plain `verify_candidate` without
+/// `--recompute` is single-method and does NOT satisfy this.
+fn has_independent_recompute(messages: &[LlmMessage]) -> bool {
+    messages.iter().any(|m| {
+        m.tool_calls.as_ref().is_some_and(|calls| {
+            calls.iter().any(|tc| match tc.name.as_str() {
+                "cluster" => tc
+                    .arguments
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|a| a == "verify"),
+                "shell" => {
+                    let cmd = tc
+                        .arguments
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    cmd.contains("verify_candidate") && cmd.contains("--recompute")
+                }
+                _ => false,
+            })
+        })
+    })
+}
+
+/// "Code for numbers" provenance check (2026-08-14, PAL/TableCoder/VeNRA):
+/// a committed numeric/list value must appear in the output of a
+/// COMPUTATION tool (`shell` — the sandbox that runs the model's parsing /
+/// arithmetic Python), not merely in a `web_fetch`/`read_file` page the model
+/// eyeballed. The model must WRITE code that parses the retrieved source and
+/// prints the value; an answer the LLM "read" off a page is a hallucinated
+/// number. Correlates each Tool result to its producing tool via `tool_call_id`.
+fn value_from_computation(answer: &str, messages: &[LlmMessage]) -> bool {
+    use std::collections::HashMap;
+    // tool_call_id → tool name (from assistant messages' tool_calls).
+    let mut names: HashMap<String, String> = HashMap::new();
+    for m in messages {
+        if let Some(calls) = &m.tool_calls {
+            for tc in calls {
+                names.insert(tc.id.clone(), tc.name.clone());
+            }
+        }
+    }
+    let pieces = super::final_answer::groundable_pieces(answer);
+    if pieces.is_empty() {
+        // Nothing code-derivable to check — don't block.
+        return true;
+    }
+    let contains = |content: &str| -> bool {
+        let lower = content.to_lowercase();
+        pieces.iter().any(|p| lower.contains(&p.to_lowercase()))
+    };
+    let is_computation = |name: &str| -> bool { name == "shell" || name == "python" };
+    for m in messages {
+        if m.role != LlmRole::Tool {
+            continue;
+        }
+        let ids: Vec<String> = m
+            .tool_call_id
+            .clone()
+            .unwrap_or_default()
+            .split('|')
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if ids.len() == 1 {
+            let name = names.get(&ids[0]).map(String::as_str).unwrap_or("");
+            if is_computation(name) && contains(&m.content) {
+                return true;
+            }
+        } else if ids.len() > 1 {
+            // Multi-result merge: content is a JSON array [{i, c}, ...].
+            if let Ok(items) =
+                serde_json::from_str::<Vec<serde_json::Value>>(&m.content)
+            {
+                for item in items {
+                    let id = item.get("i").and_then(|v| v.as_str()).unwrap_or("");
+                    let content = item.get("c").and_then(|v| v.as_str()).unwrap_or("");
+                    let name = names.get(id).map(String::as_str).unwrap_or("");
+                    if is_computation(name) && contains(content) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Evidence prompt with a TodoWrite-awareness suffix: when the task list claims
+/// completed work but no tool evidence exists, those completions are unverified
+/// — the model must re-run them with a tool and update the list.
+pub(crate) fn evidence_prompt(todo_summary: &Option<String>) -> String {
+    let has_completed = todo_summary
+        .as_deref()
+        .is_some_and(|s| s.contains("completed"));
+    if has_completed {
+        format!(
+            "{EVIDENCE_BEFORE_COMMIT_PROMPT}\n\n\
+             Your task list (`Task State` in the context) shows COMPLETED items, \
+             yet you retrieved no tool evidence in this conversation. A \
+             completed task with no tool result is NOT actually done — re-run \
+             each completed item with a tool, then update the list via \
+             TodoWrite with the real status."
+        )
+    } else {
+        EVIDENCE_BEFORE_COMMIT_PROMPT.to_string()
+    }
+}
 
 #[allow(
     clippy::too_many_arguments,
@@ -74,6 +257,8 @@ pub(crate) async fn run_loop(
     let compact_focus = &config.compact_focus;
     let proactivity = &config.proactivity;
     let meta_agent_state = &config.meta_agent_state;
+    let orchestrator = &config.orchestrator;
+    let todo_summary = &config.todo_summary;
     let hook_feedback_slot = &config.hook_feedback_slot;
     let compact_llm = config.compact_llm.as_deref();
     let background = config.background.as_ref();
@@ -118,6 +303,8 @@ pub(crate) async fn run_loop(
         None => false,
     });
     let mut verify_reprompts = 0u32;
+    // Evidence-gate nudges (cap 1) — hard question with no tool evidence.
+    let mut evidence_reprompts = 0u32;
     // Turns spent on NON-verification tool calls after a verification step ran.
     // Tracks the "verified candidate exists but the agent keeps exploring"
     // stall (the dominant GAIA timeout mode) so the runtime can nudge a commit.
@@ -133,7 +320,7 @@ pub(crate) async fn run_loop(
 
         // T16 cancellation check (gap fix): a cancel between turns must stop
         // the loop rather than waiting for the next in-flight LLM/tool call
-        // to notice. Previously only run_subagent checked between calls.
+        // to notice. Previously only run_to_string checked between calls.
         if cancel.is_some_and(|c| c.is_cancelled()) {
             state = transition(state, LoopEvent::Cancel).0;
             let _ = tx
@@ -287,6 +474,34 @@ pub(crate) async fn run_loop(
 
         // If text but no tool calls → check for pending sub-agents first.
         if tool_calls.is_empty() {
+            // Any tool result (or sub-agent result) in the conversation counts as
+            // evidence — computed once, shared by the thinking-only gate and the
+            // evidence commit gate below.
+            let any_evidence = messages.iter().any(|m| {
+                m.role == LlmRole::Tool
+                    || (m.role == LlmRole::User && m.content.starts_with("[SubAgent Result]"))
+            });
+            // Content-anchored grounding (2026-08-14): the committed value's
+            // core content must appear verbatim in a retrieved tool result.
+            // `any_evidence` only checks that SOME tool ran; this checks that
+            // the ANSWER itself is grounded. Pure-numeric answers are exempt
+            // (an average is computed, not extracted — the SGV recompute gate
+            // covers those), so a computed value is never false-blocked.
+            let answer_value = final_answer_value(&current_text);
+            let is_numeric_answer = !answer_value.chars().any(|c| c.is_ascii_alphabetic());
+            // A numeric value committed as prose ("The average is 36: ...")
+            // still needs the SGV recompute — `answer_has_number` catches that
+            // while `is_numeric_answer` (bare digits only) exempts the content
+            // gate from false-blocking a computed average.
+            let answer_has_number = answer_value.chars().any(|c| c.is_ascii_digit());
+            let answer_grounded = {
+                let tool_texts: Vec<String> = messages
+                    .iter()
+                    .filter(|m| m.role == LlmRole::Tool)
+                    .map(|m| m.content.clone())
+                    .collect();
+                is_numeric_answer || content_grounded(&answer_value, &tool_texts)
+            };
             let pending = pending_subagents.load(std::sync::atomic::Ordering::SeqCst);
             if pending > 0 {
                 if let Some(ref mut rx) = subagent_rx {
@@ -314,6 +529,47 @@ pub(crate) async fn run_loop(
             // empty answer, and the model's own reasoning is preserved as the
             // seed. No sub-agent yield, no early return with empty text.
             if current_text.is_empty() && !current_thinking.is_empty() {
+                // 0-tool gate on the thinking-only path: a HARD question whose
+                // model only "thought" and never retrieved is a memory-answer
+                // waiting to happen. If there is still budget, push the
+                // reasoning back with the hard evidence prompt and force a tool
+                // call — do NOT commit from memory. Only fall through to the
+                // terminal-convergence commit when the budget is nearly gone.
+                if difficulty == Difficulty::Hard
+                    && !any_evidence
+                    && !verified
+                    && evidence_reprompts < EVIDENCE_GATE_MAX
+                    && verify_gate
+                {
+                    let budget_ok = match wall_clock_deadline {
+                        Some(deadline) => {
+                            deadline
+                                .saturating_duration_since(std::time::Instant::now())
+                                .as_secs()
+                                > 30
+                        }
+                        None => turn < max_turns.saturating_sub(1),
+                    };
+                    if budget_ok {
+                        evidence_reprompts += 1;
+                        state = transition(state, LoopEvent::ThinkingOnly).0; // T7 → Converge
+                        tracing::warn!(
+                            turn,
+                            thinking_chars = current_thinking.len(),
+                            "Thinking-only + no tool evidence on hard question — forcing a tool call"
+                        );
+                        messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: String::new(),
+                            thinking: Some(current_thinking.clone()),
+                            tool_calls: None,
+                            tool_call_id: None,
+                            images: Vec::new(),
+                        });
+                        messages.push(LlmMessage::user(evidence_prompt(todo_summary)));
+                        continue;
+                    }
+                }
                 state = transition(state, LoopEvent::ThinkingOnly).0; // T7 → Converge
                 tracing::warn!(
                     turn,
@@ -330,7 +586,7 @@ pub(crate) async fn run_loop(
                 });
                 messages.push(LlmMessage::user(forced_final_prompt()));
                 let final_text = match llm.chat(messages, &[]).await {
-                    Ok(resp) => resp.content.unwrap_or_default(),
+                    Ok(resp) => sanitize_final_answer(&resp.content.unwrap_or_default()),
                     Err(e) => {
                         tracing::warn!(error = %e, "Forced convergence call failed");
                         String::new()
@@ -387,9 +643,124 @@ pub(crate) async fn run_loop(
                 }
             }
 
+            // ── Evidence commit gate (hard questions only, 2026-08-14 HARD) ──
+            // A hard question committing with NO tool-retrieved evidence in the
+            // whole conversation is a memory-answer (0-tool commits like "52",
+            // "Caused its demise.", "" are pure recollection — never accepted).
+            // The verification gate above only fires when `!verified`; this gate
+            // is the second layer and it is a HARD INTERCEPT: it fires on EVERY
+            // no-evidence commit (no cap) until the model actually calls a tool
+            // OR the wall-clock is nearly gone (budget_ok false → the T18
+            // forced-commit / deadline path takes over, preserving anti-timeout).
+            // A model that insists on answering from memory burns turns until it
+            // uses a tool or the deadline forces a best-effort value.
+            // (`any_evidence` and `answer_grounded` are computed at the top of
+            // this branch.)
+            if difficulty == Difficulty::Hard && (!any_evidence || !answer_grounded) {
+                let budget_now = match wall_clock_deadline {
+                    Some(deadline) => deadline
+                        .saturating_duration_since(std::time::Instant::now())
+                        .as_secs(),
+                    None => turn as u64,
+                };
+                tracing::warn!(
+                    turn,
+                    verified,
+                    verify_gate,
+                    budget_ok = budget_now > 30,
+                    budget_left = budget_now,
+                    any_evidence,
+                    answer_grounded,
+                    "GATE-DEBUG: hard question committing with no grounded evidence",
+                );
+            }
+            if difficulty == Difficulty::Hard
+                && (!any_evidence || !answer_grounded)
+                && !verified
+                && evidence_reprompts < EVIDENCE_GATE_MAX
+                && verify_gate
+            {
+                let budget_ok = match wall_clock_deadline {
+                    Some(deadline) => {
+                        deadline
+                            .saturating_duration_since(std::time::Instant::now())
+                            .as_secs()
+                            > 30
+                    }
+                    None => turn < max_turns.saturating_sub(1),
+                };
+                if budget_ok {
+                    evidence_reprompts += 1;
+                    state = transition(state, LoopEvent::UnverifiedHard).0; // T8 → Verify
+                    // Distinguish the two interception reasons: NO evidence at
+                    // all (gather evidence) vs evidence exists but does NOT
+                    // contain the answer (fabrication → abstention prompt).
+                    let grounding = !answer_grounded && any_evidence;
+                    tracing::info!(
+                        turn,
+                        reprompt = evidence_reprompts,
+                        grounding,
+                        "Hard question committed with no grounded evidence — HARD intercept"
+                    );
+                    let prompt = if grounding {
+                        UNGROUNDED_ANSWER_PROMPT.to_string()
+                    } else {
+                        evidence_prompt(todo_summary)
+                    };
+                    messages.push(LlmMessage::user(prompt));
+                    continue;
+                }
+            }
+
+            // ── "Code for numbers" + SGV gate (hard numeric answers) ─────
+            // (1) The committed value must be DERIVED BY CODE, not read off a
+            // page by the LLM (PAL/TableCoder/VeNRA: code-for-numbers). (2) An
+            // INDEPENDENT method must confirm it (verify_candidate --recompute
+            // OR cluster verify) — a single-pass computation is agreement-bias.
+            // The verify gate above caps at 2 re-prompts, so this gate keeps
+            // pushing until BOTH hold or the wall-clock is nearly gone.
+            if difficulty == Difficulty::Hard
+                && answer_has_number
+                && (!value_from_computation(&answer_value, messages)
+                    || !has_independent_recompute(messages))
+                && evidence_reprompts < EVIDENCE_GATE_MAX
+                && verify_gate
+            {
+                let budget_ok = match wall_clock_deadline {
+                    Some(deadline) => {
+                        deadline
+                            .saturating_duration_since(std::time::Instant::now())
+                            .as_secs()
+                            > 30
+                    }
+                    None => turn < max_turns.saturating_sub(1),
+                };
+                if budget_ok {
+                    evidence_reprompts += 1;
+                    state = transition(state, LoopEvent::UnverifiedHard).0; // T8 → Verify
+                    let from_code = value_from_computation(&answer_value, messages);
+                    tracing::info!(
+                        turn,
+                        reprompt = evidence_reprompts,
+                        numeric = answer_has_number,
+                        from_code,
+                        "Hard numeric answer not code-derived or not independently recomputed — intercept"
+                    );
+                    // Distinguish: value READ (not computed) → force code; value
+                    // computed but single-method → force independent recompute.
+                    let prompt = if !from_code {
+                        CODE_FOR_NUMBERS_PROMPT
+                    } else {
+                        SGV_RECOMPUTE_PROMPT
+                    };
+                    messages.push(LlmMessage::user(prompt.to_string()));
+                    continue;
+                }
+            }
+
             // No pending sub-agents → truly done.
             state = transition(state, LoopEvent::DoneSignal).0; // T9 → Done
-            let final_text = current_text.clone();
+            let final_text = sanitize_final_answer(&current_text);
             let summary = build_retrospective(
                 turn as i32,
                 total_tool_calls,
@@ -835,6 +1206,25 @@ pub(crate) async fn run_loop(
                     }
                 }
             }
+            // Meta-orchestrator directives (opt-in, benchmark). The orchestrator
+            // is a policy layer ON TOP of the FSM: its phase machine maps 1:1
+            // onto the convergence transitions above (Commit == Commit,
+            // Verify == Converge at the same thresholds, Scout/DeepDive == None,
+            // with verified/Simple jumping to Verify early), so the convergence
+            // match already fired the right coarse transition. Here we append
+            // the phase's TACTICAL directive — Scout decompose / DeepDive
+            // fan-out / Verify asymmetric check — and let the agent execute it
+            // through its existing tools. Disabled → this block is inert.
+            if let Some(orch) = &orchestrator {
+                let mut o = orch.lock().unwrap_or_else(|e| e.into_inner());
+                let directives = drive_phase(
+                    &mut o, turn, max_turns, wall_frac, difficulty, verified, messages,
+                );
+                drop(o);
+                for d in directives {
+                    messages.push(LlmMessage::user(d));
+                }
+            }
             let turns_left = if max_turns > 0 {
                 Some(max_turns.saturating_sub(turn))
             } else {
@@ -870,7 +1260,7 @@ pub(crate) async fn run_loop(
             state = transition(state, LoopEvent::WallClockLow).0; // → TerminalCommit
             messages.push(LlmMessage::user(forced_final_prompt()));
             let final_text = match llm.chat(messages, &[]).await {
-                Ok(resp) => resp.content.unwrap_or_default(),
+                Ok(resp) => sanitize_final_answer(&resp.content.unwrap_or_default()),
                 Err(_) => String::new(),
             };
             state = transition(state, LoopEvent::Ready).0; // TerminalCommit → Done

@@ -184,6 +184,24 @@ Before committing a candidate answer found through research, verify it against \
 EVERY constraint in the question — the right article/version, the exact value, \
 and units. If a candidate fails any constraint, discard it and keep searching.
 
+### Code for numbers (HARD RULE — numeric / count / list / table questions)
+When the answer is a number, a count, a list, or a value read from a table, \
+spreadsheet, or structured page, you MUST derive it with CODE, never by \
+eyeballing the raw page. LLMs confabulate numbers they \"read\"; an \
+interpreter does not. Concretely:
+1. Fetch/save the source (HTML, CSV, text, or your earlier tool results) to a \
+   file the sandbox can read.
+2. Write a Python script that PARSES that file (regex, CSV/table parse, cell \
+   addressing, arithmetic) and PRINTS ONLY the bare value — no prose, no \
+   units, just the number/list the question asks for.
+3. Run it via `shell` and read the printed value.
+4. Commit EXACTLY the value your script printed — the final answer must equal \
+   the script output, verbatim.
+The commit gate REJECTS a numeric answer that never appeared in a shell/python \
+result: if you are about to commit a number that no script printed, write the \
+script first. This is the deterministic-extraction discipline (PAL: offload \
+computation to an interpreter; the LLM only writes the program).
+
 ### Count-to-pick questions (most/least/fewest titles)
 When the question asks which article/section/part has a QUOTED term in the \
 MOST (or fewest) titles/entries (e.g. \"the article that has 'witnesses' in \

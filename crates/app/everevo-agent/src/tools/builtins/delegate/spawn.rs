@@ -56,10 +56,15 @@ pub(crate) async fn spawn_single(
 
     let start = std::time::Instant::now();
     let sa_id = Uuid::new_v4();
-    let agent_loop = crate::AgentLoop::sub_agent(max_turns)
-        .with_context_budget(sub_ctx.max_context_tokens.saturating_mul(4));
+    let agent_loop =
+        crate::AgentRun::sub_agent(max_turns).with_context_tokens(sub_ctx.max_context_tokens);
     let final_text = agent_loop
-        .run_subagent(llm, Arc::new(sub_tools), messages, cancel)
+        .run_to_string(
+            llm as Arc<dyn everevo_core::LlmProvider>,
+            Arc::new(sub_tools),
+            messages,
+            cancel,
+        )
         .await;
     let duration_ms = start.elapsed().as_millis() as u64;
 

@@ -16,7 +16,7 @@ use uuid::Uuid;
 use everevo_core::llm::LlmMessage;
 use everevo_core::tool::ToolRegistry;
 
-use crate::loop_::AgentLoop;
+use crate::loop_::AgentRun;
 use crate::subagent_context::SubAgentContext;
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -47,6 +47,9 @@ pub struct SubAgentTask {
     pub max_turns: usize,
     /// Optional system prompt override (e.g., TeamRole guidance).
     pub system_prompt_override: Option<String>,
+    /// Per-task LLM override (dual-model: asymmetric verify reviewers run on
+    /// the stronger verifier provider). None → the pool's default provider.
+    pub model_override: Option<Arc<crate::llm::HttpClient>>,
     /// Cancellation token for this specific task.
     pub cancel_token: Option<CancellationToken>,
 }
@@ -107,7 +110,10 @@ impl SubAgentPool {
                 .acquire_owned()
                 .await
                 .expect("semaphore closed");
-            let llm = Arc::clone(&self.llm);
+            let llm = task
+                .model_override
+                .clone()
+                .unwrap_or_else(|| Arc::clone(&self.llm));
             let tools = Arc::clone(&self.tools);
             let ctx = self.sub_ctx.clone();
             let timeout = self.config.timeout_secs;
@@ -132,9 +138,9 @@ impl SubAgentPool {
 
                 let content = tokio::time::timeout(
                     std::time::Duration::from_secs(timeout),
-                    AgentLoop::sub_agent(task.max_turns.max(1))
-                        .with_context_budget(ctx.max_context_tokens.saturating_mul(4))
-                        .run_subagent(llm, tools, messages, cancel),
+                    AgentRun::sub_agent(task.max_turns.max(1))
+                        .with_context_tokens(ctx.max_context_tokens)
+                        .run_to_string(llm, tools, messages, cancel),
                 )
                 .await
                 .unwrap_or_else(|_| format!("Timeout after {timeout}s"));
@@ -180,7 +186,10 @@ impl SubAgentPool {
     ) {
         for task in tasks {
             let permit = self.semaphore.clone().acquire_owned();
-            let llm = Arc::clone(&self.llm);
+            let llm = task
+                .model_override
+                .clone()
+                .unwrap_or_else(|| Arc::clone(&self.llm));
             let tools = Arc::clone(&self.tools);
             let ctx = self.sub_ctx.clone();
             let timeout = self.config.timeout_secs;
@@ -206,9 +215,9 @@ impl SubAgentPool {
 
                 let content = tokio::time::timeout(
                     std::time::Duration::from_secs(timeout),
-                    AgentLoop::sub_agent(task.max_turns.max(1))
-                        .with_context_budget(ctx.max_context_tokens.saturating_mul(4))
-                        .run_subagent(llm, tools, messages, cancel),
+                    AgentRun::sub_agent(task.max_turns.max(1))
+                        .with_context_tokens(ctx.max_context_tokens)
+                        .run_to_string(llm, tools, messages, cancel),
                 )
                 .await
                 .unwrap_or_else(|_| format!("Timeout after {timeout}s"));
@@ -247,7 +256,7 @@ impl SubAgentPool {
 /// Classify sub-agent result content as an error.
 ///
 /// Matches the error patterns produced by:
-/// - `run_subagent` (`mod.rs`): "Error: {e}", "Error: LLM stream stalled..."
+/// - `run_to_string` (`agent.rs`): "Error: {e}", "Error: LLM stream stalled..."
 /// - `HttpClient::stream_chat` (`http.rs`): "Authentication failed (HTTP 401)...",
 ///   "Rate limited (HTTP 429)...", "Server error (HTTP 500)...",
 ///   "Model overloaded (HTTP 529)...", "Bad request (HTTP 400)...",
@@ -299,6 +308,7 @@ mod tests {
             prompt: "do something".into(),
             max_turns: 3,
             system_prompt_override: None,
+            model_override: None,
             cancel_token: None,
         };
         assert_eq!(task.max_turns, 3);

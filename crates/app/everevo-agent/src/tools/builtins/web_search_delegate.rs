@@ -73,7 +73,7 @@ impl Tool for WebSearchDelegateTool {
         let max_results = params["max_results"].as_u64().unwrap_or(5).clamp(1, 20) as usize;
 
         // The delegate provider's API executes the search server-side and
-        // synthesizes the answer; run_subagent already handles the native
+        // synthesizes the answer; run_to_string already handles the native
         // `server_tool_use` → `web_search_tool_result` flow and returns text.
         let prompt = format!(
             "Research the following question using the web_search tool. Run multiple searches if \
@@ -85,9 +85,8 @@ impl Tool for WebSearchDelegateTool {
         let registry = Arc::new(ToolRegistry::new());
         let cancel = cancel.cloned().unwrap_or_else(CancellationToken::new);
         let llm: Arc<dyn everevo_core::LlmProvider> = self.llm.clone();
-        let result = crate::AgentLoop::new()
-            .with_max_turns(3)
-            .run_subagent(llm, registry, messages, cancel)
+        let result = crate::AgentRun::sub_agent(3)
+            .run_to_string(llm, registry, messages, cancel)
             .await;
         // Audit MEDIUM (2026-08-13): the tool returned is_error:false even when
         // the research sub-agent errored or was cancelled — the main loop then

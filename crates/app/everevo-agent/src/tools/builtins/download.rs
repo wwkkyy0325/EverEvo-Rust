@@ -1,15 +1,11 @@
-//! In-process download tool with workspace-scoped output directory.
-//!
-//! Complemented by MCP plugin `plugin-download` which provides basic URL-to-file download.
-//! This in-process version integrates with the session sandbox work_dir and downloader
-//! engine — features the MCP plugin cannot provide.
-//! This in-process implementation is kept for backward compatibility.
-//! New development should use the MCP plugin version.
-
 //! Download tool — wraps everevo-downloader.
 //!
 //! The agent uses this to download files with multi-mirror, resume, and progress support.
 //! Calls `Downloader::submit()` directly — **no CLI overhead**.
+//!
+//! Complemented by MCP plugin `plugin-download` (basic URL-to-file); this
+//! in-process version is the fallback that integrates the session sandbox
+//! work_dir and downloader engine the plugin cannot provide.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

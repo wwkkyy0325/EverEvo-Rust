@@ -27,10 +27,10 @@ event with a clear reason.
 | Tool timeout | per-tool timeout (300s shell / 120s other) | `failure_messages` + continue | agent sees the failure and retries | driver.rs |
 | Hook-blocked | error contains "blocked" | `ToolCallEnd is_error` + continue | agent re-routes | driver.rs |
 | User declines | confirmation gate | skip + continue | — | driver.rs |
-| Panic | `catch_unwind` | — | `AgentEvent::Error "Internal agent error"` | mod.rs |
+| Panic | `catch_unwind` | — | `AgentEvent::Error "Internal agent error"` | agent.rs |
 | Cancel | `cancel.is_cancelled()` | T16 → `Cancelled` (≤1 turn) | terminal | driver.rs |
 | **Verification spiral (top GAIA timeout cause)** | `post_verify_turns >= POST_VERIFY_STALL_TURNS` (6 non-verify turns after a verification step) | **T21 Act→Stalled** — verified-aware wrap-up nudge (`verified_wrapup_prompt`), once; at Converge/Commit stage **T23/T25 Act→Escalating** replaces the generic prompt | forced terminal commit (T18/T26) extracts the value | convergence.rs / driver.rs / state.rs |
-| **Circular verifier warning** (`expected == answer`) | verify_candidate.py reports circular | VerifyCandidate stage 0: re-derive via a DIFFERENT path (raw recompute / `cluster verify`), never dismiss | commit best-effort verified value | verify_candidate.rs |
+| **Circular verifier warning** (`expected == answer`) | verify_candidate.py reports circular | VerifyCandidate stage 0: re-derive via a DIFFERENT path (raw recompute / `cluster verify`), never dismiss | commit best-effort verified value | stages/verification/skeptic.rs |
 
 ## Tool errors(tool `execute`)
 

@@ -53,7 +53,7 @@ pub struct TaskTool {
     llm: Option<Arc<crate::llm::HttpClient>>,
     persona: Arc<std::sync::RwLock<Option<String>>>,
     result_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
-    /// Pending sub-agent count — AgentLoop uses this to block Done
+    /// Pending sub-agent count — AgentRun uses this to block Done
     /// while sub-agents are still running.
     pub pending: Arc<AtomicUsize>,
     /// Parent agent's work directory for path inheritance.
@@ -114,7 +114,7 @@ impl TaskTool {
             .unwrap_or_else(|e| e.into_inner()) = Some(dir);
     }
 
-    /// Get a receiver for the AgentLoop and store the sender.
+    /// Get a receiver for the AgentRun and store the sender.
     pub fn take_receiver(&self) -> tokio::sync::mpsc::UnboundedReceiver<String> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         *self.result_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);

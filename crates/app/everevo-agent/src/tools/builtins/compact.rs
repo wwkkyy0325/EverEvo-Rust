@@ -1,11 +1,3 @@
-//! In-process compact tool with focus-channel integration for AgentLoop autocompact.
-//!
-//! Complemented by MCP plugin `plugin-compact` which provides a stateless summarization
-//! tool. This in-process version integrates with the compact_focus shared channel that
-//! the AgentLoop reads for auto-compaction — a feature the MCP plugin cannot provide.
-//! This in-process implementation is kept for backward compatibility.
-//! New development should use the MCP plugin version.
-
 //! Compact tool — manually trigger context compaction mid-session.
 //!
 //! Claude Code equivalent: the `/compact` slash command. When called, the
@@ -15,6 +7,10 @@
 //! The `focus` parameter is wired through to `autocompact()`: the shared
 //! `compact_focus` mutex is written by this tool's `execute()` and read
 //! (then cleared) by the agent loop's compaction path on the next turn.
+//!
+//! Complemented by MCP plugin `plugin-compact` (stateless summarization);
+//! this in-process version is the fallback that integrates the
+//! `compact_focus` channel the MCP plugin cannot touch.
 
 use async_trait::async_trait;
 use everevo_core::tool::{Tool, ToolOutput};

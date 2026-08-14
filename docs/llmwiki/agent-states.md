@@ -54,7 +54,7 @@ every row below (T1–T26), so this doc and the code cannot drift.**
 
 ## Boundary notes
 
-- `panic` is caught OUTSIDE the FSM by `mod.rs` `catch_unwind` →
+- `panic` is caught OUTSIDE the FSM by `agent.rs` `catch_unwind` →
   `AgentEvent::Error "Internal agent error"`.
 - T19/T20 are `Solve` internal self-loops (the `continue` arcs), not new states.
 - T16 (cancel) was a **known gap**: previously `run_loop` only noticed
@@ -68,6 +68,19 @@ every row below (T1–T26), so this doc and the code cannot drift.**
   wall-clock has crossed into Converge/Commit, the escalation prompt (which is
   verified-aware when a verified candidate exists) supersedes the standalone
   stall nudge.
+
+## Meta-orchestrator (policy layer, NOT new FSM states)
+
+`loop_/meta_orchestrator.rs` is an LLM-free policy layer ABOVE the FSM — it
+introduces **no** new `LoopState`/`LoopEvent`/T-rows. Its phase machine
+(`Scout → DeepDive → Verify → Commit`) maps 1:1 onto the existing convergence
+transitions: `Commit`==T25, `Verify`==T23 at the same thresholds, and the early
+"None" window (T21) is refined into `Scout`/`DeepDive` with `verified`/`Simple`
+jumping straight to `Verify`. In driver section 6, when
+`EVEREVO_META_ORCHESTRATOR` is set (benchmark-only, opt-in), the FSM fires
+exactly as before and the orchestrator appends phase *tactical directives*
+(user messages) on top — the agent executes them through its existing tools.
+Disabled → byte-equivalent.
 
 ## Session lifecycle states
 

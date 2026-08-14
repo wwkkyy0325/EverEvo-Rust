@@ -4,7 +4,7 @@
 //!
 //! | Module | Content |
 //! |--------|---------|
-//! | `loop_` | ReAct agent loop (AgentLoop, AgentEvent) |
+//! | `loop_` | ReAct agent loop (AgentRun, AgentEvent) |
 //! | `llm` | LLM providers (HttpClient, MockLlmProvider) |
 //! | `tools` | Built-in tool registry |
 //! | `stages` | Context pipeline stages (persona, skills, best practices, domain, memory) |
@@ -38,7 +38,7 @@ pub mod tools;
 // ── Public API ──────────────────────────────────────────────────────────
 
 // Agent loop
-pub use loop_::{AgentEvent, AgentLoop, EscalationLevel, ProactivityState};
+pub use loop_::{AgentEvent, AgentRun, AgentRunMode, EscalationLevel, ProactivityState};
 
 // LLM providers
 pub use llm::{HttpClient, MockLlmProvider};
@@ -54,7 +54,8 @@ pub use stages::{
     SkillStage, SynthesisReport,
 };
 
-// Tool registry (legacy constructor — prefer orchestration::tools::assemble())
+// Tool registry — CLI-mode constructor; the HTTP/session registry is
+// `everevo-server::orchestration::tools::assemble` (see `CLI_REGISTRY_NAMES`).
 pub use tools::build_registry;
 
 // ── Server integration surface ────────────────────────────────────────────

@@ -18,6 +18,7 @@ use uuid::Uuid;
 use everevo_core::llm::LlmProvider;
 use everevo_core::TelemetryPipeline;
 
+use super::meta_orchestrator::MetaOrchestratorState;
 use super::proactivity::ProactivityState;
 use crate::context::BackgroundMaintenance;
 use crate::memory::meta_agent::MetaAgentState;
@@ -41,6 +42,13 @@ pub(crate) struct RunConfig {
     pub compact_focus: Option<Arc<Mutex<Option<String>>>>,
     pub proactivity: Option<Arc<Mutex<ProactivityState>>>,
     pub meta_agent_state: Option<Arc<Mutex<MetaAgentState>>>,
+    /// Current TodoWrite task list, rendered by the server (handler) each
+    /// request. Lets the driver's evidence gate reference task progress — e.g.
+    /// "your todos claim completed but you retrieved no tool evidence".
+    pub todo_summary: Option<String>,
+    /// LLM-free meta-orchestrator (Scout/DeepDive/Verify/Commit policy layer).
+    /// `None` (default) → the driver runs exactly as today (byte-equivalent).
+    pub orchestrator: Option<Arc<Mutex<MetaOrchestratorState>>>,
     pub hook_feedback_slot: Option<Arc<Mutex<Option<String>>>>,
     pub compact_llm: Option<Arc<dyn LlmProvider>>,
     pub background: Option<Arc<BackgroundMaintenance>>,
@@ -71,6 +79,8 @@ impl RunConfig {
             compact_focus: None,
             proactivity: None,
             meta_agent_state: None,
+            todo_summary: None,
+            orchestrator: None,
             hook_feedback_slot: None,
             compact_llm: None,
             background: None,

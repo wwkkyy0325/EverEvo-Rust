@@ -72,17 +72,34 @@ Before emitting `Final answer:`, every checklist item MUST have:
 Run the sandbox verifier FIRST:
   `python verify_candidate.py verify --answer <your answer> \\
       --expected <expected value> [--unit <unit>] [--compute <expr>] \\
-      [--expect-list <verbatim items>] [--entity <name>]`
+      [--recompute <expr2>] [--expect-list <verbatim items>] [--entity <name>]`
 Use `--expected` with the value you derived and `--unit` with its dimension, \
-so order-of-magnitude and unit errors are caught. If it reports violations, \
-repair the candidate and re-verify — at most 2 attempts.
+so order-of-magnitude and unit errors are caught. For a NUMERIC aggregation \
+answer, pass BOTH `--compute` (your formula) AND `--recompute` — a SECOND, \
+independent method for the same value (different decomposition, unit path, or \
+raw-data recount). The verifier rejects the candidate when the two methods \
+disagree — a single formula that already embeds the mistake cannot pass alone. \
+If it reports violations, repair the candidate and re-verify — at most 2 attempts.
 
 ### 3. Escalate to adversarial review if the deterministic check fails
 If `verify_candidate.py` still reports violations after 2 repairs, run a \
 second, INDEPENDENT check via the `cluster` tool:
   `cluster verify` with `claims` = [\"Final answer: <candidate>\"] and \
-  `perspectives` = [\"numeric reviewer\", \"source-verbatim reviewer\"].
+  `perspectives` = [\"numeric reviewer\", \"source-verbatim reviewer\"], \
+  `asymmetric` = true (reviewer sees evidence, NOT your draft).
 Commit only if it survives; the adversarial verdict is your tiebreaker.
+
+### 3b. Dead / historical sources — pre-route to archives FIRST
+When a question references a page that may be historical (\"as of 2020\", an \
+old arXiv listing, a dead science site, a page that changed), do NOT retry the \
+live page in a loop. Use `wayback_lookup`:
+  `wayback_lookup` with `url`, `from`/`to` (e.g. \"20200101\"), and `action`:
+  - `list` → archived snapshot URLs for a date range,
+  - `raw` (+ optional `timestamp`) → the snapshot's RAW content (no toolbar).
+If the live source is blocked by an anti-bot challenge (OpenReview, etc.), use \
+a public mirror dataset (e.g. HuggingFace `creativityschapiro/openreview_raw`) \
+instead of fighting the block. For live-API drift (e.g. World Bank), prefer a \
+dated bulk download over the live API.
 
 ### 4. Cap the verify loop
 Do not let re-verification consume the remaining time budget. If the verifier \

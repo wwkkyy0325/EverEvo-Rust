@@ -8,7 +8,7 @@ mod tests {
     use crate::loop_::driver::run_loop;
     use crate::loop_::proactivity::{hash_args, EscalationLevel, ProactivityState};
     use crate::loop_::trim;
-    use crate::loop_::{AgentEvent, AgentLoop};
+    use crate::loop_::{AgentEvent, AgentRun};
     use everevo_core::llm::{LlmMessage, LlmProvider, LlmRole, StreamEvent, ToolSchema};
     use everevo_core::tool::{Tool, ToolOutput, ToolRegistry};
     use everevo_core::EverEvoError;
@@ -39,6 +39,35 @@ mod tests {
             let text = params["text"].as_str().unwrap_or("no input");
             Ok(ToolOutput {
                 content: format!("echo: {text}"),
+                is_error: false,
+                ..Default::default()
+            })
+        }
+    }
+
+    struct MockShellTool;
+    #[async_trait::async_trait]
+    impl Tool for MockShellTool {
+        fn name(&self) -> &str {
+            "shell"
+        }
+        fn description(&self) -> &str {
+            "Runs a shell command"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]})
+        }
+        fn risk_level(&self) -> everevo_core::types::RiskLevel {
+            everevo_core::types::RiskLevel::Low
+        }
+        async fn execute(
+            &self,
+            params: serde_json::Value,
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<ToolOutput, EverEvoError> {
+            let cmd = params["command"].as_str().unwrap_or("");
+            Ok(ToolOutput {
+                content: format!("shell output for: {cmd}"),
                 is_error: false,
                 ..Default::default()
             })
@@ -93,7 +122,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_agent_loop_creation() {
-        let agent = AgentLoop::new();
+        let agent = AgentRun::new();
         assert_eq!(agent.max_turns, 0);
         let limited = agent.with_max_turns(5);
         assert_eq!(limited.max_turns, 5);
@@ -582,18 +611,18 @@ mod tests {
 
     #[test]
     fn test_agent_budget_config() {
-        let agent = AgentLoop::new()
+        let agent = AgentRun::new()
             .with_tool_result_budget(2000)
             .with_context_budget(50000);
         assert_eq!(agent.max_tool_result_chars, 2000);
         assert_eq!(agent.max_context_chars, 50000);
     }
 
-    // ── run_subagent now DELEGATES to run_loop (unified engine, P0.1) ──
+    // ── run_to_string now DELEGATES to run_loop (unified engine, P0.1) ──
     // The thin collect wrapper must reconstruct the streamed response text and
     // return it — exactly like the old inline loop did.
     #[tokio::test]
-    async fn test_run_subagent_delegates_to_loop() {
+    async fn test_run_to_string_delegates_to_loop() {
         use crate::llm::{MockLlmProvider, MockScript, MockStep};
 
         // Declarative mock pipeline: one text step answers the single LLM call.
@@ -603,8 +632,8 @@ mod tests {
         let mut reg = ToolRegistry::new();
         reg.register(Arc::new(EchoTool));
         let llm: Arc<dyn LlmProvider> = Arc::new(mock);
-        let result = AgentLoop::sub_agent(3)
-            .run_subagent(
+        let result = AgentRun::sub_agent(3)
+            .run_to_string(
                 llm,
                 Arc::new(reg),
                 vec![LlmMessage::user("solve it")],
@@ -613,14 +642,14 @@ mod tests {
             .await;
         assert!(
             result.contains("Final answer: 42"),
-            "run_subagent must collect streamed text through run_loop, got: {result:?}"
+            "run_to_string must collect streamed text through run_loop, got: {result:?}"
         );
     }
 
-    // ── run_subagent collects the value across a tool-calling turn. ──
+    // ── run_to_string collects the value across a tool-calling turn. ──
     // Tools execute, results re-inject, the next LLM turn commits the value.
     #[tokio::test]
-    async fn test_run_subagent_collects_after_tool_call() {
+    async fn test_run_to_string_collects_after_tool_call() {
         use crate::llm::{MockLlmProvider, MockScript, MockStep};
 
         // Mock pipeline: turn 1 calls `echo`, turn 2 commits the value.
@@ -636,8 +665,8 @@ mod tests {
         reg.register(Arc::new(EchoTool));
         let mock_arc = Arc::new(mock);
         let llm: Arc<dyn LlmProvider> = mock_arc.clone();
-        let result = AgentLoop::sub_agent(3)
-            .run_subagent(
+        let result = AgentRun::sub_agent(3)
+            .run_to_string(
                 llm,
                 Arc::new(reg),
                 vec![LlmMessage::user("echo hello")],
@@ -646,10 +675,610 @@ mod tests {
             .await;
         assert!(
             result.contains("Final answer: hello"),
-            "run_subagent must collect the value across a tool-calling turn, got: {result:?}"
+            "run_to_string must collect the value across a tool-calling turn, got: {result:?}"
         );
         // The mock pipeline asserts the agent really invoked `echo` with the
         // scripted args (not just that a value came back).
         mock_arc.assert_calls_contain("echo", &serde_json::json!({"text": "hello"}));
+    }
+
+    // ── Meta-orchestrator phase directives (opt-in, benchmark) ─────────────
+    // A Simple question jumps straight to the Verify phase on turn 1
+    // (phase_stage: Simple → Verify in the None window), so a single text-only
+    // turn must carry EXACTLY ONE phase directive. The orchestrator-OFF
+    // variant is the golden trace: no "Orchestrator:" messages at all.
+
+    fn orchestrator_config(with_orch: bool) -> RunConfig {
+        let mut c = RunConfig {
+            max_turns: 0,
+            wall_clock_deadline: Some(
+                std::time::Instant::now() + std::time::Duration::from_secs(3600),
+            ),
+            pending_subagents: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            ..RunConfig::new()
+        };
+        if with_orch {
+            c.orchestrator = Some(std::sync::Arc::new(std::sync::Mutex::new(
+                crate::loop_::MetaOrchestratorState::new(),
+            )));
+        }
+        c
+    }
+
+    async fn run_simple_turn(config: RunConfig) -> Vec<LlmMessage> {
+        // Turn 1: a tool call (echo) so the loop advances past tool execution to
+        // Section 6 (the budget/orchestrator block) — a text-only turn short-
+        // circuits to Done BEFORE Section 6. Turn 2: text-only → loop finishes.
+        let mock = MockLlmProvider::new()
+            .with_stream(vec![
+                StreamEvent::ToolCallStart {
+                    id: "call_1".into(),
+                    name: "echo".into(),
+                },
+                StreamEvent::ToolCallArg {
+                    id: "call_1".into(),
+                    arg_delta: "{\"text\":\"hi\"}".into(),
+                },
+                StreamEvent::Done {
+                    input_tokens: 10,
+                    output_tokens: 10,
+                    stop_reason: Some("tool_calls".into()),
+                },
+            ])
+            .with_stream(vec![
+                StreamEvent::Text("done".into()),
+                StreamEvent::Done {
+                    input_tokens: 10,
+                    output_tokens: 10,
+                    stop_reason: Some("end_turn".into()),
+                },
+            ]);
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        let tool_schemas: Vec<ToolSchema> = reg
+            .as_tool_schemas()
+            .into_iter()
+            .map(|s| ToolSchema {
+                name: s["function"]["name"].as_str().unwrap_or("").into(),
+                description: s["function"]["description"].as_str().unwrap_or("").into(),
+                parameters: s["function"]["parameters"].clone(),
+                native_type: None,
+            })
+            .collect();
+        let (tx, _rx) = mpsc::channel::<AgentEvent>(16);
+        let mut messages = vec![LlmMessage::user("hi there")];
+        run_loop(&mock, &reg, &tool_schemas, &mut messages, config, &tx)
+            .await
+            .expect("run_loop should not error");
+        messages
+    }
+
+    #[tokio::test]
+    async fn test_orchestrator_on_injects_exactly_one_phase_directive() {
+        let messages = run_simple_turn(orchestrator_config(true)).await;
+        let directives: Vec<&str> = messages
+            .iter()
+            .filter(|m| m.content.contains("Orchestrator:"))
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(
+            directives.len(),
+            1,
+            "Simple question on turn 1 must emit exactly one phase directive (Scout→Verify), got {directives:?}"
+        );
+        assert!(
+            directives[0].contains("Verify phase"),
+            "the single directive must be the Verify-phase asymmetric check, got: {}",
+            directives[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_orchestrator_off_is_golden_trace() {
+        let messages = run_simple_turn(orchestrator_config(false)).await;
+        assert!(
+            !messages.iter().any(|m| m.content.contains("Orchestrator:")),
+            "orchestrator disabled must inject no phase directives"
+        );
+    }
+
+    // ── Evidence gate (round-2): hard question with no tool evidence ────────
+    // The verification gate (cap 2) fires first; only after it is exhausted does
+    // the evidence gate (cap 1) nudge retrieval, then the run commits.
+
+    async fn run_text_turns(
+        mock: &MockLlmProvider,
+        user: &str,
+        max_turns: usize,
+        deadline_secs: Option<u64>,
+    ) -> Vec<LlmMessage> {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        reg.register(Arc::new(MockShellTool));
+        let tool_schemas: Vec<ToolSchema> = reg
+            .as_tool_schemas()
+            .into_iter()
+            .map(|s| ToolSchema {
+                name: s["function"]["name"].as_str().unwrap_or("").into(),
+                description: s["function"]["description"].as_str().unwrap_or("").into(),
+                parameters: s["function"]["parameters"].clone(),
+                native_type: None,
+            })
+            .collect();
+        let (tx, _rx) = mpsc::channel::<AgentEvent>(16);
+        let mut messages = vec![LlmMessage::user(user)];
+        let config = RunConfig {
+            max_turns,
+            wall_clock_deadline: deadline_secs
+                .map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s)),
+            pending_subagents: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            ..RunConfig::new()
+        };
+        run_loop(mock, &reg, &tool_schemas, &mut messages, config, &tx)
+            .await
+            .expect("run_loop should not error");
+        messages
+    }
+
+    /// Like `run_text_turns` but captures the AgentEvent stream so tests can
+    /// assert on the final `Done` payload (the committed final_text).
+    async fn run_text_turns_with_events(
+        mock: &MockLlmProvider,
+        user: &str,
+        max_turns: usize,
+        deadline_secs: Option<u64>,
+    ) -> (Vec<LlmMessage>, mpsc::Receiver<AgentEvent>) {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        reg.register(Arc::new(MockShellTool));
+        let tool_schemas: Vec<ToolSchema> = reg
+            .as_tool_schemas()
+            .into_iter()
+            .map(|s| ToolSchema {
+                name: s["function"]["name"].as_str().unwrap_or("").into(),
+                description: s["function"]["description"].as_str().unwrap_or("").into(),
+                parameters: s["function"]["parameters"].clone(),
+                native_type: None,
+            })
+            .collect();
+        let (tx, rx) = mpsc::channel::<AgentEvent>(16);
+        let mut messages = vec![LlmMessage::user(user)];
+        let config = RunConfig {
+            max_turns,
+            wall_clock_deadline: deadline_secs
+                .map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s)),
+            pending_subagents: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            ..RunConfig::new()
+        };
+        run_loop(mock, &reg, &tool_schemas, &mut messages, config, &tx)
+            .await
+            .expect("run_loop should not error");
+        (messages, rx)
+    }
+
+    #[tokio::test]
+    async fn evidence_gate_reprompts_after_verify_cap() {
+        use crate::llm::mock::{MockScript, MockStep};
+        // Hard ("which " → Hard, string answer) + deadline. Turn1/2 →
+        // verify-gate re-prompts; turn3 → evidence gate HARD-intercepts (no
+        // cap); turn4 the model calls echo (evidence now exists) → gate stops;
+        // turn5 commits. A STRING answer keeps the numeric SGV gate out of this
+        // test's scope (that gate is covered separately).
+        let mock = MockLlmProvider::from_script(
+            MockScript::new()
+                .then(MockStep::Text("Final answer: Russian-German Legion".into()))
+                .then(MockStep::Text("Final answer: Russian-German Legion".into()))
+                .then(MockStep::Text("Final answer: Russian-German Legion".into()))
+                .then(MockStep::Calls(vec![(
+                    "echo",
+                    serde_json::json!({"text": "He served with the Russian-German Legion."}),
+                )]))
+                .then(MockStep::Text("Final answer: Russian-German Legion".into())),
+        );
+        let messages =
+            run_text_turns(&mock, "Which military unit did the author join?", 0, Some(3600)).await;
+        let evidence_nudges = messages
+            .iter()
+            .filter(|m| m.content.contains("retrieved ANY evidence"))
+            .count();
+        assert!(
+            evidence_nudges >= 1,
+            "hard gate must intercept the no-evidence commit"
+        );
+        // The gate must force a tool call before the commit is accepted.
+        assert!(
+            mock.call_log()
+                .iter()
+                .flatten()
+                .filter_map(|m| m.tool_calls.as_ref())
+                .flatten()
+                .any(|tc| tc.name == "echo"),
+            "gate must force a tool call before accepting the commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn evidence_gate_skipped_when_tool_evidence_exists() {
+        use crate::llm::mock::{MockScript, MockStep};
+        // Turn1: tool call (evidence, grounded). Turn2..: text commits → only
+        // the verify gate fires, never the evidence/content/SGV gates (string
+        // answer, grounded in the tool result).
+        let mock = MockLlmProvider::from_script(
+            MockScript::new()
+                .then(MockStep::Calls(vec![(
+                    "echo",
+                    serde_json::json!({"text": "He served with the Russian-German Legion."}),
+                )]))
+                .then(MockStep::Text("Final answer: Russian-German Legion".into()))
+                .then(MockStep::Text("Final answer: Russian-German Legion".into()))
+                .then(MockStep::Text("Final answer: Russian-German Legion".into())),
+        );
+        let messages =
+            run_text_turns(&mock, "Which military unit did the author join?", 0, Some(3600)).await;
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.content.contains("retrieved ANY evidence")),
+            "evidence gate must not fire when a tool result exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn content_grounding_gate_blocks_ungrounded_entity_commit() {
+        use crate::llm::mock::{MockScript, MockStep};
+        // A tool ran (any_evidence=true) but its result does NOT contain the
+        // answer's terms → the content-anchored gate must intercept with the
+        // abstention prompt, and only allow the commit once the term appears in
+        // a tool result (the deterministic commit-time grounding check).
+        let mock = MockLlmProvider::from_script(
+            MockScript::new()
+                .then(MockStep::Calls(vec![(
+                    "echo",
+                    serde_json::json!({"text": "unrelated history page"}),
+                )]))
+                // verify gate re-prompts (cap 2) on the first two text commits
+                .then(MockStep::Text("Final answer: Lützow Free Corps".into()))
+                .then(MockStep::Text("Final answer: Lützow Free Corps".into()))
+                // verify cap exhausted → evidence gate fires (ungrounded)
+                .then(MockStep::Text("Final answer: Lützow Free Corps".into()))
+                // model retrieves a source actually containing the term
+                .then(MockStep::Calls(vec![(
+                    "echo",
+                    serde_json::json!({"text": "The author joined the Lützow Free Corps in 1813."}),
+                )]))
+                // grounded now → commit accepted
+                .then(MockStep::Text("Final answer: Lützow Free Corps".into())),
+        );
+        let (messages, mut rx) = run_text_turns_with_events(
+            &mock,
+            "Which military unit did the author of the book join?",
+            0,
+            Some(3600),
+        )
+        .await;
+        let grounding_nudges = messages
+            .iter()
+            .filter(|m| m.content.contains("does NOT appear in ANY retrieved tool result"))
+            .count();
+        assert!(
+            grounding_nudges >= 1,
+            "content-anchored gate must intercept the ungrounded commit"
+        );
+        // The run must commit the grounded value via the Done event.
+        let done_text = std::iter::from_fn(|| rx.try_recv().ok())
+            .find_map(|e| match e {
+                AgentEvent::Done { final_text } => Some(final_text),
+                _ => None,
+            });
+        assert!(
+            done_text
+                .as_deref()
+                .is_some_and(|t| t.contains("Lützow Free Corps")),
+            "grounded value must be committed after the intercept; got {:?}",
+            done_text
+        );
+    }
+
+    #[tokio::test]
+    async fn content_grounding_gate_skipped_when_answer_is_grounded() {
+        use crate::llm::mock::{MockScript, MockStep};
+        // The tool result contains the answer's term from the start → the gate
+        // never fires (any_evidence AND answer_grounded both true).
+        let mock = MockLlmProvider::from_script(
+            MockScript::new()
+                .then(MockStep::Calls(vec![(
+                    "echo",
+                    serde_json::json!({"text": "He served with the Russian-German Legion."}),
+                )]))
+                .then(MockStep::Text("Final answer: Russian-German Legion".into()))
+                .then(MockStep::Text("Final answer: Russian-German Legion".into()))
+                .then(MockStep::Text("Final answer: Russian-German Legion".into())),
+        );
+        let messages = run_text_turns(&mock, "Which unit did the author join?", 0, Some(3600)).await;
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.content.contains("does NOT appear in ANY retrieved tool result")),
+            "grounding gate must not fire when the answer is in a tool result"
+        );
+    }
+
+    #[tokio::test]
+    async fn sgv_recompute_gate_blocks_single_pass_numeric_commit() {
+        use crate::llm::mock::{MockScript, MockStep};
+        // Hard numeric answer computed by CODE (a shell python script prints
+        // "42") but with no INDEPENDENT recompute → the SGV gate must intercept
+        // until the model runs verify_candidate --recompute (or cluster verify).
+        let mock = MockLlmProvider::from_script(
+            MockScript::new()
+                // code-for-numbers satisfied: a shell python computation prints 42
+                .then(MockStep::Calls(vec![(
+                    "shell",
+                    serde_json::json!({"command": "python -c 'print(42)'"}),
+                )]))
+                // verify gate re-prompts (cap 2) on the first two text commits
+                .then(MockStep::Text("Final answer: 42".into()))
+                .then(MockStep::Text("Final answer: 42".into()))
+                // verify cap exhausted → SGV gate fires (no independent recompute)
+                .then(MockStep::Text("Final answer: 42".into()))
+                // model runs an independent recompute via verify_candidate
+                .then(MockStep::Calls(vec![(
+                    "shell",
+                    serde_json::json!({"command": "python verify_candidate.py verify --answer 42 --compute 'sum(a)' --recompute '2*21'"}),
+                )]))
+                // independent recompute present → commit accepted
+                .then(MockStep::Text("Final answer: 42".into())),
+        );
+        let (messages, mut rx) =
+            run_text_turns_with_events(&mock, "What is the sum of 21 and 21?", 0, Some(3600)).await;
+        let sgv_nudges = messages
+            .iter()
+            .filter(|m| m.content.contains("INDEPENDENT recompute"))
+            .count();
+        assert!(
+            sgv_nudges >= 1,
+            "SGV gate must intercept a single-method numeric commit"
+        );
+        let done_text = std::iter::from_fn(|| rx.try_recv().ok())
+            .find_map(|e| match e {
+                AgentEvent::Done { final_text } => Some(final_text),
+                _ => None,
+            });
+        assert!(
+            done_text.as_deref().is_some_and(|t| t.contains("42")),
+            "numeric answer must commit after independent recompute; got {:?}",
+            done_text
+        );
+    }
+
+    #[tokio::test]
+    async fn sgv_recompute_gate_catches_numeric_value_in_prose() {
+        use crate::llm::mock::{MockScript, MockStep};
+        // A numeric answer committed as PROSE ("The average is 36: ...") must
+        // still trigger the SGV gate — `answer_has_number` catches it where
+        // `is_numeric_answer` (bare digits) would miss it (bec74516 class).
+        let mock = MockLlmProvider::from_script(
+            MockScript::new()
+                // code-for-numbers satisfied: a shell python computation prints 36
+                .then(MockStep::Calls(vec![(
+                    "shell",
+                    serde_json::json!({"command": "python -c 'print(36)'"}),
+                )]))
+                .then(MockStep::Text("The average is 36: the file identifies 5 people.".into()))
+                .then(MockStep::Text("The average is 36: the file identifies 5 people.".into()))
+                // verify cap → SGV gate fires (prose contains a number)
+                .then(MockStep::Text("The average is 36: the file identifies 5 people.".into()))
+                // independent recompute
+                .then(MockStep::Calls(vec![(
+                    "shell",
+                    serde_json::json!({"command": "python verify_candidate.py verify --answer 36 --compute 'sum(x)/n' --recompute 'mean(y)'"}),
+                )]))
+                .then(MockStep::Text("Final answer: 36".into())),
+        );
+        let (messages, _rx) = run_text_turns_with_events(
+            &mock,
+            "What is the average number of pre-2020 works?",
+            0,
+            Some(3600),
+        )
+        .await;
+        let sgv_nudges = messages
+            .iter()
+            .filter(|m| m.content.contains("INDEPENDENT recompute"))
+            .count();
+        assert!(
+            sgv_nudges >= 1,
+            "SGV gate must fire when a numeric value is committed inside prose"
+        );
+    }
+
+    #[tokio::test]
+    async fn code_for_numbers_gate_blocks_value_read_off_page() {
+        use crate::llm::mock::{MockScript, MockStep};
+        // The value "42" appears ONLY in a web_fetch-style echo (LLM read it),
+        // never in a shell/python computation output → the CODE_FOR_NUMBERS
+        // gate must intercept and force the model to write code.
+        let mock = MockLlmProvider::from_script(
+            MockScript::new()
+                .then(MockStep::Calls(vec![(
+                    "echo",
+                    serde_json::json!({"text": "The page says the total is 42 in the table."}),
+                )]))
+                .then(MockStep::Text("Final answer: 42".into()))
+                .then(MockStep::Text("Final answer: 42".into()))
+                // verify cap → code-for-numbers gate fires (echo ≠ computation)
+                .then(MockStep::Text("Final answer: 42".into()))
+                // model writes + runs code that prints 42
+                .then(MockStep::Calls(vec![(
+                    "shell",
+                    serde_json::json!({"command": "python -c 'print(42)'"}),
+                )]))
+                // now code-derived, but no independent recompute → SGV gate fires
+                .then(MockStep::Text("Final answer: 42".into()))
+                // independent recompute
+                .then(MockStep::Calls(vec![(
+                    "shell",
+                    serde_json::json!({"command": "python verify_candidate.py verify --answer 42 --compute 'a' --recompute '2*21'"}),
+                )]))
+                .then(MockStep::Text("Final answer: 42".into())),
+        );
+        let (messages, _rx) = run_text_turns_with_events(&mock, "What is the total?", 0, Some(3600)).await;
+        let code_nudges = messages
+            .iter()
+            .filter(|m| m.content.contains("COMPUTED from code"))
+            .count();
+        assert!(
+            code_nudges >= 1,
+            "code-for-numbers gate must intercept a value read off a page"
+        );
+    }
+
+    #[tokio::test]
+    async fn code_for_numbers_gate_skipped_when_value_from_shell() {
+        use crate::llm::mock::{MockScript, MockStep};
+        // The value came from a shell/python computation from the start → the
+        // code-for-numbers gate never fires (only the SGV/verify gates do).
+        let mock = MockLlmProvider::from_script(
+            MockScript::new()
+                .then(MockStep::Calls(vec![(
+                    "shell",
+                    serde_json::json!({"command": "python -c 'print(42)'"}),
+                )]))
+                .then(MockStep::Text("Final answer: 42".into()))
+                .then(MockStep::Text("Final answer: 42".into()))
+                // verify cap → code gate skipped (from shell), SGV gate fires
+                .then(MockStep::Text("Final answer: 42".into()))
+                .then(MockStep::Calls(vec![(
+                    "shell",
+                    serde_json::json!({"command": "python verify_candidate.py verify --answer 42 --compute 'a' --recompute 'b'"}),
+                )]))
+                .then(MockStep::Text("Final answer: 42".into())),
+        );
+        let (messages, _rx) = run_text_turns_with_events(&mock, "What is the total?", 0, Some(3600)).await;
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.content.contains("COMPUTED from code")),
+            "code-for-numbers gate must not fire when the value came from a shell computation"
+        );
+    }
+
+    #[tokio::test]
+    async fn sgv_recompute_gate_skipped_for_string_answer() {
+        use crate::llm::mock::{MockScript, MockStep};
+        // A string/entity answer does NOT trigger the SGV gate (it is the
+        // content-anchored gate's domain). Tool evidence exists and the answer
+        // is grounded → only the verify gate re-prompts, no SGV intercept.
+        let mock = MockLlmProvider::from_script(
+            MockScript::new()
+                .then(MockStep::Calls(vec![(
+                    "echo",
+                    serde_json::json!({"text": "He served with the Russian-German Legion."}),
+                )]))
+                .then(MockStep::Text("Final answer: Russian-German Legion".into()))
+                .then(MockStep::Text("Final answer: Russian-German Legion".into()))
+                .then(MockStep::Text("Final answer: Russian-German Legion".into())),
+        );
+        let (messages, _rx) =
+            run_text_turns_with_events(&mock, "Which unit did the author join?", 0, Some(3600)).await;
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.content.contains("INDEPENDENT recompute")),
+            "SGV gate must not fire for a string answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn evidence_gate_skipped_on_simple_question() {
+        use crate::llm::mock::{MockScript, MockStep};
+        let mock = MockLlmProvider::from_script(
+            MockScript::new().then(MockStep::Text("Final answer: hi".into())),
+        );
+        let messages = run_text_turns(&mock, "Hi", 0, Some(3600)).await;
+        assert!(mock.call_count() == 1, "simple → commit on first turn");
+        assert!(!messages
+            .iter()
+            .any(|m| m.content.contains("retrieved ANY evidence")));
+    }
+
+    #[tokio::test]
+    async fn evidence_gate_respects_budget() {
+        use crate::llm::mock::{MockScript, MockStep};
+        // max_turns=1 → budget_ok false at the gates → no re-prompt, commits.
+        let mock = MockLlmProvider::from_script(
+            MockScript::new().then(MockStep::Text("Final answer: 42".into())),
+        );
+        let messages = run_text_turns(&mock, "What is 42?", 1, None).await;
+        assert_eq!(mock.call_count(), 1);
+        assert!(!messages
+            .iter()
+            .any(|m| m.content.contains("retrieved ANY evidence")));
+    }
+
+    #[tokio::test]
+    async fn thinking_only_no_evidence_forces_tool_not_commit() {
+        use crate::llm::mock::{MockScript, MockStep};
+        use everevo_core::llm::StreamEvent;
+        // Hard question + deadline. Turn1: the model THINKS but emits no text
+        // and no tool call → the thinking-only path must NOT commit; the hard
+        // evidence gate fires and forces a tool call. Turn2: echo (evidence,
+        // grounded). Turn3: verify-gate re-prompt. Turn4: commits. String
+        // answer keeps the numeric SGV gate out of this test's scope.
+        let mock = MockLlmProvider::from_script(
+            MockScript::new()
+                .then(MockStep::Stream(vec![
+                    StreamEvent::Thinking("I should reason deeply about the unit...".into()),
+                    StreamEvent::Done {
+                        input_tokens: 10,
+                        output_tokens: 10,
+                        stop_reason: Some("end_turn".into()),
+                    },
+                ]))
+                .then(MockStep::Calls(vec![(
+                    "echo",
+                    serde_json::json!({"text": "He served with the Russian-German Legion."}),
+                )]))
+                .then(MockStep::Text("Final answer: Russian-German Legion".into()))
+                .then(MockStep::Text("Final answer: Russian-German Legion".into()))
+                .then(MockStep::Text("Final answer: Russian-German Legion".into())),
+        );
+        let messages =
+            run_text_turns(&mock, "Which military unit did the author join?", 0, Some(3600)).await;
+        // The thinking-only turn must NOT commit a memory value: the evidence
+        // gate prompt fired and the model was forced to call a tool.
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.content.contains("retrieved ANY evidence")),
+            "thinking-only + no evidence on hard question must fire the evidence gate"
+        );
+        assert!(
+            mock.call_log()
+                .iter()
+                .flatten()
+                .filter_map(|m| m.tool_calls.as_ref())
+                .flatten()
+                .any(|tc| tc.name == "echo"),
+            "the gate must force a tool call before accepting the commit"
+        );
+    }
+
+    #[test]
+    fn evidence_prompt_mentions_completed_todos() {
+        use crate::loop_::driver::evidence_prompt;
+        // A task list claiming completed work → the gate flags unverified completions.
+        let p = evidence_prompt(&Some("- ✅ task A (completed)".into()));
+        assert!(
+            p.contains("COMPLETED items"),
+            "must flag unverified completions"
+        );
+        assert!(
+            p.contains("TodoWrite"),
+            "must tell the model to update the list"
+        );
+        // No todos → plain prompt, no todo note.
+        let p2 = evidence_prompt(&None);
+        assert!(!p2.contains("COMPLETED items"));
     }
 }

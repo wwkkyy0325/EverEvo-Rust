@@ -18,6 +18,10 @@ export HTTP_PROXY="http://127.0.0.1:7890"
 export HTTPS_PROXY="http://127.0.0.1:7890"
 export EVEREVO_BENCHMARK=1
 export EVEREVO_META_AGENT=0
+# LLM-free meta-orchestrator policy layer (Scout/DeepDive/Verify/Commit):
+# phase directives + asymmetric cluster-verify, per-question. Strictly opt-in
+# benchmark scaffolding — unset for a plain run.
+export EVEREVO_META_ORCHESTRATOR=1
 export HF_HOME="${HF_HOME:-$HOME/gaia-run5-hf}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$HOME/gaia-run5-hf/datasets}"
 taskkill //F //IM everevo-server.exe 2>/dev/null || true

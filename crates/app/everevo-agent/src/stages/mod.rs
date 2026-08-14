@@ -161,7 +161,6 @@ pub fn compose_stages(task: &str) -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use everevo_core::context::ContextStage as _;
 
     /// The catalog DERIVES from TOOL_VISIBLE_STAGES (P1 "完整派生"), so this
     /// guards the derivation contract instead of hand-checking a 4-entry list:

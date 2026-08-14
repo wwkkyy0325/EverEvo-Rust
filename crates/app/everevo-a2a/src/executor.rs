@@ -1,12 +1,12 @@
-//! AgentExecutor — the bridge between A2A protocol and EverEvo's AgentLoop.
+//! AgentExecutor — the bridge between A2A protocol and EverEvo's AgentRun.
 //!
 //! ## Architecture
 //!
 //! ```text
-//! A2A Message (Parts) → LlmMessage → AgentLoop::run() → A2A Task (Artifacts)
+//! A2A Message (Parts) → LlmMessage → AgentRun::run() → A2A Task (Artifacts)
 //! ```
 //!
-//! The executor wraps the existing `AgentLoop::run_subagent()` pattern
+//! The executor wraps the existing `AgentRun::run_to_string()` pattern
 //! already used by workflow/scheduler, making A2A just another entry point
 //! into the same agent infrastructure.
 
@@ -35,7 +35,7 @@ pub trait A2aAgentExecutor: Send + Sync {
     ) -> Result<A2aTask, A2aError>;
 }
 
-/// Production executor — bridges to the real EverEvo AgentLoop.
+/// Production executor — bridges to the real EverEvo AgentRun.
 pub struct EverEvoExecutor {
     llm: Arc<HttpClient>,
     tools: Arc<ToolRegistry>,
@@ -125,11 +125,11 @@ impl A2aAgentExecutor for EverEvoExecutor {
 
         // Run the agent loop — same as workflow/scheduler sub-agent
         let llm: Arc<dyn everevo_core::LlmProvider> = self.llm.clone();
-        let result = everevo_agent::AgentLoop::sub_agent(self.max_turns)
-            .run_subagent(llm, Arc::clone(&self.tools), llm_messages, cancel)
+        let result = everevo_agent::AgentRun::sub_agent(self.max_turns)
+            .run_to_string(llm, Arc::clone(&self.tools), llm_messages, cancel)
             .await;
 
-        // Detect errors from the agent run. run_subagent() returns a plain string,
+        // Detect errors from the agent run. run_to_string() returns a plain string,
         // so we use a two-tier approach: explicit error markers (fast path) then
         // content-based heuristics (broad catch for unexpected failures).
         let is_error = result.is_empty()

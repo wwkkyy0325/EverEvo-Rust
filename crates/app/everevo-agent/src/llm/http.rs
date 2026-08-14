@@ -314,8 +314,8 @@ impl LlmProvider for HttpClient {
     }
 
     /// Streaming transport override: HttpClient streams over SSE directly.
-    /// Delegates to the inherent `stream_chat` (kept so `run_subagent`, which
-    /// holds a concrete `Arc<HttpClient>`, resolves the same implementation).
+    /// Delegates to the inherent `stream_chat` (kept so the agent loop's
+    /// `Arc<dyn LlmProvider>` dispatches to the same implementation).
     async fn stream_chat(
         &self,
         messages: &[LlmMessage],

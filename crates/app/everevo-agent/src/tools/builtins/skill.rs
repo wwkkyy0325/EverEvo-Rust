@@ -1,16 +1,12 @@
-//! In-process skill tool with SkillRegistry integration.
-//!
-//! Complemented by MCP plugin `plugin-skill`. This in-process version reads from the
-//! shared SkillRegistry which is populated at boot and updated by promote_to_skill —
-//! state the MCP plugin cannot access directly.
-//! This in-process implementation is kept for backward compatibility.
-//! New development should use the MCP plugin version.
-
 //! Skill tool — matches Claude Code's skill discovery and invocation.
 //!
 //! Skills are SKILL.md files in data/skills/ that provide domain-specific
 //! instructions. The LLM can search for and read skills to extend its
 //! capabilities without modifying system prompts.
+//!
+//! Complemented by MCP plugin `plugin-skill`; this in-process version reads
+//! the shared SkillRegistry (populated at boot, updated by promote_to_skill)
+//! that the plugin cannot access directly.
 //!
 //! Now backed by `SkillRegistry` so built-in skills (embedded via `include_str!`)
 //! are visible alongside user skills created with `PromoteSkillTool`.

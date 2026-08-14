@@ -1,8 +1,8 @@
-//! Workflow tool — structured multi-agent orchestration.
+//! `parallel_agents` — structured multi-agent orchestration.
 //!
-//! Matches Claude Code's Workflow pattern: accepts tasks, spawns sub-agents,
-//! aggregates results. Each task runs as an independent agent with shared
-//! tool access.
+//! Accepts tasks, spawns sub-agents, aggregates results. Each task runs as an
+//! independent agent with shared tool access. Distinct from `workflow_run`
+//! (the JSON-defined workflow runner, `workflow_runner.rs`).
 
 use async_trait::async_trait;
 use everevo_core::tool::{Tool, ToolOutput};
@@ -367,8 +367,15 @@ async fn run_workflow_agent(
         LlmMessage::user(prompt),
     ];
 
-    let agent = crate::AgentLoop::sub_agent(3);
-    agent.run_subagent(llm, tools, messages, cancel).await
+    let agent = crate::AgentRun::sub_agent(3);
+    agent
+        .run_to_string(
+            llm as Arc<dyn everevo_core::LlmProvider>,
+            tools,
+            messages,
+            cancel,
+        )
+        .await
 }
 
 /// Per-task wall-clock cap for `parallel_agents` (audit LOW, 2026-08-13: tasks

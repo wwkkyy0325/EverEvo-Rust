@@ -436,7 +436,7 @@ pub struct ContextBuildContext {
     /// When true, the LLM should trust that ONNX, SQLite, and runtimes work.
     pub startup_verified: bool,
     /// Feedback from ReflectGate sync quick-check (hook_feedback).
-    /// Set after each tool execution; read by AgentLoop for next-turn injection.
+    /// Set after each tool execution; read by AgentRun for next-turn injection.
     pub hook_feedback: Option<String>,
     /// Durable rolling conversation summary (spec D3). Maintained incrementally
     /// in the background (Layer-1) and persisted to the sessions table; injected

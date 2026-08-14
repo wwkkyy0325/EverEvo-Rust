@@ -13,21 +13,35 @@ use everevo_core::EverEvoError;
 use tokio_util::sync::CancellationToken;
 
 use crate::subagent_pool::{SubAgentPool, SubAgentTask};
+use crate::subagent_roles::AgentRole;
 
 /// Cluster-based parallel agent orchestration.
 /// Supports fan_out, map_reduce, and verify patterns.
 pub struct ClusterTool {
     pool: Option<Arc<SubAgentPool>>,
+    /// Verifier (officer) provider — used for `verify` reviewer sub-agents so
+    /// the adversarial check runs on a stronger/independent model (MARCH).
+    verifier_llm: Option<Arc<crate::llm::HttpClient>>,
 }
 
 impl ClusterTool {
     pub fn new() -> Self {
-        Self { pool: None }
+        Self {
+            pool: None,
+            verifier_llm: None,
+        }
     }
 
     /// Wire the sub-agent pool for actual execution.
     pub fn with_pool(mut self, pool: Arc<SubAgentPool>) -> Self {
         self.pool = Some(pool);
+        self
+    }
+
+    /// Set the verifier (officer) provider used by `verify` reviewers. None →
+    /// reviewers run on the pool's default provider.
+    pub fn with_verifier_llm(mut self, llm: Option<Arc<crate::llm::HttpClient>>) -> Self {
+        self.verifier_llm = llm;
         self
     }
 }
@@ -85,6 +99,10 @@ impl Tool for ClusterTool {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Review perspectives, e.g. ['correctness', 'security', 'performance'] (verify and fan_out)"
+                },
+                "asymmetric": {
+                    "type": "boolean",
+                    "description": "verify only: withhold the solver's derivation from reviewers (independence-by-withholding, MARCH). Pass the claim + evidence POINTERS only; reviewers judge from the evidence alone."
                 }
             },
             "required": ["action", "prompt"]
@@ -156,7 +174,16 @@ impl Tool for ClusterTool {
                     .unwrap_or_else(|| {
                         vec!["correctness".into(), "security".into(), "edge_cases".into()]
                     });
-                execute_verify(pool, &claims, &perspectives, cancel).await
+                let asymmetric = params["asymmetric"].as_bool().unwrap_or(false);
+                execute_verify(
+                    pool,
+                    &claims,
+                    &perspectives,
+                    asymmetric,
+                    self.verifier_llm.clone(),
+                    cancel,
+                )
+                .await
             }
             _ => Ok(ToolOutput {
                 content: format!("Unknown action: {action}. Use fan_out, map_reduce, or verify."),
@@ -202,6 +229,7 @@ async fn execute_fan_out(
             ),
             max_turns: 5,
             system_prompt_override: None,
+            model_override: None,
             cancel_token: cancel.cloned(),
         })
         .collect();
@@ -242,6 +270,7 @@ async fn execute_map_reduce(
             prompt: format!("{prompt}\n\n---\nItem: {item}"),
             max_turns: 5,
             system_prompt_override: None,
+            model_override: None,
             cancel_token: cancel.cloned(),
         })
         .collect();
@@ -272,6 +301,7 @@ async fn execute_map_reduce(
              Flag any findings that appear unreliable."
                 .into(),
         ),
+        model_override: None,
         cancel_token: cancel.cloned(),
     }];
 
@@ -302,16 +332,29 @@ async fn execute_map_reduce(
 
 /// Adversarial verification: each claim is checked by multiple skeptics.
 /// Survives if ≥ majority confirm it.
+///
+/// With `asymmetric` set (MARCH, arXiv:2603.24579), the reviewer's system
+/// prompt is swapped for the adversarial `Verifier` role AND the solver's
+/// derivation is explicitly withheld: the reviewer judges the claim against
+/// the evidence POINTERS alone — never by re-deriving from the solver's own
+/// reasoning (which embeds the same mistake — the "committed-but-wrong" mode).
 async fn execute_verify(
     pool: &SubAgentPool,
     claims: &[String],
     perspectives: &[String],
+    asymmetric: bool,
+    verifier_llm: Option<Arc<crate::llm::HttpClient>>,
     cancel: Option<&CancellationToken>,
 ) -> Result<ToolOutput, EverEvoError> {
     // Cap claims to keep the fan-out bounded (claims × perspectives sub-agents).
     let (truncated_claims, _) = cap_batch(claims, MAX_VERIFY_CLAIMS);
+    let mode = if asymmetric {
+        " (asymmetric — solver derivation withheld)"
+    } else {
+        ""
+    };
     let mut output = format!(
-        "## Adversarial Verification: {} claims × {} perspectives\n\n",
+        "## Adversarial Verification: {} claims × {} perspectives{mode}\n\n",
         truncated_claims.len(),
         perspectives.len(),
     );
@@ -329,10 +372,8 @@ async fn execute_verify(
                      Provide specific evidence for your verdict."
                 ),
                 max_turns: 5,
-                system_prompt_override: Some(format!(
-                    "You are a {persp} reviewer. Be skeptical. Default to \
-                     REFUTED if uncertain. Provide concrete evidence."
-                )),
+                system_prompt_override: Some(reviewer_system_prompt(persp, asymmetric)),
+                model_override: verifier_llm.clone(),
                 cancel_token: cancel.cloned(),
             })
             .collect();
@@ -387,6 +428,30 @@ async fn execute_verify(
     })
 }
 
+/// System prompt for a verify reviewer. In asymmetric mode the reviewer is the
+/// adversarial `Verifier` role and is told the solver's derivation is hidden —
+/// it must judge the claim against the evidence pointers in the claim alone.
+fn reviewer_system_prompt(persp: &str, asymmetric: bool) -> String {
+    if !asymmetric {
+        return format!(
+            "You are a {persp} reviewer. Be skeptical. Default to \
+             REFUTED if uncertain. Provide concrete evidence."
+        );
+    }
+    format!(
+        "{}\n\n\
+         ## Asymmetric Review (independence-by-withholding)\n\
+         You are reviewing a claim produced by a SOLVER you cannot see. The \
+         solver's derivation, formulas, and reasoning are deliberately HIDDEN — \
+         the claim carries only the final value and POINTERS to evidence (file \
+         paths, URLs, source lines). Recompute or re-derive the value from those \
+         evidence pointers yourself; never assume the solver's own derivation \
+         was correct, because the same mistake is usually embedded in it. \
+         A claim that merely restates what you are asked to check proves nothing.",
+        AgentRole::Verifier.system_prompt(),
+    )
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -436,5 +501,39 @@ mod tests {
         // that turns them into no-ops.
         assert!(MAX_MAP_REDUCE_ITEMS > 0);
         assert!(MAX_VERIFY_CLAIMS > 0);
+    }
+
+    #[test]
+    fn test_schema_declares_asymmetric_flag() {
+        let schema = ClusterTool::new().parameters_schema();
+        assert!(
+            schema["properties"]["asymmetric"].is_object(),
+            "cluster verify schema must expose the asymmetric flag"
+        );
+    }
+
+    #[test]
+    fn test_asymmetric_reviewer_withholds_solver_derivation() {
+        let plain = reviewer_system_prompt("numeric reviewer", false);
+        assert!(!plain.contains("HIDDEN"));
+        assert!(plain.contains("numeric reviewer"));
+
+        let asymmetric = reviewer_system_prompt("numeric reviewer", true);
+        assert!(
+            asymmetric.contains("## Role: Verifier"),
+            "asymmetric reviewer uses the adversarial Verifier role"
+        );
+        assert!(
+            asymmetric.contains("deliberately HIDDEN"),
+            "must state the solver's derivation is withheld"
+        );
+        assert!(
+            asymmetric.contains("evidence pointers"),
+            "must direct review at evidence, not the solver's draft"
+        );
+        assert!(
+            asymmetric.contains("same mistake is usually embedded"),
+            "must warn that the solver's draft re-embeds the error"
+        );
     }
 }

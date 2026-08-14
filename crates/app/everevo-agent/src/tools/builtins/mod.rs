@@ -8,14 +8,12 @@
 
 mod ask_user_tool;
 mod bootstrap;
-mod browser_bridge;
 mod cluster;
 mod code_search;
 mod compact;
 mod delegate;
 mod describe_image;
 mod download;
-mod http_util;
 mod memory_tool;
 mod pipeline;
 mod plan_mode;
@@ -26,6 +24,7 @@ mod skill;
 mod team;
 mod todo_write;
 mod tool_cache_read;
+pub mod wayback;
 pub mod web_search_delegate;
 pub mod workflow;
 mod workflow_runner;
@@ -52,6 +51,7 @@ pub use todo_write::{
     load_persisted_tasks, new_todo_store, TodoItem, TodoStore, TodoWriteTool, GLOBAL_TASK_KEY,
 };
 pub use tool_cache_read::ToolCacheReadTool;
+pub use wayback::WaybackLookupTool;
 pub use web_search_delegate::WebSearchDelegateTool;
 pub use workflow::{WorkflowResults, WorkflowTask, WorkflowTool};
 pub use workflow_runner::{ListWorkflowsTool, SaveWorkflowTool, WorkflowRunnerTool};

@@ -73,7 +73,7 @@
 | `subagent_roles::{AgentRole, AgentTier}` | Enum | **Stable** | 2026-08-13 (new — soft role vocabulary + tier metadata; `parse`/`system_prompt`/`tier`) |
 | `SubAgentContext.max_context_tokens` | Field | **Stable** | 2026-08-13 (inherited from parent window; default 80000) |
 | `assemble_subagent_context(..., parent_max_context_tokens)` | Fn | **Stable** | 2026-08-13 (soft param added — sub-agents inherit the parent context budget) |
-| `stages::util::clamp_verify_fragment` | Fn | **Stable** | 2026-08-13 (new — generous budget cap for hard verification fragments) |
+| `stages::verification::gate::clamp_verify_fragment` | Fn | **Stable** | 2026-08-13 (new — generous budget cap for hard verification fragments) |
 | `problem_model::{ProblemModel, ProblemNode, ProblemEdge, NodeKind, EpiStatus, EdgeKind}` | Struct/Enum | **Stable** | 2026-08-13 (new — session-scoped structural problem model / causal draft) |
 | `problem_model` tool | Tool | **Stable** | 2026-08-13 (new — init/add_node/add_edge/update_status/list/finalize; main-loop only) |
 | `ProblemModelingStage` | Struct | **Stable** | 2026-08-13 (new — Hard-only causal-draft modeling, priority 3) |
@@ -83,7 +83,7 @@
 | `AgentCharacterStage` / `AgentCharacter` | Struct | **Stable** | 2026-08-05 (new — agent's own voice; priority 0) |
 | `AnswerDisciplineStage` | Struct | **Stable** | 2026-08-12 (two-tier: full on Hard, short format-contract on Simple — adaptive difficulty gating) |
 | `EvidenceChecklistStage` | Struct | **Stable** | 2026-08-12 (gated to Hard questions; independent-reviewer persona + mandatory deterministic verifier + cluster-verify escalation) |
-| `stages::difficulty::{classify, hard_score, Difficulty}` | Fn/Enum | **Stable** | 2026-08-12 (new — deterministic Simple/Hard classifier; conservative) |
+| `stages::verification::gate::{classify, hard_score, Difficulty}` | Fn/Enum | **Stable** | 2026-08-12 (new — deterministic Simple/Hard classifier; conservative; re-exported as `stages::{classify, hard_score, Difficulty}`) |
 | `VerifyCandidateStage` | Struct | **Stable** | 2026-08-12 (gated to Hard questions; independent-reviewer persona) |
 | `build_character_block(profile_path)` | Fn | **Stable** | 2026-08-05 (new — renders character + sources) |
 | `synthesize_character(path, llm)` / `SynthesisReport` | Fn | **Stable** | 2026-08-05 (new — LLM distills fragments → traits) |
@@ -95,6 +95,9 @@
 | `maintain_rolling_summary()` / `RollingSummaryResult` | Fn | **Stable** | 2026-08-11 (new — budget-aware chunked summarization, rule-1 no re-summarize, extractive fallback) |
 | `SUMMARY_CAP_TOKENS` / `TOOL_PAGE_THRESHOLD_CHARS` / `TOOL_PAGE_PREVIEW_CHARS` | Const | **Stable** | 2026-08-11 (new — 2048 / 30_000 / 2000) |
 | `autocompact()` | Fn | **Stable** | 2026-08-11 (Layer-2 — now folds an existing `<conversation_summary>` verbatim as prefix, summarizes only post-watermark messages) |
+| `AgentRun::with_meta_orchestrator()` | Method | **Stable** | 2026-08-14 (new — LLM-free meta-orchestrator policy layer; `None` → byte-equivalent loop; env-gated via `EVEREVO_META_ORCHESTRATOR` + `EVEREVO_BENCHMARK`) |
+| `loop_::meta_orchestrator::{Phase, MetaOrchestratorState, phase_stage, decide_fan_out, drive_phase, parse_subtask_count, subagent_phase_directive}` | Enum/Struct/Fn | **Stable** | 2026-08-14 (new — Scout/DeepDive/Verify/Commit phase machine + 5-gate fan-out governor + asymmetric verify directive; phases mirror Convergence thresholds) |
+| `SubAgentContext.orchestrator_directive` | Field | **Stable** | 2026-08-14 (new — optional parent phase directive rendered in the sub-agent system prompt; default `None`) |
 
 ## everevo-agent (LLM-facing Tools)
 
@@ -108,6 +111,7 @@
 | `parallel_agents` | **Stable** | 2026-07-30 (renamed from `Workflow`) | avoids clash with `workflow_run` |
 | `describe_image` | **Stable** | 2026-08-11 (new — dedicated vision model; fallback to `chess_fen.py`/`fractions_ocr.py`) | params: `path`, `question?` |
 | `tool_cache_read` | **Stable** | 2026-08-11 (new — re-read a paged tool output by absolute path, ~4MB guard) | params: `path` |
+| `cluster` `asymmetric` param | **Stable** | 2026-08-14 (new — verify action withholds the solver's derivation; reviewer system prompt = adversarial `Verifier` role + independence-by-withholding) | verify-only |
 
 ## everevo-server (HTTP API)
 

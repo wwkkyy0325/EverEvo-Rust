@@ -1,16 +1,11 @@
-//! In-process todo_write tool with persistent storage and session state.
-//!
-//! Complemented by MCP plugin `plugin-todo-write`. This in-process version manages
-//! persistent task storage (JSON files per session), global task tracking, and
-//! workspace-aware persistence — features the MCP plugin cannot provide.
-//! This in-process implementation is kept for backward compatibility.
-//! New development should use the MCP plugin version.
-
 //! TodoWrite tool — matches Claude Code's TodoWrite behavior.
 //!
-//! Lets the LLM maintain a structured task list. Todos are stored in
-//! per-session AppState, rendered by the frontend, and auto-persisted to
-//! disk so task state survives server restarts and context compaction.
+//! The in-process implementation is the stateful always-on TodoWrite
+//! (registered by `assemble`); the MCP plugin `plugin-todo-write` lacks the
+//! kernel integration (per-session storage + auto-persist). Lets the LLM
+//! maintain a structured task list. Todos are stored in per-session AppState,
+//! rendered by the frontend, and auto-persisted to disk so task state survives
+//! server restarts and context compaction.
 //!
 //! ## Persistence
 //!
@@ -196,8 +191,8 @@ impl Tool for TodoWriteTool {
             None => {
                 return Err(EverEvoError::InvalidInput(
                     "todos is required and must be an array of items like \
-                     {\"description\": \"...\", \"status\": \"pending\"} — provide the full \
-                     list each call (write the whole list, not a delta)"
+                     {\"content\": \"...\", \"status\": \"pending\", \"activeForm\": \"...\"} — \
+                     provide the full list each call (write the whole list, not a delta)"
                         .into(),
                 ))
             }

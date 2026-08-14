@@ -28,12 +28,13 @@ pub(super) async fn run_auto_continue(
     s: &mut ContentBlockStreamer,
     pending_for_autocontinue: &Arc<std::sync::atomic::AtomicUsize>,
     messages_for_autocontinue: &mut Vec<LlmMessage>,
-    client_for_autocontinue: Arc<everevo_agent::llm::HttpClient>,
+    client_for_autocontinue: Arc<dyn everevo_core::LlmProvider>,
     tools_for_autocontinue: Arc<everevo_core::tool::ToolRegistry>,
     state: &Arc<AppState>,
     session_id: Uuid,
     proactivity: &Arc<std::sync::Mutex<everevo_agent::ProactivityState>>,
     meta_agent: &Option<Arc<std::sync::Mutex<everevo_agent::memory::MetaAgentState>>>,
+    orchestrator: &Option<Arc<std::sync::Mutex<everevo_agent::loop_::MetaOrchestratorState>>>,
     hook_feedback: &Arc<std::sync::Mutex<Option<String>>>,
     context_window_tokens: usize,
     trace_id: Option<Uuid>,
@@ -120,8 +121,8 @@ pub(super) async fn run_auto_continue(
                 )));
             }
 
-            // ── Restart AgentLoop with updated messages ──
-            let mut agent2 = everevo_agent::AgentLoop::new()
+            // ── Restart AgentRun with updated messages ──
+            let mut agent2 = everevo_agent::AgentRun::new()
                 .with_pending_subagents(Arc::clone(pending_for_autocontinue))
                 .with_cancel_token(coord.cancel.clone())
                 .with_compact_focus(coord.compact_focus.clone());
@@ -130,6 +131,7 @@ pub(super) async fn run_auto_continue(
                 agent2,
                 proactivity,
                 meta_agent,
+                orchestrator,
                 hook_feedback,
                 context_window_tokens,
                 trace_id,

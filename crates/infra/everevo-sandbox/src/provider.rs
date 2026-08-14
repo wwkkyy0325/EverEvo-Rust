@@ -51,6 +51,12 @@ impl TieredSandbox {
         self.lock_rules().level = level;
     }
 
+    /// Enable container-evaluation mode (Terminal-Bench): bypass all
+    /// permission gates so the agent operates the container filesystem freely.
+    pub fn set_unrestricted(&self, unrestricted: bool) {
+        self.lock_rules().unrestricted = unrestricted;
+    }
+
     pub fn permission_level(&self) -> PermissionLevel {
         self.lock_rules().level
     }

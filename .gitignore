@@ -55,3 +55,34 @@ __pycache__/
 
 # ── Compiled build artifacts ──
 scripts/gaia-docker/everevo-server
+
+# ── Harbor / Terminal-Bench (WS4, 2026-08-13) ──
+# Downloaded TB-2.0 dataset (89 tasks, ~46M)
+terminal-bench/
+# Harbor run output + cache
+jobs/
+.harbor/
+# Docker cross-compile cargo cache
+.cargo-docker/
+
+# ── Stray path-conversion artifacts (Git Bash) ──
+# Accidental mount root from MSYS path mangling
+C:/
+
+# ── GAIA agent run artifacts (sandbox writes to repo root) ──
+# Raw page/data dumps + verification leftovers the GAIA agent writes during
+# benchmark runs. Some contain ground-truth-derived content — never commit.
+nature*.html
+nature*.json
+nagel_*.txt
+orcid_results*.txt
+final_counts.txt
+final_verify.txt
+all_analysis.txt
+b_analysis.txt
+b_conflicts.txt
+b_definitive.txt
+b_noyear*.txt
+os1.xml
+sample3.json
+count_nature.py

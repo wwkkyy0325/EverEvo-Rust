@@ -50,6 +50,11 @@ pub enum PermissionDecision {
 pub struct PermissionRules {
     /// Current permission level.
     pub level: PermissionLevel,
+    /// Container-evaluation mode (Terminal-Bench): bypass ALL permission gates.
+    /// The container is itself the isolation boundary, so the agent must be
+    /// free to operate the full filesystem. Enabled via
+    /// `EVEREVO_SANDBOX_UNRESTRICTED`.
+    pub unrestricted: bool,
     /// Network policy for this session.
     pub network: NetworkPolicy,
     /// Glob patterns for allowed write destinations (session-scoped).
@@ -74,6 +79,7 @@ impl Default for PermissionRules {
     fn default() -> Self {
         Self {
             level: PermissionLevel::SemiAuto,
+            unrestricted: false,
             network: NetworkPolicy::for_level(PermissionLevel::SemiAuto),
             filesystem_write_allowlist: vec![
                 "data/sandbox/**".into(),
@@ -167,6 +173,13 @@ pub fn check_permission(command: &str, rules: &PermissionRules) -> PermissionDec
         return PermissionDecision::Deny {
             reason: "只读模式，不允许执行任何命令".into(),
         };
+    }
+
+    // ── 0.5 Container-evaluation mode — bypass all gates ───────────
+    // The container is the isolation boundary; the agent operates the full
+    // filesystem (Terminal-Bench tasks touch /app, /tmp, /usr, …).
+    if rules.unrestricted {
+        return PermissionDecision::Allow;
     }
 
     // ── 1. Deny patterns — permanent block ─────────────────────────

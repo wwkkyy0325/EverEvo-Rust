@@ -57,8 +57,31 @@ fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
 
 // ── Agent Loop ──────────────────────────────────────────────────────────
 
+/// How an [`AgentRun`] is being used — selects the per-run policy for the
+/// hard-question verification gate and the benchmark wall-clock deadline.
+///
+/// `verify_gate` and wall-clock are *not* individually settable; the mode is
+/// the single owner (unified-entry refactor, P0):
+/// - `Session` — main session + auto-continue: verification gate ON,
+///   benchmark wall-clock derived from env.
+/// - `SubAgent` — sub-agent/team/cluster/workflow runs: verification gate OFF
+///   (the main loop verifies the final synthesis), no wall-clock.
+/// - `Cli` — standalone binary chat: gate ON, wall-clock from env.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AgentRunMode {
+    Session,
+    SubAgent,
+    Cli,
+}
+
 /// The ReAct agent loop — LLM → Tools → Results → LLM cycle.
-pub struct AgentLoop {
+///
+/// Consuming builder (`mut self -> Self`), three mode constructors, one
+/// mode-driven run pair. Unified entry for the 11 construction sites
+/// (architecture-restructure-plan.md P0).
+pub struct AgentRun {
+    /// Run mode — drives verification-gate + wall-clock policy.
+    mode: AgentRunMode,
     /// Maximum number of ReAct turns before forced termination.
     /// `pub(crate)` — read directly by the loop tests (2026-08-13 mod.rs split).
     pub(crate) max_turns: usize,
@@ -70,7 +93,7 @@ pub struct AgentLoop {
     telemetry: Option<Arc<TelemetryPipeline>>,
     /// Trace ID for correlating telemetry records.
     trace_id: Option<Uuid>,
-    /// Pending subagent results channel — TaskTool pushes, AgentLoop drains.
+    /// Pending subagent results channel — TaskTool pushes, AgentRun drains.
     subagent_rx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>>,
     /// Pending sub-agent count — shared with TaskTool.
     pending_subagents: Arc<std::sync::atomic::AtomicUsize>,
@@ -84,6 +107,12 @@ pub struct AgentLoop {
     proactivity_state: Option<Arc<std::sync::Mutex<ProactivityState>>>,
     /// Meta-agent state — cross-turn pattern diagnosis and hint injection.
     meta_agent_state: Option<Arc<std::sync::Mutex<crate::memory::meta_agent::MetaAgentState>>>,
+    /// LLM-free meta-orchestrator policy state (Scout/DeepDive/Verify/Commit).
+    /// None → the driver runs exactly as today (opt-in, benchmark).
+    orchestrator_state: Option<Arc<std::sync::Mutex<crate::loop_::MetaOrchestratorState>>>,
+    /// Current TodoWrite task list (server-rendered) — lets the driver's
+    /// evidence gate reference task progress. None → no todo awareness.
+    todo_summary: Option<String>,
     /// Hook feedback slot — ReflectGateHook writes tool error feedback here;
     /// the loop reads+clears it after tool execution and injects as a user message.
     hook_feedback_slot: Option<Arc<std::sync::Mutex<Option<String>>>>,
@@ -99,9 +128,10 @@ pub struct AgentLoop {
     tool_cache_dir: Option<PathBuf>,
 }
 
-impl AgentLoop {
+impl AgentRun {
     pub fn new() -> Self {
         Self {
+            mode: AgentRunMode::Session,
             max_turns: 0,
             max_tool_result_chars: 4000,
             max_context_chars: 80000,
@@ -113,6 +143,8 @@ impl AgentLoop {
             compact_focus: None,
             proactivity_state: None,
             meta_agent_state: None,
+            orchestrator_state: None,
+            todo_summary: None,
             hook_feedback_slot: None,
             background_maintenance: None,
             compact_llm: None,
@@ -168,6 +200,26 @@ impl AgentLoop {
         self
     }
 
+    /// Enable the LLM-free meta-orchestrator policy layer
+    /// (Scout/DeepDive/Verify/Commit). Opt-in: when set, the driver fires
+    /// phase directives; when `None` (default) the loop is byte-equivalent to
+    /// today.
+    pub fn with_meta_orchestrator(
+        mut self,
+        state: Arc<std::sync::Mutex<crate::loop_::MetaOrchestratorState>>,
+    ) -> Self {
+        self.orchestrator_state = Some(state);
+        self
+    }
+
+    /// Provide the current TodoWrite task list (server-rendered). The driver's
+    /// evidence gate references it when a hard question claims completed work
+    /// but retrieved no tool evidence. None → no todo awareness.
+    pub fn with_todo_summary(mut self, summary: Option<String>) -> Self {
+        self.todo_summary = summary;
+        self
+    }
+
     /// Wire the ReflectGateHook feedback slot so the loop reads tool error
     /// feedback after each tool execution and injects it into the conversation.
     pub fn with_hook_feedback(mut self, slot: Arc<std::sync::Mutex<Option<String>>>) -> Self {
@@ -177,11 +229,6 @@ impl AgentLoop {
 
     pub fn with_cancel_token(mut self, token: tokio_util::sync::CancellationToken) -> Self {
         self.cancel_token = Some(token);
-        self
-    }
-
-    pub fn with_subagent_channel(self, rx: tokio::sync::mpsc::UnboundedReceiver<String>) -> Self {
-        *self.subagent_rx.lock().unwrap_or_else(|e| e.into_inner()) = Some(rx);
         self
     }
 
@@ -205,6 +252,15 @@ impl AgentLoop {
         self
     }
 
+    /// Set the context ceiling from a token budget (4 chars/token, matching
+    /// driver.rs `max_context_chars / 4`). Single home for the tokens→chars
+    /// conversion that previously repeated at 4 call sites.
+    #[must_use]
+    pub fn with_context_tokens(mut self, tokens: usize) -> Self {
+        self.max_context_chars = tokens.saturating_mul(4);
+        self
+    }
+
     pub fn with_telemetry(mut self, telemetry: Arc<TelemetryPipeline>, trace_id: Uuid) -> Self {
         self.telemetry = Some(telemetry);
         self.trace_id = Some(trace_id);
@@ -215,6 +271,7 @@ impl AgentLoop {
 
     /// Full-featured main session loop (chat in server mode).
     /// Wires sub-agent channels, cancellation, compaction focus, and proactivity.
+    #[must_use]
     pub fn main_session(
         subagent_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
         pending_subagents: Arc<std::sync::atomic::AtomicUsize>,
@@ -222,30 +279,54 @@ impl AgentLoop {
         compact_focus: Arc<std::sync::Mutex<Option<String>>>,
         proactivity: Arc<std::sync::Mutex<ProactivityState>>,
     ) -> Self {
-        Self::new()
-            .with_subagent_channel(subagent_rx)
-            .with_pending_subagents(pending_subagents)
-            .with_cancel_token(cancel_token)
-            .with_compact_focus(compact_focus)
-            .with_proactivity(proactivity)
+        let mut s = Self::new();
+        *s.subagent_rx.lock().unwrap_or_else(|e| e.into_inner()) = Some(subagent_rx);
+        s.pending_subagents = pending_subagents;
+        s.cancel_token = Some(cancel_token);
+        s.compact_focus = Some(compact_focus);
+        s.proactivity_state = Some(proactivity);
+        s
     }
 
     /// Standard sub-agent loop (TaskTool, Team, Workflow, Cluster, A2A).
     /// Sets a turn limit; the caller can chain additional `.with_*()` methods.
+    #[must_use]
     pub fn sub_agent(max_turns: usize) -> Self {
-        Self::new().with_max_turns(max_turns)
+        let mut s = Self::new().with_max_turns(max_turns);
+        s.mode = AgentRunMode::SubAgent;
+        s
     }
 
-    /// CLI chat loop (standalone binary mode, 30-turn limit).
+    /// CLI chat loop (standalone binary mode). Unbounded by default — the agent
+    /// runs until it completes (or the caller stops it); benchmark/eval runs
+    /// impose their own official cap (e.g. Terminal-Bench `agent.timeout_sec`),
+    /// and `EVEREVO_MAX_TURNS` optionally bounds it.
+    #[must_use]
     pub fn cli() -> Self {
-        Self::new().with_max_turns(30)
+        let max_turns = std::env::var("EVEREVO_MAX_TURNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(0);
+        let mut s = Self::new().with_max_turns(max_turns);
+        s.mode = AgentRunMode::Cli;
+        s
+    }
+
+    /// Per-run policy for the verification gate and benchmark wall-clock,
+    /// driven solely by the run mode.
+    fn mode_gate(&self) -> (bool, Option<std::time::Instant>) {
+        match self.mode {
+            AgentRunMode::SubAgent => (false, None),
+            AgentRunMode::Session | AgentRunMode::Cli => (true, derive_benchmark_wallclock()),
+        }
     }
 
     /// Run the ReAct loop with streaming output via AgentEvent channel.
     #[allow(clippy::type_complexity)]
     pub async fn run(
         &self,
-        llm: Arc<crate::llm::HttpClient>,
+        llm: Arc<dyn LlmProvider>,
         tools: Arc<ToolRegistry>,
         mut messages: Vec<LlmMessage>,
         confirmation: Option<Arc<dyn Fn(&str, &serde_json::Value) -> bool + Send + Sync>>,
@@ -267,10 +348,15 @@ impl AgentLoop {
         let compact_focus = self.compact_focus.clone();
         let proactivity = self.proactivity_state.clone();
         let meta_agent = self.meta_agent_state.clone();
+        let orchestrator = self.orchestrator_state.clone();
+        let todo_summary = self.todo_summary.clone();
         let hook_feedback_slot = self.hook_feedback_slot.clone();
         let background = self.background_maintenance.clone();
         let compact_llm = self.compact_llm.clone();
         let tool_cache_dir = self.tool_cache_dir.clone();
+        // Run-mode policy computed outside the spawned task (it borrows self);
+        // the values are moved into the 'static task below.
+        let (verify_gate, wall_deadline) = self.mode_gate();
         tokio::spawn(async move {
             let mut tool_schemas: Vec<ToolSchema> = tools
                 .as_tool_schemas()
@@ -289,24 +375,8 @@ impl AgentLoop {
                 tool_schemas.push(native);
             }
 
-            // Benchmark mode (EVEREVO_BENCHMARK=1): thread a task-level wall-clock
-            // deadline so the loop can inject escalating convergence nudges and a
-            // forced terminal commit instead of the plain max_turns error.
-            // Tunable via EVEREVO_BENCHMARK_WALLCLOCK (seconds); default 300s.
-            // A full GAIA run sets this ~30s UNDER the harness question_timeout
-            // (the GAIA official per-question cap is 1800s) so the forced
-            // terminal commit lands before the harness kills the request.
-            // Non-benchmark runs pass None and keep byte-identical behavior.
-            let wall_deadline = if std::env::var("EVEREVO_BENCHMARK").is_ok() {
-                let secs: u64 = std::env::var("EVEREVO_BENCHMARK_WALLCLOCK")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .filter(|n| *n > 0)
-                    .unwrap_or(300);
-                Some(std::time::Instant::now() + std::time::Duration::from_secs(secs))
-            } else {
-                None
-            };
+            // Run-mode policy (verify_gate + wall_deadline) was computed
+            // before spawning and moved into this task.
 
             // Bundle the per-run wiring once (unified-entry refactor, P0): the
             // loop engine reads everything from RunConfig instead of ~20
@@ -324,12 +394,14 @@ impl AgentLoop {
                 compact_focus,
                 proactivity,
                 meta_agent_state: meta_agent,
+                orchestrator,
+                todo_summary,
                 hook_feedback_slot,
                 compact_llm,
                 background,
                 tool_cache_dir,
                 cancel,
-                verify_gate: true,
+                verify_gate,
             };
             match AssertUnwindSafe(run_loop(
                 llm.as_ref(),
@@ -369,9 +441,10 @@ impl AgentLoop {
 
     /// Run the ReAct loop synchronously and collect the final response as a String.
     /// Designed for sub-agents and workflow tasks that need a simple text result.
+    /// Blocking (non-streaming) — `verify_gate` is driven by the mode.
     ///
     /// Returns the accumulated text from all turns, or an error string.
-    pub async fn run_subagent(
+    pub async fn run_to_string(
         &self,
         llm: Arc<dyn LlmProvider>,
         tools: Arc<ToolRegistry>,
@@ -408,15 +481,17 @@ impl AgentLoop {
         // (delegate/spawn.rs), so a fresh pending counter keeps the loop from
         // yielding on the parent's in-flight sub-agents, and subagent_rx stays
         // None (no async results to drain in a sub-agent run).
+        let (verify_gate, _) = self.mode_gate();
         let config = RunConfig {
             max_turns,
             max_tool_result_chars: self.max_tool_result_chars,
             max_context_chars: self.max_context_chars,
-            pending_subagents: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            pending_subagents: self.pending_subagents.clone(),
             cancel: Some(cancel.clone()),
             // A sub-agent returns its best answer; the main loop verifies the
-            // final synthesis — skip the hard-question verification gate.
-            verify_gate: false,
+            // final synthesis — skip the hard-question verification gate
+            // (mode_gate yields false for AgentRunMode::SubAgent).
+            verify_gate,
             ..RunConfig::new()
         };
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(32);
@@ -454,8 +529,26 @@ impl AgentLoop {
     }
 }
 
-impl Default for AgentLoop {
+impl Default for AgentRun {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Derive the benchmark wall-clock deadline from env, or `None` outside
+/// benchmark mode. `EVEREVO_BENCHMARK=1` + `EVEREVO_BENCHMARK_WALLCLOCK`
+/// (seconds, default 300). A full GAIA run sets this ~30s UNDER the harness
+/// question_timeout so the forced terminal commit lands before the harness
+/// kills the request. Non-benchmark runs keep byte-identical behavior (None).
+fn derive_benchmark_wallclock() -> Option<std::time::Instant> {
+    if std::env::var("EVEREVO_BENCHMARK").is_ok() {
+        let secs: u64 = std::env::var("EVEREVO_BENCHMARK_WALLCLOCK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(300);
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(secs))
+    } else {
+        None
     }
 }

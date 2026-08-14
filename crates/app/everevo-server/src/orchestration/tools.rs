@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! [1] Bootstrap tools      ← kernel-compiled, never removable (shell, plugin_status, ...)
-//! [2] MCP plugin auto-load ← 21 plugins: 13 tools + 5 stages + 3 hooks
+//! [2] MCP plugin auto-load ← 20 plugins: 12 tools + 5 stages + 3 hooks
 //! [3] External MCP servers ← user-configured MCP servers via config
 //! [4] In-process fallback   ← only registered when MCP didn't provide (web_search, etc.)
 //! [5] Stateful in-process   ← always registered (memory, todo, plan, skill, task, workflow)
@@ -60,16 +60,18 @@ pub struct AssembledTools {
     pub results_backlog: Arc<std::sync::Mutex<Vec<(String, String, String)>>>, // (id, description, result)
     pub task_handles: Arc<std::sync::Mutex<Vec<SubAgentHandle>>>,
     pub task_statuses: Arc<std::sync::Mutex<Vec<SubAgentStatus>>>,
-    /// Shared focus channel: CompactTool writes → AgentLoop's autocompact reads.
+    /// Shared focus channel: CompactTool writes → AgentRun's autocompact reads.
     pub compact_focus: Arc<std::sync::Mutex<Option<String>>>,
-    /// Hook feedback slot: ReflectGateHook writes → AgentLoop reads after tool execution.
+    /// Hook feedback slot: ReflectGateHook writes → AgentRun reads after tool execution.
     pub hook_feedback: Arc<std::sync::Mutex<Option<String>>>,
 }
 
-/// Assemble the full per-session 11-tool registry.
-///
-/// Covers shell, download, bootstrap, memory, TodoWrite, EnterPlan, ExitPlan,
-/// Skill, Verify, Task (with sub-agents), and Workflow.
+/// Assemble the full per-session tool registry: bootstrap tools + MCP plugin
+/// tools + stateful in-process tools (memory, TodoWrite, plan mode, Skill,
+/// task/pipeline, workflow/team, cluster, problem_model, ask_user, etc.) with
+/// review/audit/reflect hooks and plan-mode filtering. The CLI counterpart is
+/// `everevo_agent::tools::build_registry` (a `ToolRegistry::subset`-able
+/// name list — see `CLI_REGISTRY_NAMES`).
 pub async fn assemble(
     state: &Arc<AppState>,
     session_id: Uuid,
@@ -82,7 +84,7 @@ pub async fn assemble(
     let mut registry = ToolRegistry::new();
     let is_fully_auto = permission_level == "全自动" || permission_level == "fully_auto";
 
-    // Shared focus channel: CompactTool writes, AgentLoop's autocompact reads
+    // Shared focus channel: CompactTool writes, AgentRun's autocompact reads
     let compact_focus = Arc::new(std::sync::Mutex::new(None::<String>));
 
     // Plan mode state: shared between EnterPlanModeTool/ExitPlanModeTool and chat route
@@ -309,7 +311,7 @@ pub async fn assemble(
     // todo_write → needs persistent store + session state
     // plan_mode → needs shared PlanModeState across sessions
     // skill → needs SkillRegistry
-    // compact → needs focus channel (AgentLoop autocompact)
+    // compact → needs focus channel (AgentRun autocompact)
     // code_search/code_map → needs background FS indexing
     // download → needs session-scoped work_dir
     registry.register(Arc::new(
@@ -435,9 +437,8 @@ pub async fn assemble(
                     ];
                     let mt = if max_turns == 0 { 3 } else { max_turns };
                     let llm: Arc<dyn everevo_core::LlmProvider> = self.llm.clone();
-                    let result = everevo_agent::AgentLoop::new()
-                        .with_max_turns(mt)
-                        .run_subagent(llm, Arc::clone(&self.tools), messages, self.cancel.clone())
+                    let result = everevo_agent::AgentRun::sub_agent(mt)
+                        .run_to_string(llm, Arc::clone(&self.tools), messages, self.cancel.clone())
                         .await;
                     Ok(result)
                 }
@@ -504,6 +505,22 @@ pub async fn assemble(
     // No in-process fallback needed.
 
     // ── Cluster tool ──
+    // Dual-model tiers: sub-agents (soldiers) run on `subagentModelId` (flash),
+    // verify reviewers (officers) on `verifierModelId` (pro). Fall back to the
+    // main client when a tier id is unset (default = single-model behavior).
+    let subagent_client = state
+        .subagent_llm
+        .read()
+        .await
+        .as_ref()
+        .map(|p| Arc::clone(&p.client))
+        .unwrap_or_else(|| Arc::clone(client));
+    let verifier_client = state
+        .verifier_llm
+        .read()
+        .await
+        .as_ref()
+        .map(|p| Arc::clone(&p.client));
     // Build a SubAgentPool for cluster patterns (fan_out, map_reduce, verify)
     let cluster_pool = {
         let cluster_base =
@@ -513,7 +530,7 @@ pub async fn assemble(
                 max_concurrent: 8,
                 timeout_secs: 300,
             },
-            Arc::clone(client),
+            subagent_client.clone(),
             cluster_base,
             sub_ctx.clone(),
             Arc::new(
@@ -525,7 +542,14 @@ pub async fn assemble(
         Arc::new(pool)
     };
     registry.register(Arc::new(
-        everevo_agent::tools::builtins::ClusterTool::new().with_pool(cluster_pool),
+        everevo_agent::tools::builtins::ClusterTool::new()
+            .with_pool(cluster_pool)
+            .with_verifier_llm(verifier_client),
+    ));
+
+    // ── Wayback lookup — dead-source pre-routing (historical pages) ──
+    registry.register(Arc::new(
+        everevo_agent::tools::builtins::WaybackLookupTool::new(),
     ));
 
     // ── Base registries for sub-agents ──
@@ -585,7 +609,7 @@ pub async fn assemble(
         let sub_task = everevo_agent::tools::builtins::TaskTool::new(
             Arc::new(state.config.data_dir.join("sandbox")),
             Arc::new(ToolRegistry::new()),
-            Some(Arc::clone(client)),
+            Some(subagent_client.clone()),
         )
         .with_subagent_limits(30, 300);
         base_for_task.register(Arc::new(sub_task));
@@ -593,7 +617,7 @@ pub async fn assemble(
         everevo_agent::tools::builtins::TaskTool::new(
             Arc::new(state.config.data_dir.join("sandbox")),
             Arc::new(task_registry),
-            Some(Arc::clone(client)),
+            Some(subagent_client.clone()),
         )
         .with_subagent_limits(100, 600)
     } else {
@@ -605,7 +629,7 @@ pub async fn assemble(
         everevo_agent::tools::builtins::TaskTool::new(
             Arc::new(state.config.data_dir.join("sandbox")),
             Arc::new(base_for_task),
-            Some(Arc::clone(client)),
+            Some(subagent_client.clone()),
         )
         .with_subagent_limits(100, 600)
     };

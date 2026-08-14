@@ -10,7 +10,7 @@
 //! Review Gate — PRE-ACT tool execution guard.
 //!
 //! Implemented as a `ToolHook` so it plugs into the existing tool execution
-//! lifecycle without modifying the core AgentLoop. Registered FIRST in the
+//! lifecycle without modifying the core AgentRun. Registered FIRST in the
 //! hook chain so it blocks before any other hook (including AuditHook).
 //!
 //! ## Checks (in order)

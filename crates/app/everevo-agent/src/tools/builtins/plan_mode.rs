@@ -6,10 +6,6 @@
 //! auto-load because its `enter_plan_mode`/`exit_plan_mode` run in a separate
 //! process, cannot touch this map, and so were a no-op that misled the agent
 //! into believing write tools were blocked when they weren't.
-
-//! Plan Mode tools — Claude Code-aligned state machine.
-//!
-//! ## Architecture
 //!
 //! Plan mode is a safety mechanism: when active, only read-only tools are
 //! available. The agent explores, designs, writes a plan, and gets user
@@ -17,8 +13,7 @@
 //!
 //! ```text
 //! Normal → EnterPlanMode → PlanMode (write tools blocked, pre-perm saved)
-//! PlanMode → ExitPlanMode  → Normal (permission restored, plan saved)
-//!          → CancelPlanMode → Normal (permission restored, plan discarded)
+//! PlanMode → ExitPlanMode → Normal (permission restored, plan saved)
 //! ```
 //!
 //! ## Research basis
@@ -53,13 +48,13 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "code_map",
     "memory",
     "web_fetch",
-    "web_search",
+    "web_search_local",
     "EnterPlanMode",
     "ExitPlanMode",
     "Skill",
-    "Verify",
+    "verify",
     "TodoWrite",
-    "Compact",
+    "compact",
 ];
 
 /// Check if a tool is allowed in plan mode.
@@ -126,7 +121,7 @@ impl Tool for EnterPlanModeTool {
         if state.contains_key(&session_id) {
             return Ok(ToolOutput {
                 content: "Already in plan mode. Use ExitPlanMode to submit your plan \
-                          or call CancelPlanMode to discard it."
+                          and restore permissions."
                     .into(),
                 is_error: true,
                 ..Default::default()

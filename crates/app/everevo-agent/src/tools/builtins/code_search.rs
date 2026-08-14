@@ -1,12 +1,8 @@
-//! In-process code search with background FS indexing and file watching.
-//!
-//! Complemented by MCP plugin `plugin-code-search` which provides stateless grep/code-map.
-//! This in-process version provides background indexing and FS change watching for
-//! faster sub-sequent searches — features the MCP plugin cannot provide.
-//! This in-process implementation is kept for backward compatibility.
-//! New development should use the MCP plugin version.
-
 //! Code search tools — keyword search + directory map for the LLM.
+//!
+//! Complemented by MCP plugin `plugin-code-search` (stateless grep/code-map);
+//! this in-process version is the fallback with background FS indexing and
+//! change watching the plugin cannot provide.
 //!
 //! ## Architecture (research-backed, Phases 0-2)
 //!

@@ -375,7 +375,7 @@ async fn handle_chat(
             .and_then(|r| r.context_window),
     );
     // Capture before the budget is moved into the context (used again for the
-    // AgentLoop ceiling below).
+    // AgentRun ceiling below).
     let context_window_tokens = context_budget.window;
     let ctx = ContextBuildContext {
         user_message: effective_message.clone(),
@@ -466,6 +466,18 @@ async fn handle_chat(
             )
         }
     };
+    // LLM-free meta-orchestrator policy layer — strictly opt-in benchmark
+    // scaffolding (EVEREVO_BENCHMARK set AND EVEREVO_META_ORCHESTRATOR != "0").
+    // None → the loop is byte-equivalent to today. Constructed here so the
+    // shared state can also seed the sub-agent phase directive below and the
+    // auto-continue restart wires the same state.
+    let orchestrator = if crate::app_state::meta_orchestrator_effective() {
+        Some(std::sync::Arc::new(std::sync::Mutex::new(
+            everevo_agent::loop_::MetaOrchestratorState::new(),
+        )))
+    } else {
+        None
+    };
     let mut sub_ctx = everevo_agent::subagent_context::assemble_subagent_context(
         &effective_message,
         None,
@@ -481,6 +493,13 @@ async fn handle_chat(
     .await;
     // Inherit parent session's permission level for sub-agents.
     sub_ctx.permission_level = Some(permission_level.clone());
+    // Seed the sub-agent with the parent's orchestrator phase context (None
+    // when the orchestrator is off → the sub-agent system prompt omits the
+    // section entirely).
+    sub_ctx.orchestrator_directive = orchestrator.as_ref().map(|orch| {
+        let phase = orch.lock().unwrap_or_else(|e| e.into_inner()).phase;
+        everevo_agent::loop_::subagent_phase_directive(phase)
+    });
 
     // Inject T1 memory context for sub-agents (≤400 chars).
     // Session-filtered: sub-agents of this session must not see other sessions'
@@ -611,10 +630,10 @@ async fn handle_chat(
     // Each thinking / tool_use / text segment is a separate content block
     // with an incrementing index.  This lets the frontend render blocks
     // in order without any interleaving hacks.
-    // Clone refs before moving into AgentLoop (needed for auto-continue)
+    // Clone refs before moving into AgentRun (needed for auto-continue)
     let pending_for_autocontinue = Arc::clone(&coord.pending);
     let mut messages_for_autocontinue = messages.clone();
-    let client_for_autocontinue = Arc::clone(&client);
+    let client_for_autocontinue = Arc::clone(&client) as Arc<dyn everevo_core::LlmProvider>;
     let tools_for_autocontinue = Arc::clone(&tools);
     let proactivity = Arc::new(std::sync::Mutex::new(everevo_agent::ProactivityState::new()));
 
@@ -653,7 +672,7 @@ async fn handle_chat(
     } else {
         None
     };
-    let mut agent = everevo_agent::AgentLoop::main_session(
+    let mut agent = everevo_agent::AgentRun::main_session(
         subagent_rx,
         coord.pending.clone(),
         coord.cancel.clone(),
@@ -666,12 +685,16 @@ async fn handle_chat(
         agent,
         &proactivity,
         &meta_agent,
+        &orchestrator,
         &assembled.hook_feedback,
         context_window_tokens,
         trace_id,
         state.telemetry_pipeline.clone(),
     );
     agent = agent.with_compact_llm(compact_arc.clone());
+    // TodoWrite awareness: pass the current task list so the driver's evidence
+    // gate can reference completed-but-unverified items.
+    agent = agent.with_todo_summary(Some(todo_summary.clone()));
     // Layer-1 background rolling-summary maintenance (spec D3): runs at soft
     // threshold turn boundaries without blocking the main loop.
     agent = agent.with_background_maintenance(compact_arc.as_ref().map(|llm| {
@@ -694,7 +717,14 @@ async fn handle_chat(
             .join(session_id.to_string())
             .join("tool_cache"),
     ));
-    let mut agent_rx = agent.run(client, tools, messages, None).await;
+    let mut agent_rx = agent
+        .run(
+            client as Arc<dyn everevo_core::LlmProvider>,
+            tools,
+            messages,
+            None,
+        )
+        .await;
 
     let assistant_id = Uuid::new_v4();
     let mut s = ContentBlockStreamer::new(session_id);
@@ -827,6 +857,7 @@ async fn handle_chat(
         session_id,
         &proactivity,
         &meta_agent,
+        &orchestrator,
         &assembled.hook_feedback,
         context_window_tokens,
         trace_id,

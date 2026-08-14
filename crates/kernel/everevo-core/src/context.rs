@@ -7,21 +7,21 @@
 //! future work (RAG, knowledge graph, tool definitions) adds new stages
 //! without touching the core chat logic.
 //!
-//! ## Design Reference
+//! ## Priority order (lived in `crates/app/everevo-agent/src/stages/`)
 //!
-//! ChatGPT's 7-layer context assembly (reverse-engineered by Manthan Gupta):
-//! system instructions → user memory → session metadata → recent summaries →
-//! current messages → latest input. We mirror this with pluggable stages.
+//! Stages are ordered by priority; lower runs first. (Not all are in this
+//! crate — `stages/` in the agent crate hosts the context stages.)
 //!
 //! ```text
-//! [0] System Prompt         ← static, loaded from config
-//! [1] User Memory           ← persistent facts (future)
-//! [2] Session Metadata      ← ephemeral per-session
-//! [3] Recent Sessions       ← cross-session context (future)
-//! [4] Knowledge Base        ← RAG results slot (future)
-//! [5] Tool Definitions      ← available tools slot (future)
-//! [6] Conversation History  ← current session messages, sliding window
-//! [7] Latest User Message   ← the new input
+//! [0] SystemPrompt       → static instructions + tool descriptions
+//! [1] Persona            → user communication style + thinking paradigm
+//! [2] BestPractices      → verification, planning, code quality rules
+//! [3] Skill              → loaded SKILL.md instructions
+//! [4+] Memory/Domain     → relevant facts and domain docs (RAG)
+//! [75] RollingSummary    → durable background summary
+//! [80] History           → conversation messages (sliding window)
+//! [90] SessionMetadata   → ephemeral per-session
+//! [99] LatestMessage     → current user input
 //! ```
 
 mod budget;
