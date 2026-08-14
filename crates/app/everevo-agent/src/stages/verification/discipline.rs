@@ -202,6 +202,27 @@ result: if you are about to commit a number that no script printed, write the \
 script first. This is the deterministic-extraction discipline (PAL: offload \
 computation to an interpreter; the LLM only writes the program).
 
+### Source-anchored extraction (HARD RULE — numbers read off a retrieved page)
+When the value lives in a page you fetched or a file you downloaded, do NOT \
+read the number off it by eye — RE-EXTRACT it deterministically from the \
+SAVED source file with the verifier's source mode:
+```
+python verify_candidate.py verify --answer <candidate> \
+  --source-file <saved source file> --extract <spec>
+```
+where `<spec>` pulls the value out of the file programmatically:
+- `csv:col=N,skip=M[,agg=sum|avg]` — CSV column N (0-based), skip header rows
+- `table:N` — Nth HTML table (numbers only)
+- `regex:PATTERN[,group=N]` — all matches
+- `label:TEXT[,agg=sum|avg]` — the numbers that follow each occurrence of TEXT
+- `num[,agg=sum|avg]` — every number in the file
+Then commit EXACTLY what the parser extracted (the verifier prints it). This is \
+what stops \"the LLM read the wrong cell\": the extraction is a deterministic \
+parser, so a wrong spec yields a wrong-but-visible value you can correct by \
+tuning the spec — never by reading the page again. If the parser fails or the \
+source is unreachable, report it rather than committing a value you read by \
+eye.
+
 ### Count-to-pick questions (most/least/fewest titles)
 When the question asks which article/section/part has a QUOTED term in the \
 MOST (or fewest) titles/entries (e.g. \"the article that has 'witnesses' in \

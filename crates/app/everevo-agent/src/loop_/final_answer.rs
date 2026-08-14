@@ -94,8 +94,7 @@ pub(crate) fn sanitize_final_answer(text: &str) -> String {
 pub(crate) fn final_answer_value(text: &str) -> String {
     let s = sanitize_final_answer(text);
     if let Some(idx) = s.to_lowercase().rfind("final answer") {
-        let rest = s[idx + "final answer".len()..]
-            .trim_start_matches([':', ' ', '\t', '=', '-']);
+        let rest = s[idx + "final answer".len()..].trim_start_matches([':', ' ', '\t', '=', '-']);
         if !rest.is_empty() {
             return rest.to_string();
         }
@@ -119,9 +118,7 @@ pub(crate) fn content_grounded(answer: &str, tool_texts: &[String]) -> bool {
         return true;
     }
     let haystack = tool_texts.join(" ").to_lowercase();
-    pieces
-        .iter()
-        .any(|p| haystack.contains(&p.to_lowercase()))
+    pieces.iter().any(|p| haystack.contains(&p.to_lowercase()))
 }
 
 /// Extract the "groundable" content of a candidate answer — numeric runs
@@ -220,7 +217,9 @@ mod tests {
     #[test]
     fn content_grounded_requires_source_match() {
         // Fully-fabricated entity → NOT grounded.
-        let tools = ["A biography of the author, who later joined the Russian-German Legion.".to_string()];
+        let tools = [
+            "A biography of the author, who later joined the Russian-German Legion.".to_string(),
+        ];
         assert!(!content_grounded("Lützow Free Corps", &tools));
         // Term present → grounded.
         let tools2 = ["He served with the Lützow Free Corps before emigrating.".to_string()];

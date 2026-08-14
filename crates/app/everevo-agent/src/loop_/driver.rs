@@ -112,6 +112,23 @@ value, then prints ONLY the bare value. Do NOT read the number off the page — 
 extract it with code (regex, table parse, arithmetic). Commit the exact value \
 your script printed.";
 
+/// Source-anchored intercept (2026-08-14): the value was computed by code but
+/// from INPUT the LLM read off the page (bec74516's wrong ORCID counts), not
+/// from a deterministic parse of the SAVED source. The commit is blocked until
+/// the model re-extracts the value from the source file with the verifier's
+/// source mode.
+const SOURCE_ANCHORED_PROMPT: &str = "\
+Your numeric answer was COMPUTED from values the LLM read off the page — when \
+you read input numbers by eye you get the wrong cell (e.g. wrong ORCID counts). \
+This is BLOCKED. You retrieved a source: SAVE it to a file the sandbox can \
+read, then re-extract the value DETERMINISTICALLY with the verifier's source \
+mode, and commit exactly what it prints:\n\
+python verify_candidate.py verify --answer <candidate> --source-file <saved source> --extract <spec>\n\
+where <spec> pulls the value out of the file (e.g. csv:col=1,skip=1,agg=avg | \
+label:\"pre-2020 works\",agg=avg | table:0 | regex:<pattern> | num). If the \
+parser fails or the source is unreachable, report it — never commit a value \
+you read by eye.";
+
 /// True when the conversation contains an INDEPENDENT numeric verification:
 /// a `verify_candidate` shell call with `--recompute` (a second method), or a
 /// `cluster verify` adversarial review. A plain `verify_candidate` without
@@ -137,6 +154,77 @@ fn has_independent_recompute(messages: &[LlmMessage]) -> bool {
             })
         })
     })
+}
+
+/// Source-anchored extraction check (2026-08-14): the committed value was
+/// pulled by a `verify_candidate --source-file` call (deterministic re-extract
+/// from a SAVED source file), not computed from inline literals the LLM read
+/// off a page. Correlates the shell result to the verify_candidate call via
+/// tool_call_id; the value must appear in that call's output.
+fn value_from_source_extraction(answer: &str, messages: &[LlmMessage]) -> bool {
+    use std::collections::HashMap;
+    let mut names: HashMap<String, String> = HashMap::new();
+    for m in messages {
+        if let Some(calls) = &m.tool_calls {
+            for tc in calls {
+                names.insert(tc.id.clone(), tc.name.clone());
+            }
+        }
+    }
+    let pieces = super::final_answer::groundable_pieces(answer);
+    if pieces.is_empty() {
+        return true;
+    }
+    let contains = |content: &str| -> bool {
+        let lower = content.to_lowercase();
+        pieces.iter().any(|p| lower.contains(&p.to_lowercase()))
+    };
+    let is_source_verify = |args: &serde_json::Value| -> bool {
+        args.get("command")
+            .and_then(|v| v.as_str())
+            .is_some_and(|c| c.contains("verify_candidate") && c.contains("--source-file"))
+    };
+    for m in messages {
+        if let Some(calls) = &m.tool_calls {
+            for tc in calls {
+                if tc.name == "shell" && is_source_verify(&tc.arguments) {
+                    // Find the Tool result(s) for this call id.
+                    for tm in messages {
+                        if tm.role != LlmRole::Tool {
+                            continue;
+                        }
+                        let ids: Vec<String> = tm
+                            .tool_call_id
+                            .clone()
+                            .unwrap_or_default()
+                            .split('|')
+                            .map(str::to_string)
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        if ids.iter().any(|id| id == &tc.id) {
+                            if ids.len() == 1 {
+                                if contains(&tm.content) {
+                                    return true;
+                                }
+                            } else if let Ok(items) =
+                                serde_json::from_str::<Vec<serde_json::Value>>(&tm.content)
+                            {
+                                for item in items {
+                                    let id = item.get("i").and_then(|v| v.as_str()).unwrap_or("");
+                                    let content =
+                                        item.get("c").and_then(|v| v.as_str()).unwrap_or("");
+                                    if id == tc.id && contains(content) {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// "Code for numbers" provenance check (2026-08-14, PAL/TableCoder/VeNRA):
@@ -186,9 +274,7 @@ fn value_from_computation(answer: &str, messages: &[LlmMessage]) -> bool {
             }
         } else if ids.len() > 1 {
             // Multi-result merge: content is a JSON array [{i, c}, ...].
-            if let Ok(items) =
-                serde_json::from_str::<Vec<serde_json::Value>>(&m.content)
-            {
+            if let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(&m.content) {
                 for item in items {
                     let id = item.get("i").and_then(|v| v.as_str()).unwrap_or("");
                     let content = item.get("c").and_then(|v| v.as_str()).unwrap_or("");
@@ -692,9 +778,9 @@ pub(crate) async fn run_loop(
                 if budget_ok {
                     evidence_reprompts += 1;
                     state = transition(state, LoopEvent::UnverifiedHard).0; // T8 → Verify
-                    // Distinguish the two interception reasons: NO evidence at
-                    // all (gather evidence) vs evidence exists but does NOT
-                    // contain the answer (fabrication → abstention prompt).
+                                                                            // Distinguish the two interception reasons: NO evidence at
+                                                                            // all (gather evidence) vs evidence exists but does NOT
+                                                                            // contain the answer (fabrication → abstention prompt).
                     let grounding = !answer_grounded && any_evidence;
                     tracing::info!(
                         turn,
@@ -712,17 +798,33 @@ pub(crate) async fn run_loop(
                 }
             }
 
-            // ── "Code for numbers" + SGV gate (hard numeric answers) ─────
+            // ── "Code for numbers" + source-anchor + SGV gate (hard numeric) ──
             // (1) The committed value must be DERIVED BY CODE, not read off a
-            // page by the LLM (PAL/TableCoder/VeNRA: code-for-numbers). (2) An
-            // INDEPENDENT method must confirm it (verify_candidate --recompute
-            // OR cluster verify) — a single-pass computation is agreement-bias.
-            // The verify gate above caps at 2 re-prompts, so this gate keeps
-            // pushing until BOTH hold or the wall-clock is nearly gone.
+            // page by the LLM (PAL/TableCoder/VeNRA: code-for-numbers). (2) If
+            // a source was retrieved, the value must come from a deterministic
+            // re-EXTRACTION of the SAVED source (verify_candidate --source-file),
+            // not from input the LLM read off the page. (3) An INDEPENDENT
+            // method must confirm it (verify_candidate --recompute OR cluster
+            // verify). The verify gate caps at 2 re-prompts, so this gate keeps
+            // pushing until all applicable hold or the wall-clock is nearly gone.
+            let from_code = value_from_computation(&answer_value, messages);
+            let source_anchored = value_from_source_extraction(&answer_value, messages);
+            let has_retrieval = messages.iter().any(|m| {
+                m.tool_calls.as_ref().is_some_and(|calls| {
+                    calls.iter().any(|tc| {
+                        matches!(
+                            tc.name.as_str(),
+                            "download" | "web_fetch" | "write_file" | "read_file"
+                        )
+                    })
+                })
+            });
+            let needs_code = !from_code;
+            let needs_source = has_retrieval && !source_anchored;
+            let needs_recompute = !has_independent_recompute(messages);
             if difficulty == Difficulty::Hard
                 && answer_has_number
-                && (!value_from_computation(&answer_value, messages)
-                    || !has_independent_recompute(messages))
+                && (needs_code || needs_source || needs_recompute)
                 && evidence_reprompts < EVIDENCE_GATE_MAX
                 && verify_gate
             {
@@ -738,18 +840,22 @@ pub(crate) async fn run_loop(
                 if budget_ok {
                     evidence_reprompts += 1;
                     state = transition(state, LoopEvent::UnverifiedHard).0; // T8 → Verify
-                    let from_code = value_from_computation(&answer_value, messages);
                     tracing::info!(
                         turn,
                         reprompt = evidence_reprompts,
                         numeric = answer_has_number,
                         from_code,
-                        "Hard numeric answer not code-derived or not independently recomputed — intercept"
+                        source_anchored,
+                        has_retrieval,
+                        "Hard numeric answer not code/source-anchored or not independently recomputed — intercept"
                     );
-                    // Distinguish: value READ (not computed) → force code; value
-                    // computed but single-method → force independent recompute.
-                    let prompt = if !from_code {
+                    // Cascade: not from code → force code; code but input read
+                    // off the page → force source re-extraction; else single-
+                    // method → force independent recompute.
+                    let prompt = if needs_code {
                         CODE_FOR_NUMBERS_PROMPT
+                    } else if needs_source {
+                        SOURCE_ANCHORED_PROMPT
                     } else {
                         SGV_RECOMPUTE_PROMPT
                     };

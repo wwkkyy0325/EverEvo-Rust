@@ -74,6 +74,37 @@ mod tests {
         }
     }
 
+    struct MockDownloadTool;
+    #[async_trait::async_trait]
+    impl Tool for MockDownloadTool {
+        fn name(&self) -> &str {
+            "download"
+        }
+        fn description(&self) -> &str {
+            "Downloads a URL to a file"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]})
+        }
+        fn risk_level(&self) -> everevo_core::types::RiskLevel {
+            everevo_core::types::RiskLevel::Low
+        }
+        async fn execute(
+            &self,
+            params: serde_json::Value,
+            _cancel: Option<&CancellationToken>,
+        ) -> Result<ToolOutput, EverEvoError> {
+            Ok(ToolOutput {
+                content: format!(
+                    "downloaded: {} (saved to source.html)",
+                    params["url"].as_str().unwrap_or("")
+                ),
+                is_error: false,
+                ..Default::default()
+            })
+        }
+    }
+
     #[tokio::test]
     async fn test_agent_direct_answer_no_tools() {
         let mock = MockLlmProvider::new().with_text("Hello, how can I help?");
@@ -831,6 +862,7 @@ mod tests {
         let mut reg = ToolRegistry::new();
         reg.register(Arc::new(EchoTool));
         reg.register(Arc::new(MockShellTool));
+        reg.register(Arc::new(MockDownloadTool));
         let tool_schemas: Vec<ToolSchema> = reg
             .as_tool_schemas()
             .into_iter()
@@ -841,7 +873,10 @@ mod tests {
                 native_type: None,
             })
             .collect();
-        let (tx, rx) = mpsc::channel::<AgentEvent>(16);
+        // Large capacity: the caller keeps `rx` un-drained during the run, so a
+        // small channel would fill and block `tx.send()` (deadlock). 256 bounds
+        // a long gate-cascade run without ever blocking the loop.
+        let (tx, rx) = mpsc::channel::<AgentEvent>(256);
         let mut messages = vec![LlmMessage::user(user)];
         let config = RunConfig {
             max_turns,
@@ -875,8 +910,13 @@ mod tests {
                 )]))
                 .then(MockStep::Text("Final answer: Russian-German Legion".into())),
         );
-        let messages =
-            run_text_turns(&mock, "Which military unit did the author join?", 0, Some(3600)).await;
+        let messages = run_text_turns(
+            &mock,
+            "Which military unit did the author join?",
+            0,
+            Some(3600),
+        )
+        .await;
         let evidence_nudges = messages
             .iter()
             .filter(|m| m.content.contains("retrieved ANY evidence"))
@@ -913,8 +953,13 @@ mod tests {
                 .then(MockStep::Text("Final answer: Russian-German Legion".into()))
                 .then(MockStep::Text("Final answer: Russian-German Legion".into())),
         );
-        let messages =
-            run_text_turns(&mock, "Which military unit did the author join?", 0, Some(3600)).await;
+        let messages = run_text_turns(
+            &mock,
+            "Which military unit did the author join?",
+            0,
+            Some(3600),
+        )
+        .await;
         assert!(
             !messages
                 .iter()
@@ -958,18 +1003,20 @@ mod tests {
         .await;
         let grounding_nudges = messages
             .iter()
-            .filter(|m| m.content.contains("does NOT appear in ANY retrieved tool result"))
+            .filter(|m| {
+                m.content
+                    .contains("does NOT appear in ANY retrieved tool result")
+            })
             .count();
         assert!(
             grounding_nudges >= 1,
             "content-anchored gate must intercept the ungrounded commit"
         );
         // The run must commit the grounded value via the Done event.
-        let done_text = std::iter::from_fn(|| rx.try_recv().ok())
-            .find_map(|e| match e {
-                AgentEvent::Done { final_text } => Some(final_text),
-                _ => None,
-            });
+        let done_text = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|e| match e {
+            AgentEvent::Done { final_text } => Some(final_text),
+            _ => None,
+        });
         assert!(
             done_text
                 .as_deref()
@@ -994,11 +1041,12 @@ mod tests {
                 .then(MockStep::Text("Final answer: Russian-German Legion".into()))
                 .then(MockStep::Text("Final answer: Russian-German Legion".into())),
         );
-        let messages = run_text_turns(&mock, "Which unit did the author join?", 0, Some(3600)).await;
+        let messages =
+            run_text_turns(&mock, "Which unit did the author join?", 0, Some(3600)).await;
         assert!(
-            !messages
-                .iter()
-                .any(|m| m.content.contains("does NOT appear in ANY retrieved tool result")),
+            !messages.iter().any(|m| m
+                .content
+                .contains("does NOT appear in ANY retrieved tool result")),
             "grounding gate must not fire when the answer is in a tool result"
         );
     }
@@ -1039,11 +1087,10 @@ mod tests {
             sgv_nudges >= 1,
             "SGV gate must intercept a single-method numeric commit"
         );
-        let done_text = std::iter::from_fn(|| rx.try_recv().ok())
-            .find_map(|e| match e {
-                AgentEvent::Done { final_text } => Some(final_text),
-                _ => None,
-            });
+        let done_text = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|e| match e {
+            AgentEvent::Done { final_text } => Some(final_text),
+            _ => None,
+        });
         assert!(
             done_text.as_deref().is_some_and(|t| t.contains("42")),
             "numeric answer must commit after independent recompute; got {:?}",
@@ -1122,7 +1169,8 @@ mod tests {
                 )]))
                 .then(MockStep::Text("Final answer: 42".into())),
         );
-        let (messages, _rx) = run_text_turns_with_events(&mock, "What is the total?", 0, Some(3600)).await;
+        let (messages, _rx) =
+            run_text_turns_with_events(&mock, "What is the total?", 0, Some(3600)).await;
         let code_nudges = messages
             .iter()
             .filter(|m| m.content.contains("COMPUTED from code"))
@@ -1154,12 +1202,108 @@ mod tests {
                 )]))
                 .then(MockStep::Text("Final answer: 42".into())),
         );
-        let (messages, _rx) = run_text_turns_with_events(&mock, "What is the total?", 0, Some(3600)).await;
+        let (messages, _rx) =
+            run_text_turns_with_events(&mock, "What is the total?", 0, Some(3600)).await;
         assert!(
             !messages
                 .iter()
                 .any(|m| m.content.contains("COMPUTED from code")),
             "code-for-numbers gate must not fire when the value came from a shell computation"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_anchor_gate_blocks_value_computed_from_read_input() {
+        use crate::llm::mock::{MockScript, MockStep};
+        // The model COMPUTED a value in code (from_code=true) but READ the
+        // input numbers off a retrieved page (download → has_retrieval) and
+        // never re-extracted from the SAVED source → the source-anchor gate
+        // must intercept with the SOURCE_ANCHORED prompt.
+        let mock = MockLlmProvider::from_script(
+            MockScript::new()
+                // code computation (inline value the LLM computed from read input)
+                .then(MockStep::Calls(vec![(
+                    "shell",
+                    serde_json::json!({"command": "python -c 'print(36)'"}),
+                )]))
+                // retrieved a source it should parse, not read
+                .then(MockStep::Calls(vec![(
+                    "download",
+                    serde_json::json!({"url": "https://orcid.org/x"}),
+                )]))
+                .then(MockStep::Text("Final answer: 36".into()))
+                .then(MockStep::Text("Final answer: 36".into()))
+                // verify cap → source-anchor gate fires (has_retrieval, not source-anchored)
+                .then(MockStep::Text("Final answer: 36".into()))
+                // model re-extracts from the saved source deterministically → 26.4
+                .then(MockStep::Calls(vec![(
+                    "shell",
+                    serde_json::json!({"command": "python verify_candidate.py verify --answer 26.4 --source-file orcid.txt --extract 'label:pre-2020 works,agg=avg'"}),
+                )]))
+                // independent recompute on the corrected value
+                .then(MockStep::Calls(vec![(
+                    "shell",
+                    serde_json::json!({"command": "python verify_candidate.py verify --answer 26.4 --compute 'a' --recompute 'b'"}),
+                )]))
+                // all three gates satisfied → commit
+                .then(MockStep::Text("Final answer: 26.4".into())),
+        );
+        let (messages, _rx) = run_text_turns_with_events(
+            &mock,
+            "What is the average number of pre-2020 works?",
+            0,
+            Some(3600),
+        )
+        .await;
+        let source_nudges = messages
+            .iter()
+            .filter(|m| m.content.contains("re-extract the value DETERMINISTICALLY"))
+            .count();
+        eprintln!(
+            "DEBUG source_nudges={} total_msgs={} calls={}",
+            source_nudges,
+            messages.len(),
+            mock.call_log().len()
+        );
+        assert!(
+            source_nudges >= 1,
+            "source-anchor gate must intercept a value computed from LLM-read input"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_anchor_gate_skipped_when_value_source_anchored() {
+        use crate::llm::mock::{MockScript, MockStep};
+        // The value came from a verify_candidate --source-file extraction → the
+        // source-anchor gate never fires (source_anchored=true).
+        let mock = MockLlmProvider::from_script(
+            MockScript::new()
+                .then(MockStep::Calls(vec![(
+                    "shell",
+                    serde_json::json!({"command": "python verify_candidate.py verify --answer 26.4 --source-file orcid.txt --extract 'label:pre-2020 works,agg=avg'"}),
+                )]))
+                .then(MockStep::Calls(vec![(
+                    "download",
+                    serde_json::json!({"url": "https://orcid.org/x"}),
+                )]))
+                .then(MockStep::Calls(vec![(
+                    "shell",
+                    serde_json::json!({"command": "python verify_candidate.py verify --answer 26.4 --compute 'a' --recompute 'b'"}),
+                )]))
+                .then(MockStep::Text("Final answer: 26.4".into())),
+        );
+        let (messages, _rx) = run_text_turns_with_events(
+            &mock,
+            "What is the average number of pre-2020 works?",
+            0,
+            Some(3600),
+        )
+        .await;
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.content.contains("re-extract the value DETERMINISTICALLY")),
+            "source-anchor gate must not fire when the value is source-anchored"
         );
     }
 
@@ -1180,7 +1324,8 @@ mod tests {
                 .then(MockStep::Text("Final answer: Russian-German Legion".into())),
         );
         let (messages, _rx) =
-            run_text_turns_with_events(&mock, "Which unit did the author join?", 0, Some(3600)).await;
+            run_text_turns_with_events(&mock, "Which unit did the author join?", 0, Some(3600))
+                .await;
         assert!(
             !messages
                 .iter()
@@ -1243,8 +1388,13 @@ mod tests {
                 .then(MockStep::Text("Final answer: Russian-German Legion".into()))
                 .then(MockStep::Text("Final answer: Russian-German Legion".into())),
         );
-        let messages =
-            run_text_turns(&mock, "Which military unit did the author join?", 0, Some(3600)).await;
+        let messages = run_text_turns(
+            &mock,
+            "Which military unit did the author join?",
+            0,
+            Some(3600),
+        )
+        .await;
         // The thinking-only turn must NOT commit a memory value: the evidence
         // gate prompt fired and the model was forced to call a tool.
         assert!(

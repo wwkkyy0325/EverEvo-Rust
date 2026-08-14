@@ -4,6 +4,25 @@ All notable changes to EverEvo-Rust. Append-only, newest first.
 
 ---
 
+## 2026-08-14 — 源锚定提取门控（Source-Anchored Extraction）—— 错题修复率 21.6% → 35.1%
+
+**权威依据:** WebLists/BardeenAgent (2025, CSS-selector 确定性提取 66% recall)、Evident (按代码路径溯源打分)、VeNRA (Fact Ledger, 所有算术走代码)、Microsoft (数值必须精确引用源)。核心: 不检测脚本内容(启发式双刃剑), 而是**确定性提取工具 + 溯源验证**。
+
+**实现:**
+- **verify_candidate.py `--source-file/--extract`**: 确定性重提取引擎 — `csv:col=N,skip=M[,agg=sum|avg]` / `table:N` / `regex:PATTERN[,group=N]` / `label:TEXT[,agg=sum|avg]` / `num`。模型提供 spec, 解析器从保存的源文件提取值, 与候选比对。**23 pytest 全过**。
+- **AnswerDiscipline "Source-anchored extraction" HARD RULE**: 数值从抓取页读 → 必须 SAVE 源 + verify_candidate --source-file 确定性重提取 + 提交提取值。
+- **driver `value_from_source_extraction` 门**: 值必须溯源到 verify_candidate --source-file 调用输出 (tool_call_id 关联, 确定性非启发式)。级联: 非代码→CODE / 有检索未源锚定→SOURCE_ANCHORED / 单方法→SGV。
+- **harness VERIFY_HINT** 补 --source-file 语法。
+- **345 Rust 测试 + clippy + fmt 全绿** (新增 source_anchor 2 测试)。
+
+**验证:**
+- 冒烟: **bec74516 ORCID 从错「36」→ 对「26.4」**(源锚定提取直接修好数据提取类教科书案例)。
+- 全量 37 错题: **13/37 (35.1%)**, 高于 CODE 门 10/37 (27.0%)、基线 8/37 (21.6%)。L2 34.8%, L3 27.3%。投影总分 ≈ 141/165 (85.5%)。稳定修复 7 个。丢失 3 (方差)。
+
+**剩余瓶颈(诚实):** 数据选择错(模型选错 spec/字段, ~50%)、方差翻转(~30%)、死源(~15%)、视觉精度(~5%) — 门控修好了"答案提交层"的纪律问题, 剩余是"数据选择层"的模型推理能力边界。
+
+---
+
 ## 2026-08-14 — CODE 门首次突破错题修复平台期（8/37 → 10/37）
 
 **CODE 门跑批（37 错题, workers=6, attempts=1, 新二进制）:**
